@@ -22,7 +22,12 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Modules load from 0x10000 up to HeapBase; the heap (AllocSysMemory,
+        // sceSifAllocIopHeap) runs from here to HeapLimit. A real IOP shares one
+        // pool, and typical module sets need well under 512 KB, while games
+        // allocate ~1 MB+ of heap (Drakengard: 832 KB of EE-requested buffers
+        // before its opening movie), so give the heap the larger share.
+        static constexpr uint32_t HeapBase = 0x00090000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
