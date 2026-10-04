@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "ps2_debug_panel.h"
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
@@ -2183,6 +2184,11 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+        // PS2X_DEBUG_PANEL=0 starts with the panel hidden (F1 toggles).
+        if (const char *panel = std::getenv("PS2X_DEBUG_PANEL"); panel && panel[0] == '0')
+        {
+            m_visible = false;
+        }
     }
 #endif
 }
