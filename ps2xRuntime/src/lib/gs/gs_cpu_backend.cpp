@@ -386,12 +386,30 @@ namespace
     struct GSSmode2State
     {
         bool interlaced = false;
-        bool frameMode = true;
+        // SMODE2.FFMD. With INT set, FFMD=1 scans out one field per vsync from a
+        // half-height buffer (DH/2 lines, line-doubled); FFMD=0 reads both
+        // fields from a full-height buffer.
+        bool ffmd = false;
     };
 
     GSSmode2State decodeSMode2(uint64_t smode2)
     {
         return {(smode2 & 0x1ull) != 0ull, ((smode2 >> 1) & 0x1ull) != 0ull};
+    }
+
+    // Expand a half-height field buffer (INT + FFMD) to the full display height.
+    void lineDoubleFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t fieldHeight, uint32_t fullHeight)
+    {
+        if (pixels.empty() || width == 0u || fieldHeight == 0u)
+            return;
+        const std::vector<uint8_t> source = pixels;
+        for (uint32_t y = 0; y < fullHeight && y < kHostFrameHeight; ++y)
+        {
+            const uint32_t sourceY = std::min(y >> 1u, fieldHeight - 1u);
+            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
+                        source.data() + sourceY * kHostFrameWidth * 4u,
+                        width * 4u);
+        }
     }
 
     void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
@@ -1862,7 +1880,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     PresentationFrame result{};
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
-    const bool fieldMode = smode2.interlaced && !smode2.frameMode;
+    const bool fieldMode = smode2.interlaced && !smode2.ffmd;
+    const bool halfHeightField = smode2.interlaced && smode2.ffmd;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(request.dispfb2);
@@ -1871,6 +1890,20 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     uint32_t width1 = 0u, height1 = 0u, width2 = 0u, height2 = 0u;
     decodeDisplaySize(request.display1, width1, height1);
     decodeDisplaySize(request.display2, width2, height2);
+    const uint32_t fullHeight = std::max(height1, height2);
+    if (halfHeightField)
+    {
+        height1 = (height1 + 1u) >> 1u;
+        height2 = (height2 + 1u) >> 1u;
+    }
+    auto finishFieldPresentation = [&](PresentationFrame &frame)
+    {
+        if (halfHeightField)
+        {
+            lineDoubleFieldPresentation(frame.pixels, frame.width, frame.height, fullHeight);
+            frame.height = fullHeight;
+        }
+    };
     const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, displayFrame1);
     const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, displayFrame2);
     if (!valid1 && !valid2)
@@ -1958,6 +1991,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             normalizePresentationAlpha(result.pixels, result.width, result.height);
             if (fieldMode)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+            finishFieldPresentation(result);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
             return result;
@@ -1974,6 +2008,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     if (fieldMode)
         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
     normalizePresentationAlpha(result.pixels, result.width, result.height);
+    finishFieldPresentation(result);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;
     return result;

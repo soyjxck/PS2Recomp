@@ -80,6 +80,9 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            // libmc reports a card the game hasn't seen yet as "changed"
+            // (-1 / -2); many games only latch card info on that result.
+            bool infoReported = false;
         };
 
         std::mutex g_mcStateMutex;
@@ -877,7 +880,15 @@ namespace ps2_stubs
                 cardType = kMcTypePs2;
                 freeBlocks = state.formatted ? kMcFreeClusters : 0;
                 format = state.formatted ? kMcFormatted : kMcUnformatted;
-                result = state.formatted ? kMcResultSucceed : kMcResultNoFormat;
+                if (!state.formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    result = state.infoReported ? kMcResultSucceed : kMcResultChangedCard;
+                }
+                state.infoReported = true;
             }
 
             setMcCommandResultLocked(kMcCmdGetInfo, result);
