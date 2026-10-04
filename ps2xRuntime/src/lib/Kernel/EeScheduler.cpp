@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_gsIrqLatched = 0u;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -394,10 +395,19 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
+    if (m_pendingEeTimerInterrupts != 0u || (pendingGsInterrupts() & ~m_gsIrqLatched) != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+uint32_t EeScheduler::pendingGsInterrupts() const
+{
+    // CSR bit 0 = SIGNAL, bit 1 = FINISH; IMR bit 8 = SIGMSK, bit 9 = FINISHMSK.
+    const GSRegisters &gs = m_runtime.memory().gs();
+    const uint32_t events = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+    const uint32_t masked = static_cast<uint32_t>(gs.imr >> 8) & 0x3u;
+    return events & ~masked;
 }
 
 bool EeScheduler::isExecutingGuest() const noexcept
@@ -1753,6 +1763,12 @@ void EeScheduler::processPendingEvents()
             dispatchIrq(false, 9u + timer);
         }
     }
+    const uint32_t gsInterrupts = pendingGsInterrupts();
+    if ((gsInterrupts & ~m_gsIrqLatched) != 0u)
+    {
+        dispatchIrq(false, 0u); // INTC_GS
+    }
+    m_gsIrqLatched = gsInterrupts;
     std::deque<EeEvent> pending;
     {
         std::lock_guard lock(m_eventMutex);

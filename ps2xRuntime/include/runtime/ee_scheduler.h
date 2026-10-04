@@ -383,6 +383,7 @@ private:
     void requestPreemptionIfHigher(const GuestThread &readyThread, bool interruptSafe);
     void applyPendingPreemption();
     void processPendingEvents();
+    uint32_t pendingGsInterrupts() const;
     void processDueDeadlines();
     void processEvent(const EeEvent &event);
     void finishEventWaiters(EeEventFlag &flag, bool interruptSafe);
@@ -425,6 +426,10 @@ private:
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    // GS CSR SIGNAL/FINISH bits that were unmasked and pending at the last
+    // poll; INTC 0 is raised on each newly pending bit (the GS line is level
+    // triggered and stays high until the handler acks the CSR bit).
+    uint32_t m_gsIrqLatched = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
