@@ -71,40 +71,20 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // The EE ABI (Sony's EABI) passes the first eight integer arguments in
+        // $a0-$a3/$t0-$t3, so arguments 5..7 are always $t0..$t2. Falling back
+        // to stack slots when they are zero read garbage for legitimate zeros
+        // (e.g. sceGsSetDefDispEnv(..., dx=0, dy=0) became dx=dy=-1).
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9};
-            }
-
-            return {stack0, stack1};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9)};
         }
 
         GsTrailingArgs3 decodeGsTrailingArgs3(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t reg10 = getRegU32(ctx, 10);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-            const uint32_t stack2 = readStackU32(rdram, ctx, 24);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u || reg10 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u || stack2 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9, reg10};
-            }
-
-            return {stack0, stack1, stack2};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10)};
         }
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
@@ -1013,9 +993,21 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
+        // Like libgraph: scale to the 2560-clock NTSC line (MAGH), and offset
+        // from the standard NTSC origin (DX 652, DY 50 for interlaced output).
+        const uint32_t magh = std::clamp<uint32_t>(2560u / w, 1u, 16u) - 1u;
+        const int32_t sdx = static_cast<int16_t>(dx & 0xFFFFu);
+        const int32_t sdy = static_cast<int16_t>(dy & 0xFFFFu);
+        const uint32_t displayX = static_cast<uint32_t>(652 + sdx * static_cast<int32_t>(magh + 1u));
+        const uint32_t displayY = static_cast<uint32_t>(50 + sdy);
+        uint64_t display = makeDisplay(displayX, displayY, magh, 0, w * (magh + 1u) - 1u, h - 1);
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        // PMODE: read circuit 2 on, CRTMD=1, alpha from ALP, output alpha from
+        // circuit 1 (SCE_GS_SET_PMODE(0, 1, 1, 1, 0, 0)). SMODE2 keeps the
+        // interlace/field mode programmed by sceGsResetGraph.
+        constexpr uint64_t kDefaultPmode = 0x66u;
+        const uint64_t smode2 = runtime ? (runtime->memory().gs().smode2 & 0x3u) : 0x1u;
+        writeGsDispEnv(rdram, envAddr, display, dispfb, kDefaultPmode, smode2);
         setReturnS32(ctx, 0);
     }
 

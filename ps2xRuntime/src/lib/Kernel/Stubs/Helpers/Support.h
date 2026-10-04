@@ -1805,15 +1805,21 @@ namespace
         return true;
     }
 
-    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb)
+    // sceGsSetDefDispEnv fills every field of sceGsDispEnv; callers allocate it
+    // on the stack, so leaving pmode/smode2/bgcolor alone hands garbage to
+    // sceGsPutDispEnv (both read circuits off -> no picture).
+    static bool writeGsDispEnv(uint8_t *rdram, uint32_t addr, uint64_t display, uint64_t dispfb,
+                               uint64_t pmode, uint64_t smode2)
     {
         uint8_t *ptr = getMemPtr(rdram, addr);
         if (!ptr)
             return false;
         GsDispEnvMem env{};
-        std::memcpy(&env, ptr, sizeof(env));
+        env.pmode = pmode;
+        env.smode2 = smode2;
         env.dispfb = dispfb;
         env.display = display;
+        env.bgcolor = 0;
         std::memcpy(ptr, &env, sizeof(env));
         return true;
     }
