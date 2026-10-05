@@ -646,7 +646,17 @@ static inline float ps2ClampF(float value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// R5900 CVT.W.S always truncates toward zero and saturates out-of-range
+// values (incl. exponent-255 encodings) to INT32_MAX / INT32_MIN.
+static inline int32_t ps2CvtWS(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) >= 0x4F000000u) // |value| >= 2^31
+        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2CvtWS((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 // The R5900 FPU has no NaN/Inf: exponent 255 encodes ordinary large values
 // (games seed "max" with 0x7FFFFFFF and compare against it), and denormals are
