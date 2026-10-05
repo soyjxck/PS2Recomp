@@ -141,9 +141,21 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
+// R5900/VU floats have no Inf/NaN: exponent-255 encodings are huge finite
+// values and results saturate. Clamp operands and results to +/-FLT_MAX
+// (PCSX2-style clamping) so e.g. 0x7FFFFFFF - 0x7FFFFFFF == 0.
+static inline __m128 ps2ClampPs(__m128 v)
+{
+    const __m128i bits = _mm_castps_si128(v);
+    const __m128i expMask = _mm_set1_epi32(0x7F800000);
+    const __m128i isSpecial = _mm_cmpeq_epi32(_mm_and_si128(bits, expMask), expMask);
+    const __m128i clamped = _mm_or_si128(_mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))),
+                                         _mm_set1_epi32(0x7F7FFFFF));
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(isSpecial, clamped), _mm_andnot_si128(isSpecial, bits)));
+}
+#define PS2_VADD(a, b) ps2ClampPs(_mm_add_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
+#define PS2_VSUB(a, b) ps2ClampPs(_mm_sub_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
+#define PS2_VMUL(a, b) ps2ClampPs(_mm_mul_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
@@ -605,11 +617,22 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 
 // FPU (COP1) operations
 #define FPU_SET_ACC(ctx, res) (ctx->f_acc = res)
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+// Scalar counterpart of ps2ClampPs: exponent-255 encodings become +/-FLT_MAX.
+static inline float ps2ClampF(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    std::memcpy(&value, &bits, sizeof(bits));
+    return value;
+}
+#define FPU_ADD_S(a, b) ps2ClampF(ps2ClampF((float)(a)) + ps2ClampF((float)(b)))
+#define FPU_SUB_S(a, b) ps2ClampF(ps2ClampF((float)(a)) - ps2ClampF((float)(b)))
+#define FPU_MUL_S(a, b) ps2ClampF(ps2ClampF((float)(a)) * ps2ClampF((float)(b)))
+// Division by zero yields +/-max on the R5900 (sign = sign(a) ^ sign(b)).
+#define FPU_DIV_S(a, b) ps2ClampF(ps2ClampF((float)(a)) / ps2ClampF((float)(b)))
+#define FPU_SQRT_S(a) sqrtf(fabsf(ps2ClampF((float)(a))))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
