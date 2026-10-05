@@ -625,22 +625,37 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
 #define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
+// The R5900 FPU has no NaN/Inf: exponent 255 encodes ordinary large values
+// (games seed "max" with 0x7FFFFFFF and compare against it), and denormals are
+// zero. Compare as sign-magnitude integers so host NaN semantics never apply.
+static inline int64_t ps2FpuOrderKey(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0u)
+        return 0; // +/-0 and denormals
+    const int64_t magnitude = static_cast<int64_t>(bits & 0x7FFFFFFFu);
+    return (bits & 0x80000000u) ? -magnitude : magnitude;
+}
+#define PS2_FPU_EQ(a, b) (ps2FpuOrderKey((float)(a)) == ps2FpuOrderKey((float)(b)))
+#define PS2_FPU_LT(a, b) (ps2FpuOrderKey((float)(a)) < ps2FpuOrderKey((float)(b)))
+#define PS2_FPU_LE(a, b) (ps2FpuOrderKey((float)(a)) <= ps2FpuOrderKey((float)(b)))
 #define FPU_C_F_S(a, b) (0)
-#define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_EQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_UEQ_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_ULT_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_OLE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_ULE_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_UN_S(a, b) (0)
+#define FPU_C_EQ_S(a, b) PS2_FPU_EQ(a, b)
+#define FPU_C_UEQ_S(a, b) PS2_FPU_EQ(a, b)
+#define FPU_C_OLT_S(a, b) PS2_FPU_LT(a, b)
+#define FPU_C_ULT_S(a, b) PS2_FPU_LT(a, b)
+#define FPU_C_OLE_S(a, b) PS2_FPU_LE(a, b)
+#define FPU_C_ULE_S(a, b) PS2_FPU_LE(a, b)
 #define FPU_C_SF_S(a, b) (0)
-#define FPU_C_NGLE_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_SEQ_S(a, b) ((float)(a) == (float)(b))
-#define FPU_C_NGL_S(a, b) ((float)(a) == (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LT_S(a, b) ((float)(a) < (float)(b))
-#define FPU_C_NGE_S(a, b) ((float)(a) < (float)(b) || isnan((float)(a)) || isnan((float)(b)))
-#define FPU_C_LE_S(a, b) ((float)(a) <= (float)(b))
-#define FPU_C_NGT_S(a, b) ((float)(a) <= (float)(b) || isnan((float)(a)) || isnan((float)(b)))
+#define FPU_C_NGLE_S(a, b) (0)
+#define FPU_C_SEQ_S(a, b) PS2_FPU_EQ(a, b)
+#define FPU_C_NGL_S(a, b) PS2_FPU_EQ(a, b)
+#define FPU_C_LT_S(a, b) PS2_FPU_LT(a, b)
+#define FPU_C_NGE_S(a, b) PS2_FPU_LT(a, b)
+#define FPU_C_LE_S(a, b) PS2_FPU_LE(a, b)
+#define FPU_C_NGT_S(a, b) PS2_FPU_LE(a, b)
 
 // QFSRV: Quadword Funnel Shift Right Variable
 // Concatenates rs || rt (256 bits) and right-shifts by SA bits, taking lower 128 bits.
