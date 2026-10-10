@@ -123,4 +123,13 @@ namespace ps2x
     }
 }
 
+namespace ps2x
+{
+    // The shape the picture is shown in from now on, width over height, in
+    // place of the [display] aspect; 0 goes back to that. For a game that
+    // draws some of its screens for a wider picture than others (its scenes
+    // widened, its movies and menus not). Any thread may call it.
+    void setPresentationAspect(float widthOverHeight);
+}
+
 #endif // PS2_SETTINGS_H

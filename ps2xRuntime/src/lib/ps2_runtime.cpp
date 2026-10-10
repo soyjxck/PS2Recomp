@@ -106,6 +106,13 @@ static const HostDisplay &hostDisplay()
     return display;
 }
 
+static std::atomic<float> g_presentationAspect{0.0f};
+
+void ps2x::setPresentationAspect(float widthOverHeight)
+{
+    g_presentationAspect.store(widthOverHeight > 0.0f ? widthOverHeight : 0.0f, std::memory_order_relaxed);
+}
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -3025,7 +3032,8 @@ void PS2Runtime::run()
         // As large as fits, in the shape asked for: the game's pixels are
         // not square on a television, and a widescreen picture is drawn
         // squeezed into the same 640.
-        const float shape = hostDisplay().aspect > 0.0f ? hostDisplay().aspect : srcWidth / srcHeight;
+        const float asked = g_presentationAspect.load(std::memory_order_relaxed);
+        const float shape = asked > 0.0f ? asked : hostDisplay().aspect > 0.0f ? hostDisplay().aspect : srcWidth / srcHeight;
         const float dstHeight = std::min(screenHeight, screenWidth / shape);
         const float dstWidth = dstHeight * shape;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
