@@ -156,6 +156,29 @@ static inline __m128 ps2ClampPs(__m128 v)
 #define PS2_VADD(a, b) ps2ClampPs(_mm_add_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
 #define PS2_VSUB(a, b) ps2ClampPs(_mm_sub_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
 #define PS2_VMUL(a, b) ps2ClampPs(_mm_mul_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
+// VU MAX and MINI compare their operands as sign-and-magnitude integers:
+// every bit pattern is a number (0x7FFFFFFF is the largest, not a NaN) and the
+// result is one of the operands, bit for bit. A game that grows a bounding box
+// from "minimum = 0x7FFFFFFF" and then tests a point by clamping it to the box
+// and comparing the bits depends on both properties; host float min/max keep
+// or drop a NaN instead, depending on the host.
+static inline __m128 ps2VuMax(__m128 a, __m128 b)
+{
+    const __m128i ia = _mm_castps_si128(a), ib = _mm_castps_si128(b);
+    // Two negative numbers order the other way round as integers.
+    const __m128i bothNegative = _mm_srai_epi32(_mm_and_si128(ia, ib), 31);
+    const __m128i takeA = _mm_xor_si128(_mm_cmpgt_epi32(ia, ib), bothNegative);
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(takeA, ia), _mm_andnot_si128(takeA, ib)));
+}
+static inline __m128 ps2VuMini(__m128 a, __m128 b)
+{
+    const __m128i ia = _mm_castps_si128(a), ib = _mm_castps_si128(b);
+    const __m128i bothNegative = _mm_srai_epi32(_mm_and_si128(ia, ib), 31);
+    const __m128i takeA = _mm_xor_si128(_mm_cmpgt_epi32(ib, ia), bothNegative);
+    return _mm_castsi128_ps(_mm_or_si128(_mm_and_si128(takeA, ia), _mm_andnot_si128(takeA, ib)));
+}
+#define PS2_VU_MAX(a, b) ps2VuMax((__m128)(a), (__m128)(b))
+#define PS2_VU_MINI(a, b) ps2VuMini((__m128)(a), (__m128)(b))
 // VU0 macro mode: MAC and status flags of an arithmetic result. `dest` is the
 // instruction's dest field (x=8, y=4, z=2, w=1), which is also the bit order of
 // the zero and sign nibbles in the MAC register.

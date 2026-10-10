@@ -127,6 +127,18 @@ void register_ps2_mmi_tests()
         t.IsTrue(FPU_RSQRT_S(8.0f, -4.0f) == 4.0f, "FPU_RSQRT_S(8.0f, -4.0f) == 4.0f");
         float big; uint32_t bigBits = 0x7FFFFFFF; std::memcpy(&big, &bigBits, 4);
         t.IsTrue(FPU_MAX_S(big, 1.0f) != 1.0f && FPU_MIN_S(big, 1.0f) == 1.0f, "FPU_MAX_S(big, 1.0f) != 1.0f && FPU_MIN_S(big, 1.0f) == 1.0f");
+        // VU MAX/MINI: sign-and-magnitude order over every bit pattern, and the
+        // result is one of the operands. Lanes: (0x7FFFFFFF vs 5), (0xFFFFFFFF
+        // vs -3), (-1 vs -2), (+0 vs -0).
+        {
+            const __m128i a = W(0x7FFFFFFFu, 0xFFFFFFFFu, 0xBF800000u, 0x00000000u);
+            const __m128i b = W(0x40A00000u, 0xC0400000u, 0xC0000000u, 0x80000000u);
+            const __m128 fa = _mm_castsi128_ps(a), fb = _mm_castsi128_ps(b);
+            t.IsTrue(eq(_mm_castps_si128(ps2VuMax(fa, fb)), W(0x7FFFFFFFu, 0xC0400000u, 0xBF800000u, 0x00000000u)), "ps2VuMax picks the greater bit pattern");
+            t.IsTrue(eq(_mm_castps_si128(ps2VuMax(fb, fa)), W(0x7FFFFFFFu, 0xC0400000u, 0xBF800000u, 0x00000000u)), "ps2VuMax does not depend on operand order");
+            t.IsTrue(eq(_mm_castps_si128(ps2VuMini(fa, fb)), W(0x40A00000u, 0xFFFFFFFFu, 0xC0000000u, 0x80000000u)), "ps2VuMini picks the lesser bit pattern");
+            t.IsTrue(eq(_mm_castps_si128(ps2VuMini(fb, fa)), W(0x40A00000u, 0xFFFFFFFFu, 0xC0000000u, 0x80000000u)), "ps2VuMini does not depend on operand order");
+        }
         __m128 r = ps2Vu0RInit(0.0f);
         for (int i = 0; i < 5; ++i) r = ps2Vu0RNext(r);
         const float rf = _mm_cvtss_f32(r);
