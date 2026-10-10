@@ -1734,10 +1734,12 @@ struct GSCpuBackend::RasterQueue
     PageSet written{};  // pages pending primitives write
     PageSet read{};     // pages of textures they sample that could change under them
     PageSet readLive{}; // ...of those, pages sampled from VRAM while drawing
-    // The same for everything handed to the pool since it was last seen idle.
-    PageSet flightWritten{};
-    PageSet flightRead{};
-    PageSet flightReadLive{};
+    // Batches are numbered as they are handed over. For every page, the last
+    // batch that writes it and the last that reads it: once that one has been
+    // retired, nothing outstanding touches the page.
+    uint64_t submitted = 0;
+    std::array<uint64_t, kPageCount> pageWriter{};
+    std::array<uint64_t, kPageCount> pageReader{};
     // Target of the pending primitives.
     uint32_t fbp = 0, fbw = 0, zbp = 0;
     uint8_t fpsm = 0, zpsm = 0;
@@ -1746,6 +1748,7 @@ struct GSCpuBackend::RasterQueue
     struct Batch
     {
         std::vector<PreparedPrimitive> primitives;
+        uint64_t number = 0;
         int firstRow = 0;
         int bandCount = 0;
         std::atomic<int> nextBand{0};
@@ -1758,7 +1761,7 @@ struct GSCpuBackend::RasterQueue
     std::deque<Batch *> flight;   // handed over, in order; only the front one is drawn
     std::vector<Batch *> spare;
     size_t flightPrimitives = 0;
-    std::atomic<size_t> flightBatches{0};
+    std::atomic<uint64_t> retired{0}; // number of the last batch drawn completely
     bool quit = false;
 
     static void drawBands(Batch &batch)
@@ -1800,7 +1803,7 @@ struct GSCpuBackend::RasterQueue
             flightPrimitives -= batch->primitives.size();
             batch->primitives.clear();
             spare.push_back(batch);
-            flightBatches.fetch_sub(1, std::memory_order_release);
+            retired.store(batch->number, std::memory_order_release);
             done.notify_all();
             if (!flight.empty())
                 wake.notify_all();
@@ -1835,7 +1838,19 @@ struct GSCpuBackend::RasterQueue
 
     bool busy() const
     {
-        return flightBatches.load(std::memory_order_acquire) != 0u;
+        return retired.load(std::memory_order_acquire) != submitted;
+    }
+
+    // The last batch handed over that touches any of `pages`.
+    static uint64_t lastBatch(const PageSet &pages, const std::array<uint64_t, kPageCount> &lastUse)
+    {
+        uint64_t last = 0;
+        for (size_t word = 0; word < pages.size(); ++word)
+        {
+            for (uint64_t bits = pages[word]; bits != 0u; bits &= bits - 1u)
+                last = std::max(last, lastUse[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))]);
+        }
+        return last;
     }
 
     // PS2X_GS_STATS=1: how the queue is being used, every few thousand batches.
@@ -1908,16 +1923,18 @@ struct GSCpuBackend::RasterQueue
         if (!batch)
             batch = new Batch();
         batch->primitives.swap(pending);
+        batch->number = ++submitted;
         batch->firstRow = top;
         batch->bandCount = (bottom - top) / kBandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
         batch->drawing = 0;
 
-        for (size_t i = 0; i < written.size(); ++i)
+        for (size_t word = 0; word < written.size(); ++word)
         {
-            flightWritten[i] |= written[i];
-            flightRead[i] |= read[i];
-            flightReadLive[i] |= readLive[i];
+            for (uint64_t bits = written[word]; bits != 0u; bits &= bits - 1u)
+                pageWriter[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))] = submitted;
+            for (uint64_t bits = read[word]; bits != 0u; bits &= bits - 1u)
+                pageReader[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))] = submitted;
         }
         pendingPixels = 0;
         written.fill(0u);
@@ -1930,7 +1947,6 @@ struct GSCpuBackend::RasterQueue
             flight.push_back(batch);
             flightPrimitives += batch->primitives.size();
             outstanding = flightPrimitives;
-            flightBatches.fetch_add(1, std::memory_order_release);
         }
         wake.notify_all();
 
@@ -1960,14 +1976,38 @@ struct GSCpuBackend::RasterQueue
         }
     }
 
+    // Helps the pool until batch `number` has been drawn. Uses nothing that
+    // belongs to the GS thread, so another thread may call it (with the number
+    // it was given under the backend lock).
+    void waitFor(uint64_t number)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (retired.load(std::memory_order_acquire) < number)
+        {
+            if (!drawFront(lock))
+                done.wait(lock);
+        }
+    }
+
+    // As waitFor, on the GS thread, counted in the statistics.
+    void waitForCounted(uint64_t number)
+    {
+        if (retired.load(std::memory_order_acquire) >= number)
+            return;
+        const bool timed = wantStats();
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        waitFor(number);
+        if (timed)
+        {
+            ++stats.waits;
+            stats.waitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+    }
+
     // Returns once everything handed over has been drawn.
     void waitIdle()
     {
-        if (busy())
-            waitUntil(0u);
-        flightWritten.fill(0u);
-        flightRead.fill(0u);
-        flightReadLive.fill(0u);
+        waitForCounted(submitted);
     }
 
     // Hands over and waits: everything queued is in VRAM on return.
@@ -2022,21 +2062,35 @@ void GSCpuBackend::SubmitPrimitives()
 void GSCpuBackend::FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
                                            const char *why)
 {
+    if (const uint64_t batch = LastBatchTouching(layout, x0, y0, x1, y1, writes, why))
+        m_rasterQueue->waitForCounted(batch);
+}
+
+// Hands over what is pending if it touches those pixels, and returns the
+// number of the last outstanding batch that does (0 if none): once that batch
+// has been drawn the pixels are final.
+uint64_t GSCpuBackend::LastBatchTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
+                                         const char *why)
+{
     if (!m_rasterQueue || !layout.table)
-        return;
+        return 0u;
     RasterQueue &queue = *m_rasterQueue;
-    const bool busy = queue.busy();
-    if (queue.pending.empty() && !busy)
-        return;
+    if (queue.pending.empty() && !queue.busy())
+        return 0u;
     PageSet pages{};
     addPages(pages, layout, x0, y0, x1, y1);
     if (!queue.pending.empty() && (intersects(pages, queue.written) || (writes && intersects(pages, queue.read))))
-    {
-        queue.run(why);
-        return;
-    }
-    if (busy && (intersects(pages, queue.flightWritten) || (writes && intersects(pages, queue.flightRead))))
-        queue.waitIdle();
+        queue.submit(why);
+    uint64_t last = RasterQueue::lastBatch(pages, queue.pageWriter);
+    if (writes)
+        last = std::max(last, RasterQueue::lastBatch(pages, queue.pageReader));
+    return last > queue.retired.load(std::memory_order_acquire) ? last : 0u;
+}
+
+void GSCpuBackend::WaitForBatch(uint64_t batch)
+{
+    if (m_rasterQueue && batch != 0u)
+        m_rasterQueue->waitFor(batch);
 }
 
 // Before queueing a primitive that samples those texels while it is drawn:

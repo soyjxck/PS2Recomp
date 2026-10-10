@@ -87,6 +87,8 @@ private:
     // a surface (anything that reads or writes VRAM outside the queue asks).
     void FlushPrimitives();
     void SubmitPrimitives();
+    uint64_t LastBatchTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes, const char *why);
+    void WaitForBatch(uint64_t batch);
     void SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, const char *why);
     void FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
                                  const char *why = "upload");

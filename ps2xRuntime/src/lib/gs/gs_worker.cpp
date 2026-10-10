@@ -37,6 +37,9 @@ namespace
 
         void loop()
         {
+            // Everything queued is taken in one go, so the threads that post
+            // meet this one at the lock once per run, not per packet.
+            std::deque<std::vector<uint8_t>> taken;
             std::unique_lock<std::mutex> lock(mutex);
             for (;;)
             {
@@ -44,9 +47,7 @@ namespace
                                { return quit || !queue.empty(); });
                 if (queue.empty())
                     return;
-                std::vector<uint8_t> packet = std::move(queue.front());
-                queue.pop_front();
-                queuedBytes -= packet.size();
+                taken.swap(queue);
                 lock.unlock();
 
                 // PS2X_GS_STATS=1: how much of its time the worker spends drawing.
@@ -57,7 +58,13 @@ namespace
                 }();
                 const auto started = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-                gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                size_t bytes = 0;
+                for (const std::vector<uint8_t> &packet : taken)
+                {
+                    gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                    bytes += packet.size();
+                }
+                const uint64_t count = taken.size();
 
                 if (wantStats)
                 {
@@ -66,7 +73,7 @@ namespace
                     static auto windowStart = started;
                     const auto finished = std::chrono::steady_clock::now();
                     busySeconds += std::chrono::duration<double>(finished - started).count();
-                    ++packets;
+                    packets += count;
                     const double window = std::chrono::duration<double>(finished - windowStart).count();
                     if (window >= 2.0)
                     {
@@ -79,9 +86,14 @@ namespace
                 }
 
                 lock.lock();
-                ++completed;
-                if (spare.size() < 64u)
-                    spare.push_back(std::move(packet));
+                completed += count;
+                queuedBytes -= bytes;
+                while (!taken.empty())
+                {
+                    if (spare.size() < 256u)
+                        spare.push_back(std::move(taken.front()));
+                    taken.pop_front();
+                }
                 workDone.notify_all();
             }
         }
@@ -224,21 +236,30 @@ namespace GsWorker
             return;
         }
 
-        std::unique_lock<std::mutex> lock(w.mutex);
-        w.workDone.wait(lock, [&]
-                        { return w.queuedBytes < Worker::kMaxQueuedBytes; });
+        // The copy is made outside the lock.
         std::vector<uint8_t> packet;
-        if (!w.spare.empty())
         {
-            packet = std::move(w.spare.back());
-            w.spare.pop_back();
+            std::unique_lock<std::mutex> lock(w.mutex);
+            w.workDone.wait(lock, [&]
+                            { return w.queuedBytes < Worker::kMaxQueuedBytes; });
+            if (!w.spare.empty())
+            {
+                packet = std::move(w.spare.back());
+                w.spare.pop_back();
+            }
         }
         packet.assign(data, data + sizeBytes);
-        w.queuedBytes += packet.size();
-        w.queue.push_back(std::move(packet));
-        ++w.posted;
-        lock.unlock();
-        w.workReady.notify_one();
+        bool wasEmpty = false;
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            wasEmpty = w.queue.empty();
+            w.queuedBytes += packet.size();
+            w.queue.push_back(std::move(packet));
+            ++w.posted;
+        }
+        // The worker only sleeps on an empty queue.
+        if (wasEmpty)
+            w.workReady.notify_one();
 
         // Sent straight from the EE (no VU1 worker in between): an interrupt
         // this packet raises is pending when the send returns.

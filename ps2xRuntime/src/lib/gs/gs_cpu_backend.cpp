@@ -2123,38 +2123,65 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
 }
 
 // Copies the VRAM pages `count` frames occupy into `out` (a whole-VRAM image
-// whose other pages keep whatever an earlier call left), waiting only for
-// queued drawing that touches them.
+// whose other pages keep whatever an earlier call left), after the queued
+// drawing that touches them. The wait for that drawing is outside the backend
+// lock, so the GS thread keeps going meanwhile.
 void GSCpuBackend::SnapshotFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count,
                                   std::vector<uint8_t> &out)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_vram || m_vramSize == 0u)
+    for (int attempt = 0;; ++attempt)
     {
-        out.clear();
-        return;
-    }
-    if (out.size() != m_vramSize)
-        out.assign(m_vramSize, 0u);
-    for (size_t i = 0; i < count; ++i)
-    {
-        const GSFrameReg &frame = frames[i];
-        const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
-        const uint32_t base = baseIsPages[i] ? framePageBaseToBlock(frame.fbp) : frame.fbp;
-        const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, base, fbw);
-        if (!layout.table || heights[i] == 0u)
-            continue;
-        const int lastX = static_cast<int>(fbw * 64u) - 1;
-        const int lastY = static_cast<int>(heights[i]) - 1;
-        FlushPrimitivesTouching(layout, 0, 0, lastX, lastY, false, "present");
-        const uint32_t rows = (static_cast<uint32_t>(lastY) >> layout.pageHeightShift) + 1u;
-        const uint32_t pages = std::min<uint32_t>(rows * layout.pagesPerRow + (layout.spillsIntoNextPage ? 1u : 0u), kVramPages);
-        for (uint32_t page = 0; page < pages; ++page)
+        uint64_t waitFor = 0;
         {
-            const size_t offset = static_cast<size_t>((layout.basePage + page) % kVramPages) * GSMem::GS_PAGE_SIZE;
-            if (offset + GSMem::GS_PAGE_SIZE <= m_vramSize)
-                std::memcpy(out.data() + offset, m_vram + offset, GSMem::GS_PAGE_SIZE);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_vram || m_vramSize == 0u)
+            {
+                out.clear();
+                return;
+            }
+            if (out.size() != m_vramSize)
+                out.assign(m_vramSize, 0u);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const GSFrameReg &frame = frames[i];
+                const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
+                const uint32_t base = baseIsPages[i] ? framePageBaseToBlock(frame.fbp) : frame.fbp;
+                const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, base, fbw);
+                if (!layout.table || heights[i] == 0u)
+                    continue;
+                waitFor = std::max(waitFor, LastBatchTouching(layout, 0, 0, static_cast<int>(fbw * 64u) - 1,
+                                                              static_cast<int>(heights[i]) - 1, false, "present"));
+            }
+            // More may have been queued for these pages while this thread
+            // waited; after a few rounds, wait with the lock held instead.
+            if (waitFor != 0u && attempt >= 3)
+            {
+                WaitForBatch(waitFor);
+                waitFor = 0u;
+            }
+            if (waitFor == 0u)
+            {
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const GSFrameReg &frame = frames[i];
+                    const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
+                    const uint32_t base = baseIsPages[i] ? framePageBaseToBlock(frame.fbp) : frame.fbp;
+                    const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, base, fbw);
+                    if (!layout.table || heights[i] == 0u)
+                        continue;
+                    const uint32_t rows = ((heights[i] - 1u) >> layout.pageHeightShift) + 1u;
+                    const uint32_t pages = std::min<uint32_t>(rows * layout.pagesPerRow + (layout.spillsIntoNextPage ? 1u : 0u), kVramPages);
+                    for (uint32_t page = 0; page < pages; ++page)
+                    {
+                        const size_t offset = static_cast<size_t>((layout.basePage + page) % kVramPages) * GSMem::GS_PAGE_SIZE;
+                        if (offset + GSMem::GS_PAGE_SIZE <= m_vramSize)
+                            std::memcpy(out.data() + offset, m_vram + offset, GSMem::GS_PAGE_SIZE);
+                    }
+                }
+                return;
+            }
         }
+        WaitForBatch(waitFor);
     }
 }
 
