@@ -153,7 +153,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
     {
         float bc = vt(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * bc;
+            result[c] = std::fma(vs(c), bc, acc(c));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -164,7 +164,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
     {
         float bc = vt(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * bc;
+            result[c] = std::fma(-vs(c), bc, acc(c));
         applyFmacDest(vd, result, dest);
         return;
     }
@@ -228,7 +228,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x21: // MADDq
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * q();
+            result[c] = std::fma(vs(c), q(), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x22: // ADDi
@@ -238,7 +238,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x23: // MADDi
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * i();
+            result[c] = std::fma(vs(c), i(), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x24: // SUBq
@@ -248,7 +248,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x25: // MSUBq
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * q();
+            result[c] = std::fma(-vs(c), q(), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x26: // SUBi
@@ -258,7 +258,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x27: // MSUBi
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * i();
+            result[c] = std::fma(-vs(c), i(), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x28: // ADD
@@ -268,7 +268,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x29: // MADD
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * vt(c);
+            result[c] = std::fma(vs(c), vt(c), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2A: // MUL
@@ -288,7 +288,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         return;
     case 0x2D: // MSUB
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * vt(c);
+            result[c] = std::fma(-vs(c), vt(c), acc(c));
         applyFmacDest(vd, result, dest);
         return;
     case 0x2E: // OPMSUB
@@ -347,7 +347,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         {
             float bc = vt(specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * bc;
+                result[c] = std::fma(vs(c), bc, acc(c));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -358,7 +358,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
         {
             float bc = vt(specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * bc;
+                result[c] = std::fma(-vs(c), bc, acc(c));
             applyFmacDestAcc(result, dest);
             return;
         }
@@ -495,7 +495,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x21: // MADDAq
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * q();
+                result[c] = std::fma(vs(c), q(), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x22: // ADDAi
@@ -505,7 +505,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x23: // MADDAi
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * i();
+                result[c] = std::fma(vs(c), i(), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x24: // SUBAq
@@ -515,7 +515,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x25: // MSUBAq
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * q();
+                result[c] = std::fma(-vs(c), q(), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x26: // SUBAi
@@ -525,7 +525,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x27: // MSUBAi
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * i();
+                result[c] = std::fma(-vs(c), i(), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x28: // ADDA
@@ -535,7 +535,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x29: // MADDA
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * vt(c);
+                result[c] = std::fma(vs(c), vt(c), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2A: // MULA
@@ -550,7 +550,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
             return;
         case 0x2D: // MSUBA
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * vt(c);
+                result[c] = std::fma(-vs(c), vt(c), acc(c));
             applyFmacDestAcc(result, dest);
             return;
         case 0x2E: // OPMULA

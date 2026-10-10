@@ -564,7 +564,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
     {
         float bc = vt(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * bc;
+            result[c] = std::fma(vs(c), bc, acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -576,7 +576,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
     {
         float bc = vt(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * bc;
+            result[c] = std::fma(-vs(c), bc, acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -645,7 +645,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x21: // MADDq
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * q();
+            result[c] = std::fma(vs(c), q(), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -657,7 +657,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x23: // MADDi
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * i();
+            result[c] = std::fma(vs(c), i(), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -669,7 +669,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x25: // MSUBq
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * q();
+            result[c] = std::fma(-vs(c), q(), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -681,7 +681,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x27: // MSUBi
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * i();
+            result[c] = std::fma(-vs(c), i(), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -693,7 +693,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x29: // MADD
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) + vs(c) * vt(c);
+            result[c] = std::fma(vs(c), vt(c), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -716,7 +716,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x2D: // MSUB
         for (int c = 0; c < 4; c++)
-            result[c] = acc(c) - vs(c) * vt(c);
+            result[c] = std::fma(-vs(c), vt(c), acc(c));
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
         return;
@@ -778,7 +778,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         {
             float bc = vt(specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * bc;
+                result[c] = std::fma(vs(c), bc, acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -790,7 +790,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         {
             float bc = vt(specialOp & 3);
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * bc;
+                result[c] = std::fma(-vs(c), bc, acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -937,7 +937,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x21: // MADDAq
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * q();
+                result[c] = std::fma(vs(c), q(), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -949,7 +949,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x23: // MADDAi
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * i();
+                result[c] = std::fma(vs(c), i(), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -961,7 +961,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x25: // MSUBAq
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * q();
+                result[c] = std::fma(-vs(c), q(), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -973,7 +973,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x27: // MSUBAi
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * i();
+                result[c] = std::fma(-vs(c), i(), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -985,7 +985,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x29: // MADDA
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) + vs(c) * vt(c);
+                result[c] = std::fma(vs(c), vt(c), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
@@ -1003,7 +1003,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
             return;
         case 0x2D: // MSUBA
             for (int c = 0; c < 4; c++)
-                result[c] = acc(c) - vs(c) * vt(c);
+                result[c] = std::fma(-vs(c), vt(c), acc(c));
             publishFmac(result, dest);
             sink.acc(dest, result);
             return;
