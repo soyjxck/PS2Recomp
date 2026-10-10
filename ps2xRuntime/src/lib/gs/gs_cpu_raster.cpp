@@ -235,6 +235,55 @@ namespace
     };
 }
 
+// PS2X_GS_PROBE=<x>,<y>[:<secs>[:<count>]]: say what is drawn at one pixel of
+// the frame buffer. From that emulated time, the next <count> (64) triangles
+// and sprites that reach the pixel are reported with what went into it:
+// the vertex colours, the texture and the texel sampled, the blend and the
+// tests, the value before and after. For a model that comes out the wrong
+// colour: is it its vertices, its texture or the state? While a probe is set
+// everything is drawn a pixel at a time (as with PS2X_GS_SCALAR=1).
+namespace
+{
+    struct PixelProbe
+    {
+        bool set = false;
+        int x = 0, y = 0;
+        uint64_t fromTick = 0;
+        int count = 64;
+        std::atomic<int> left{0};
+        std::atomic<bool> armed{false};
+    };
+
+    PixelProbe &pixelProbe()
+    {
+        static PixelProbe probe;
+        static const bool parsed = []
+        {
+            const char *value = std::getenv("PS2X_GS_PROBE");
+            double seconds = 0.0;
+            if (value != nullptr && std::sscanf(value, "%d,%d:%lf:%d", &probe.x, &probe.y, &seconds, &probe.count) >= 2)
+            {
+                probe.set = true;
+                probe.fromTick = static_cast<uint64_t>(seconds * 59.94);
+            }
+            return true;
+        }();
+        (void)parsed;
+        return probe;
+    }
+}
+
+// Called by the EE at each vblank: starts the probe when its time has come.
+void ps2xArmGsProbe(uint64_t tick)
+{
+    PixelProbe &probe = pixelProbe();
+    if (probe.set && tick >= probe.fromTick && !probe.armed.exchange(true))
+    {
+        probe.left.store(probe.count);
+        std::fprintf(stderr, "[probe] pixel (%d, %d) from tick %llu\n", probe.x, probe.y, static_cast<unsigned long long>(tick));
+    }
+}
+
 // Everything a pixel needs, resolved from the draw state once per primitive.
 struct GSCpuBackend::FastPipeline
 {
@@ -2465,7 +2514,7 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
         const char *value = std::getenv("PS2X_GS_SCALAR");
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
-    if (scalarOnly || (p.tme && p.textureIsTarget))
+    if (scalarOnly || pixelProbe().set || (p.tme && p.textureIsTarget))
     {
         RasteriseRowsScalar(primitive, yFirst, yLast, tally);
         return;
@@ -2822,6 +2871,11 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
                 a = flatA;
             }
 
+            // For PS2X_GS_PROBE.
+            const int vertexR = r, vertexG = g, vertexB = b, vertexA = a;
+            float probeU = 0.0f, probeV = 0.0f;
+            uint32_t probeTexel = 0u;
+
             if (p.tme)
             {
                 float texU, texV;
@@ -2840,11 +2894,34 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
                     texU = (rowS + primitive.texS.dx * dx) * invQ * texWf;
                     texV = (rowT + primitive.texT.dx * dx) * invQ * texHf;
                 }
-                p.combine(p.sample(texU, texV), r, g, b, a);
+                probeU = texU;
+                probeV = texV;
+                probeTexel = p.sample(texU, texV);
+                p.combine(probeTexel, r, g, b, a);
             }
 
             const int fog = p.fge ? clampU8(static_cast<int>(rowFog + primitive.fog.dx * dx)) : 0;
+            PixelProbe &probe = pixelProbe();
+            const bool probed = probe.set && x == probe.x && y == probe.y && probe.left.load(std::memory_order_relaxed) > 0 &&
+                                probe.left.fetch_sub(1) > 0;
+            const uint32_t before = probed ? read32(p.vram, FastPipeline::unitIn(p.frame, frameRow, x)) : 0u;
             p.write(x, frameRow, depthRow, static_cast<uint32_t>(z + 0.5), r, g, b, a, fog);
+            if (probed)
+            {
+                std::fprintf(stderr,
+                             "[probe] fbp=0x%x tri (%.0f,%.0f rgba %u,%u,%u,%u) (%.0f,%.0f rgba %u,%u,%u,%u) (%.0f,%.0f rgba %u,%u,%u,%u) gouraud=%d colour %d,%d,%d,%d"
+                             " | tme=%d tfx=%u tcc=%d psm=0x%x tbp=0x%x tbw=%u %dx%d copy=%d cpsm=0x%x csa=%u uv=%.1f,%.1f texel=%08x"
+                             " | out %d,%d,%d,%d fog=%d/%d abe=%d %u%u%u%u fix=%u atest=%d:%u/%u/%u ztst=%u zmsk=%d z=%.0f fbmsk=0x%x | %08x -> %08x\n",
+                             static_cast<unsigned>(p.frame.basePage), v0.x, v0.y, v0.r, v0.g, v0.b, v0.a, v1.x, v1.y, v1.r, v1.g,
+                             v1.b, v1.a, v2.x, v2.y, v2.r, v2.g, v2.b, v2.a, gouraud ? 1 : 0, vertexR, vertexG, vertexB, vertexA,
+                             p.tme ? 1 : 0, static_cast<unsigned>(p.tfx), p.tcc ? 1 : 0, static_cast<unsigned>(p.texPsm), p.tbp0, p.tbw,
+                             p.texW, p.texH, p.decoded != nullptr ? 1 : 0, static_cast<unsigned>(p.cpsm), static_cast<unsigned>(p.csa),
+                             probeU, probeV, probeTexel, r, g, b, a, fog, p.fge ? 1 : 0, p.abe ? 1 : 0, static_cast<unsigned>(p.asel),
+                             static_cast<unsigned>(p.bsel), static_cast<unsigned>(p.csel), static_cast<unsigned>(p.dsel),
+                             static_cast<unsigned>(p.fix), p.alphaTest ? 1 : 0, static_cast<unsigned>(p.atst), static_cast<unsigned>(p.aref),
+                             static_cast<unsigned>(p.afail), static_cast<unsigned>(p.ztst), p.zmask ? 1 : 0, z, p.fbmsk, before,
+                             read32(p.vram, FastPipeline::unitIn(p.frame, frameRow, x)));
+            }
         }
     }
 }
