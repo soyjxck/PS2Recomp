@@ -243,8 +243,27 @@ void register_code_generator_tests()
         const size_t radicand = vu.find("ctx->vu0_vf[6], ctx->vu0_vf[6], _MM_SHUFFLE(0,0,0,0)");
         t.IsTrue(numerator != std::string::npos && radicand != std::string::npos && numerator < radicand,
                  "VRSQRT reads fs.fsf as the numerator and ft.ftf as the radicand");
-        t.IsTrue(vu.find("ctx->vu0_q = (ft > 0.0f) ? (fs / sqrtf(ft)) : 0.0f;") != std::string::npos,
-                 "VRSQRT divides the numerator by the root and keeps 0 for other radicands");
+        t.IsTrue(vu.find("ctx->vu0_q = PS2_VU0_RSQRT(fs, ft);") != std::string::npos,
+                 "VRSQRT divides the numerator by the root of the radicand");
+    });
+
+    tc.Run("VU0 macro arithmetic sets MAC flags and cannot write VF0", [](TestCase &t) {
+        CodeGenerator gen({}, {});
+        R5900Decoder decoder;
+
+        // vsub.xyzw vf0, vf13, vf12 followed by cfc2 of the MAC register is how
+        // games compare two vectors: the difference is discarded, the flags kept.
+        const auto compare = gen.translateInstruction(decoder.decodeInstruction(0x1000, 0x4bec682cu));
+        const size_t flags = compare.find("PS2_VU0_SET_FLAGS(ctx, res, 0xF);");
+        const size_t restore = compare.find("ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);");
+        t.IsTrue(flags != std::string::npos, "VSUB publishes the MAC flags of its result");
+        t.IsTrue(restore != std::string::npos && flags < restore, "a write to VF0 leaves (0, 0, 0, 1) behind");
+
+        // vftoi4.xy vf13, vf12 converts without touching the flags.
+        const auto convert = gen.translateInstruction(decoder.decodeInstruction(0x1000, 0x4b8d617du));
+        t.IsTrue(convert.find("PS2_VU0_SET_FLAGS") == std::string::npos, "VFTOI leaves the MAC flags alone");
+        t.IsTrue(convert.find("_mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f)") == std::string::npos,
+                 "a write to another register does not reset VF0");
     });
 
     tc.Run("SYSCALL publishes its continuation before entering the runtime", [](TestCase &t) {
@@ -2048,33 +2067,29 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+        tc.Run("VU random helpers keep R a 23-bit sequence under the exponent of 1.0", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction inst{};
             inst.rd = 7;
+            inst.rt = 5;
             inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.vectorField = 0x8;
 
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
+            const std::string vrnext = gen.translateVU_VRNEXT(inst);
+            t.IsTrue(vrnext.find("ctx->vu0_r = PS2_VU0_R_NEXT(ctx->vu0_r);") != std::string::npos,
+                     "VRNEXT advances the sequence");
+            t.IsTrue(vrnext.find("ctx->vu0_vf[5] = ") != std::string::npos,
+                     "VRNEXT stores the new value in ft");
 
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
+            const std::string vrinit = gen.translateVU_VRINIT(inst);
+            t.IsTrue(vrinit.find("ctx->vu0_vf[7], ctx->vu0_vf[7], _MM_SHUFFLE(0,0,0,2)") != std::string::npos &&
+                         vrinit.find("ctx->vu0_r = PS2_VU0_R_INIT(src);") != std::string::npos,
+                     "VRINIT seeds R from fs.fsf");
 
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
+            const std::string vrxor = gen.translateVU_VRXOR(inst);
+            t.IsTrue(vrxor.find("ctx->vu0_r = PS2_VU0_R_XOR(ctx->vu0_r, src);") != std::string::npos,
+                     "VRXOR mixes fs.fsf into R");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {

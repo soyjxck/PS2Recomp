@@ -156,6 +156,93 @@ static inline __m128 ps2ClampPs(__m128 v)
 #define PS2_VADD(a, b) ps2ClampPs(_mm_add_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
 #define PS2_VSUB(a, b) ps2ClampPs(_mm_sub_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
 #define PS2_VMUL(a, b) ps2ClampPs(_mm_mul_ps(ps2ClampPs((__m128)(a)), ps2ClampPs((__m128)(b))))
+// VU0 macro mode: MAC and status flags of an arithmetic result. `dest` is the
+// instruction's dest field (x=8, y=4, z=2, w=1), which is also the bit order of
+// the zero and sign nibbles in the MAC register.
+static inline void ps2Vu0SetFlags(__m128 res, uint32_t dest, uint32_t &mac, uint16_t &status)
+{
+    static const uint8_t kLaneToDest[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    const __m128i exponent = _mm_and_si128(_mm_castps_si128(res), _mm_set1_epi32(0x7F800000));
+    const uint32_t zero = kLaneToDest[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(exponent, _mm_setzero_si128()))) & 0xF] & dest;
+    const uint32_t sign = kLaneToDest[_mm_movemask_ps(res) & 0xF] & dest;
+    mac = zero | (sign << 4);
+    const uint32_t now = (zero != 0u ? 0x1u : 0u) | (sign != 0u ? 0x2u : 0u);
+    status = static_cast<uint16_t>((status & 0xFF0u) | now | (now << 6)); // current flags and their sticky copies
+}
+#define PS2_VU0_SET_FLAGS(ctx, res, dest) ps2Vu0SetFlags((res), (dest), (ctx)->vu0_mac_flags, (ctx)->vu0_status)
+
+static inline float ps2Vu0Clamp(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) == 0x7F800000u)
+        bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+    else if ((bits & 0x7F800000u) == 0u)
+        bits &= 0x80000000u;
+    std::memcpy(&value, &bits, sizeof(bits));
+    return value;
+}
+
+// DIV, SQRT and RSQRT as the VU computes Q: no NaN or infinity, a zero divisor
+// gives the largest float with the sign of the operands, and roots take |ft|.
+static inline float ps2Vu0Div(float fs, float ft)
+{
+    fs = ps2Vu0Clamp(fs);
+    ft = ps2Vu0Clamp(ft);
+    if (ft == 0.0f)
+        return (std::signbit(fs) != std::signbit(ft)) ? -3.4028234663852886e38f : 3.4028234663852886e38f;
+    return ps2Vu0Clamp(fs / ft);
+}
+
+static inline float ps2Vu0Sqrt(float ft)
+{
+    return sqrtf(fabsf(ps2Vu0Clamp(ft)));
+}
+
+static inline float ps2Vu0Rsqrt(float fs, float ft)
+{
+    fs = ps2Vu0Clamp(fs);
+    ft = ps2Vu0Clamp(ft);
+    if (ft == 0.0f)
+        return (std::signbit(fs) != std::signbit(ft)) ? -3.4028234663852886e38f : 3.4028234663852886e38f;
+    return ps2Vu0Clamp(fs / sqrtf(fabsf(ft)));
+}
+#define PS2_VU0_DIV(fs, ft) ps2Vu0Div((fs), (ft))
+#define PS2_VU0_SQRT(ft) ps2Vu0Sqrt((ft))
+#define PS2_VU0_RSQRT(fs, ft) ps2Vu0Rsqrt((fs), (ft))
+
+// The R register: a 23-bit M-sequence under the exponent of 1.0, so it reads
+// as a float in [1, 2). All four lanes of vu0_r hold the same word.
+static inline __m128 ps2Vu0RFromBits(uint32_t bits)
+{
+    return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(0x3F800000u | (bits & 0x007FFFFFu))));
+}
+
+static inline __m128 ps2Vu0RInit(float seed)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &seed, sizeof(bits));
+    return ps2Vu0RFromBits(bits);
+}
+
+static inline __m128 ps2Vu0RXor(__m128 r, float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return ps2Vu0RFromBits(static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(r))) ^ bits);
+}
+
+static inline __m128 ps2Vu0RNext(__m128 r)
+{
+    uint32_t bits = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(r)));
+    const uint32_t feedback = ((bits >> 4) ^ (bits >> 22)) & 1u;
+    bits = (bits << 1) ^ feedback;
+    return ps2Vu0RFromBits(bits);
+}
+#define PS2_VU0_R_INIT(seed) ps2Vu0RInit((seed))
+#define PS2_VU0_R_XOR(r, value) ps2Vu0RXor((r), (value))
+#define PS2_VU0_R_NEXT(r) ps2Vu0RNext((r))
+
 #define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
