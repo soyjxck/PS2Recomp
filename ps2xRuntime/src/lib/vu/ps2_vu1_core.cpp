@@ -64,6 +64,25 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
+namespace
+{
+    // Resets the PATH1 transfer state but not its 64 KiB packet buffer: every
+    // byte is copied in before it is read or submitted, and clearing it at
+    // every MSCAL and XGKICK is a memset of the whole buffer each time.
+    template <typename Xgkick>
+    void resetXgkickTransfer(Xgkick &xgkick)
+    {
+        xgkick.sourceAddress = 0;
+        xgkick.totalBytes = 0;
+        xgkick.copiedBytes = 0;
+        xgkick.currentTagEnd = 0;
+        xgkick.cycleCredit = 0;
+        xgkick.issueCycle = 0;
+        xgkick.active = false;
+        xgkick.currentTagEop = false;
+    }
+}
+
 void VU1Interpreter::resetScheduler()
 {
     m_flagPipeline = {};
@@ -73,7 +92,7 @@ void VU1Interpreter::resetScheduler()
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
-    m_xgkick = {};
+    resetXgkickTransfer(m_xgkick);
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -950,7 +969,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    resetXgkickTransfer(m_xgkick);
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
