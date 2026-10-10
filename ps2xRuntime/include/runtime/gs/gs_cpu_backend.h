@@ -248,6 +248,8 @@ private:
     void FillShadow(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1);
     void MarkShadowDrawn(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1);
     void ScaleUp(PreparedPrimitive &primitive, SurfaceScale scale) const;
+    bool PrepareBlit(PreparedPrimitive &scaled, const GSContext &context);
+    static void BlitRows(const PreparedPrimitive &primitive, int yFirst, int yLast);
     bool CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width, uint32_t height,
                          std::vector<uint8_t> &outPixels);
 

@@ -1689,6 +1689,16 @@ struct GSCpuBackend::PreparedPrimitive
     float spanX = 1.0f, spanY = 1.0f;
     float tu0 = 0.0f, tv0 = 0.0f, tu1 = 0.0f, tv1 = 0.0f;
 
+    // A sprite drawn into the shadow that only copies a frame buffer (see
+    // PrepareBlit): where the pixels come from, which may be the shadow as
+    // well, and how much larger that copy of the texture is.
+    bool blit = false;
+    const uint8_t *blitSource = nullptr;
+    uint32_t blitMask = 0;
+    GSMem::SurfaceLayout blitLayout;
+    int blitScaleX = 1, blitScaleY = 1;
+    int blitMaxU = 0, blitMaxV = 0;
+
     bool empty() const { return maxX < minX || maxY < minY; }
 };
 
@@ -2515,6 +2525,11 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
 
 void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally)
 {
+    if (primitive.blit)
+    {
+        BlitRows(primitive, yFirst, yLast);
+        return;
+    }
     const FastPipeline &p = primitive.pipeline;
     if (primitive.line)
     {
@@ -3208,6 +3223,117 @@ void GSCpuBackend::ScaleUp(PreparedPrimitive &primitive, SurfaceScale scale) con
     primitive.zDy /= ny;
 }
 
+// A scaled sprite that does nothing but copy a frame buffer on to another
+// (filtered, perhaps mixed with what is there): the game squeezing its frame
+// into a field, most of all, which is every pixel of the picture twice over
+// each frame. It is drawn by BlitRows instead of the general path, and it
+// takes the texture from the shadow when the frame buffer it is has a larger
+// copy there, so that a higher resolution reaches the display. False when
+// the primitive is anything else.
+bool GSCpuBackend::PrepareBlit(PreparedPrimitive &scaled, const GSContext &context)
+{
+    const FastPipeline &p = scaled.pipeline;
+    if (!scaled.sprite || !p.tme || !p.fst || p.decoded || p.regionRepeat || p.texKind != TextureKind::Direct32 || p.tfx != 1u ||
+        p.fge || p.alphaTest || p.date || !p.zmask || p.ztst != 1u || p.frameKind != FrameKind::C32 || p.fbmsk != 0u ||
+        (p.abe && p.pabe) || (context.tex0.tbp0 & 31u) != 0u || !p.texture.table || p.texture.spillsIntoNextPage)
+        return false;
+    // From the shadow only if these very pages are a surface drawn there,
+    // laid out as the texture is. A texture that starts part of the way
+    // into a frame buffer, or anything else that only looks like one, has
+    // its copy somewhere else in the shadow or nowhere: filling one for it
+    // here would write over another surface's.
+    const SurfaceScale from = ScaleOf(context.tex0.tbp0 >> 5, context.tex0.tbw);
+    if (from.larger() && m_shadow &&
+        !ShadowStale(p.texture, from, p.sampledU0, std::max(p.sampledV0 - 2, 0), p.sampledU1, p.sampledV1))
+    {
+        scaled.blitSource = m_shadow.get();
+        scaled.blitMask = m_shadowMask;
+        scaled.blitLayout = ShadowLayout(p.texture, from);
+        scaled.blitScaleX = from.x;
+        scaled.blitScaleY = from.y;
+    }
+    else
+    {
+        scaled.blitSource = m_vram;
+        scaled.blitMask = kVramMask;
+        scaled.blitLayout = p.texture;
+        scaled.blitScaleX = scaled.blitScaleY = 1;
+    }
+    // Down to the last row the sprite's coordinates name and no further:
+    // filtering reaches half a texel past it, and below a frame buffer is
+    // some other surface (the line of rubbish at the foot of the picture).
+    const int rows = static_cast<int>(std::ceil(std::max(scaled.tv0, scaled.tv1)));
+    scaled.blitMaxU = p.texW * scaled.blitScaleX - 1;
+    scaled.blitMaxV = std::min(p.texH, std::max(rows, 1)) * scaled.blitScaleY - 1;
+    scaled.blit = true;
+    return true;
+}
+
+// Rows yFirst..yLast of such a copy: for each, the two rows of the source it
+// lies between are fetched once, and every pixel is the four texels around
+// it weighed by how near they are (as FastPipeline::sample does), then mixed
+// with the pixel already there if the primitive blends.
+void GSCpuBackend::BlitRows(const PreparedPrimitive &q, int yFirst, int yLast)
+{
+    const FastPipeline &p = q.pipeline;
+    const int y0 = std::max(yFirst, q.minY), y1 = std::min(yLast, q.maxY);
+    if (y0 > y1 || q.maxX < q.minX)
+        return;
+    // Texels of the source's copy per pixel drawn, and where the first pixel is.
+    const double stepU = static_cast<double>(q.tu1 - q.tu0) / q.spanX * q.blitScaleX;
+    const double stepV = static_cast<double>(q.tv1 - q.tv0) / q.spanY * q.blitScaleY;
+    const double firstU = (q.tu0 * q.blitScaleX) + (static_cast<double>(q.minX - q.originX) + 0.5) * stepU - 0.5;
+    const double lastU = firstU + static_cast<double>(q.maxX - q.minX) * stepU;
+    const int lowU = static_cast<int>(std::floor(std::min(firstU, lastU)));
+    const int count = static_cast<int>(std::floor(std::max(firstU, lastU))) - lowU + 2;
+    thread_local std::vector<uint32_t> fetched;
+    fetched.resize(static_cast<size_t>(count) * 2u);
+    uint32_t *const upper = fetched.data(), *const lower = fetched.data() + count;
+    const int64_t fixedStep = static_cast<int64_t>(std::llround(stepU * 65536.0));
+    const int64_t fixedFirst = static_cast<int64_t>(std::llround((firstU - lowU) * 65536.0));
+    const int alphaFix = p.fix;
+    for (int y = y0; y <= y1; ++y)
+    {
+        const double sv = (q.tv0 * q.blitScaleY) + (static_cast<double>(y - q.originY) + 0.5) * stepV - 0.5;
+        const int v = static_cast<int>(std::floor(sv));
+        const uint32_t wy = static_cast<uint32_t>((sv - v) * 256.0 + 0.5);
+        const FastPipeline::Row rowA = FastPipeline::rowOf(q.blitLayout, clampInt(v, 0, q.blitMaxV));
+        const FastPipeline::Row rowB = FastPipeline::rowOf(q.blitLayout, clampInt(v + 1, 0, q.blitMaxV));
+        for (int i = 0; i < count; ++i)
+        {
+            const int u = clampInt(lowU + i, 0, q.blitMaxU);
+            std::memcpy(&upper[i], q.blitSource + ((FastPipeline::unitIn(q.blitLayout, rowA, u) * 4u) & (q.blitMask - 3u)), 4u);
+            std::memcpy(&lower[i], q.blitSource + ((FastPipeline::unitIn(q.blitLayout, rowB, u) * 4u) & (q.blitMask - 3u)), 4u);
+        }
+        const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+        int64_t at = fixedFirst;
+        for (int x = q.minX; x <= q.maxX; ++x, at += fixedStep)
+        {
+            const int i = clampInt(static_cast<int>(at >> 16), 0, count - 2);
+            const uint32_t wx = static_cast<uint32_t>((at & 0xFFFF) + 128) >> 8;
+            uint32_t colour = lerpColor(lerpColor(upper[i], upper[i + 1], wx), lerpColor(lower[i], lower[i + 1], wx), wy);
+            const uint32_t unit = FastPipeline::unitIn(p.frame, frameRow, x);
+            int a = p.tcc ? static_cast<int>(colour >> 24) : q.v[1].a;
+            if (p.abe)
+            {
+                const uint32_t there = p.tread32(unit);
+                const int alpha = p.csel == 0u ? a : (p.csel == 1u ? static_cast<int>(there >> 24) : alphaFix);
+                auto blend = [&](int source, int dest)
+                {
+                    const int difference = ((source & p.maskAS) | (dest & p.maskAD)) - ((source & p.maskBS) | (dest & p.maskBD));
+                    return static_cast<uint32_t>(clampU8(((difference * alpha) >> 7) + ((source & p.maskDS) | (dest & p.maskDD))));
+                };
+                colour = blend(static_cast<int>(colour & 0xFFu), static_cast<int>(there & 0xFFu)) |
+                         (blend(static_cast<int>((colour >> 8) & 0xFFu), static_cast<int>((there >> 8) & 0xFFu)) << 8) |
+                         (blend(static_cast<int>((colour >> 16) & 0xFFu), static_cast<int>((there >> 16) & 0xFFu)) << 16);
+            }
+            if (p.fba)
+                a |= 0x80;
+            p.twrite32(unit, (colour & 0x00FFFFFFu) | (static_cast<uint32_t>(a & 0xFF) << 24));
+        }
+    }
+}
+
 // The picture a display circuit shows, from the shadow: `width` by `height`
 // of the game's pixels from (originX, originY) of the frame, scaled, as
 // packed RGBA. False when the frame has no copy that size.
@@ -3360,6 +3486,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         if (twice)
         {
             ScaleUp(primitive, scale);
+            PrepareBlit(primitive, ctx);
             Rasterise(primitive, primitive.minY, primitive.maxY);
         }
         return true;
@@ -3395,6 +3522,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     if (twice)
     {
         ScaleUp(primitive, scale);
+        PrepareBlit(primitive, ctx);
         queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
                                static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
         queue.pending.push_back(primitive);
