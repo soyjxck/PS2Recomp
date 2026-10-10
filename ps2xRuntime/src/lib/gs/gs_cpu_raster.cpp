@@ -2390,23 +2390,81 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     const GSVertex &v1 = batch.vertices[1];
     const GSContext &ctx = state.context;
 
-    const int ofx = ctx.xyoffset.ofx >> 4;
-    const int ofy = ctx.xyoffset.ofy >> 4;
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    // One way of the sprite: the pixels it covers, and how its texture is
+    // laid over them.
+    //
+    // The sprite goes on whole pixels: where its first corner lies part of
+    // a pixel along, that part is dropped (so a frame a game sets half a
+    // line down for the other field stays where it was), and it covers as
+    // many pixels as reach its second corner. Most sprites are a whole
+    // number of pixels with their texture texel for texel, or with the
+    // half texel a game adds for the GS's filtering at both corners; those
+    // have the texture's fractions dropped as well, and each pixel reads
+    // the middle of what it covers.
+    // The rest read what the GS reads: the texel coordinate of the pixel's
+    // own place between the corners. (A game that halves its picture in
+    // strips 15.75 pixels wide, to blur it, relies on that: the strips
+    // leave a column out of every sixteen otherwise, and the picture
+    // comes back from each halving a texel off.)
+    struct Way
+    {
+        int first = 0;        // the first pixel
+        int count = 1;        // how many
+        bool flipped = false; // the second vertex comes first
+        bool exact = false;   // texel coordinates as the GS has them
+        float inset = 0.0f;   // exact: from the first corner to the first pixel
+        float extent = 1.0f;  // exact: pixels from corner to corner
+    };
+    auto wayOf = [&p](float from, float to, int offset, uint32_t texelFrom, uint32_t texelTo, bool across)
+    {
+        Way way;
+        // Sixteenths of a pixel, as the GS has them.
+        int a = static_cast<int>(std::lround(from * 16.0f)), b = static_cast<int>(std::lround(to * 16.0f));
+        way.flipped = a > b;
+        if (way.flipped)
+        {
+            std::swap(a, b);
+            std::swap(texelFrom, texelTo);
+        }
+        const int extent = b - a;
+        way.first = (a >> 4) - (offset >> 4);
+        way.count = std::max(1, (extent + 15) >> 4);
+        if (extent <= 0 || !p.tme)
+            return way;
+        way.extent = static_cast<float>(extent) * 0.0625f;
+        const bool whole = (extent & 15) == 0;
+        if (!p.fst)
+        {
+            way.exact = !whole;
+            return way;
+        }
+        const bool level = whole && static_cast<int>(texelTo) - static_cast<int>(texelFrom) == extent;
+        if (level && across && p.linear && ((a - offset) & 15) != 0)
+        {
+            // Texel for texel but part of a pixel across, and filtered: a
+            // blur, which is that part of a pixel and nothing else. Where
+            // the GS has it, then.
+            const int corner = a - offset;
+            way.first = (corner + 15) >> 4;
+            way.count = std::max(1, ((b - offset + 15) >> 4) - way.first);
+            way.inset = static_cast<float>((way.first << 4) - corner) * 0.0625f;
+            way.exact = true;
+        }
+        else
+        {
+            way.exact = !(whole && (level || ((texelFrom & 15u) == 8u && (texelTo & 15u) == 8u)));
+        }
+        return way;
+    };
+    const Way across = wayOf(v0.x, v1.x, ctx.xyoffset.ofx, v0.u, v1.u, true);
+    const Way down = wayOf(v0.y, v1.y, ctx.xyoffset.ofy, v0.v, v1.v, false);
 
     // Which corner each vertex is at decides the direction the texture runs.
-    const bool flipX = x0 > x1;
-    const bool flipY = y0 > y1;
-    if (flipX)
-        std::swap(x0, x1);
-    if (flipY)
-        std::swap(y0, y1);
-
-    const int spanX = std::max(1, x1 - x0);
-    const int spanY = std::max(1, y1 - y0);
+    const bool flipX = across.flipped;
+    const bool flipY = down.flipped;
+    const int x0 = across.first, y0 = down.first;
+    const int spanX = across.count;
+    const int spanY = down.count;
     const int lastX = x0 + spanX - 1;
     const int lastY = y0 + spanY - 1;
     if (lastX < p.scissorX0 || x0 > p.scissorX1 || lastY < p.scissorY0 || y0 > p.scissorY1)
@@ -2431,10 +2489,10 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     float tu0, tv0, tu1, tv1;
     if (p.fst)
     {
-        tu0 = static_cast<float>(v0.u >> 4);
-        tv0 = static_cast<float>(v0.v >> 4);
-        tu1 = static_cast<float>(v1.u >> 4);
-        tv1 = static_cast<float>(v1.v >> 4);
+        tu0 = across.exact ? static_cast<float>(v0.u) * 0.0625f : static_cast<float>(v0.u >> 4);
+        tv0 = down.exact ? static_cast<float>(v0.v) * 0.0625f : static_cast<float>(v0.v >> 4);
+        tu1 = across.exact ? static_cast<float>(v1.u) * 0.0625f : static_cast<float>(v1.u >> 4);
+        tv1 = down.exact ? static_cast<float>(v1.v) * 0.0625f : static_cast<float>(v1.v >> 4);
     }
     else
     {
@@ -2452,6 +2510,18 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
         std::swap(tu0, tu1);
     if (flipY)
         std::swap(tv0, tv1);
+    // What follows takes a pixel to read the middle of its share of what
+    // lies between these two; the GS has it read its own place.
+    auto asRead = [](const Way &way, float &first, float &last)
+    {
+        if (!way.exact)
+            return;
+        const float step = (last - first) / way.extent;
+        first += (way.inset - 0.5f) * step;
+        last = first + static_cast<float>(way.count) * step;
+    };
+    asRead(across, tu0, tu1);
+    asRead(down, tv0, tv1);
     primitive.tu0 = tu0;
     primitive.tv0 = tv0;
     primitive.tu1 = tu1;
