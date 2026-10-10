@@ -101,6 +101,8 @@ namespace GSGpu
         uint8_t fge = 0, fogR = 0, fogG = 0, fogB = 0;
         uint8_t writeRgb = 1, writeAlpha = 1;
         uint8_t date = 0, datm = 0; // the destination alpha test, and the bit it wants
+        uint8_t alphaOver = 0;      // a pixel's alpha may be more than 0x80, the GS's one
+        uint8_t unused[3]{};
     };
 
     // Pixels asked for with Renderer::Read, when the graphics card gets to them.

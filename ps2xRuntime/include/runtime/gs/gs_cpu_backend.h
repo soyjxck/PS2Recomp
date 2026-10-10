@@ -65,6 +65,7 @@ private:
         int height = 0; // rows it has: the image's
         std::vector<uint32_t> pixels; // RGBA, row major
         uint32_t gpuTexture = 0; // the same as a texture of the graphics card's, once it has drawn with it
+        uint8_t gpuMaxAlpha = 0; // ...and the largest alpha in it
     };
     struct PreparedPrimitive;
     // What a Rasterise call covered, for PS2X_GS_STATS.

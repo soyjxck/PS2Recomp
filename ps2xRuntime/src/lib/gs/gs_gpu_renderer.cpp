@@ -22,7 +22,9 @@
 //   shader multiplies by X and passes Y as a second output for the blend
 //   state to multiply by (dual source blending); a negative one turns
 //   the blend equation into a subtraction. Alpha from the frame buffer
-//   and Y = 1 + alpha have no such form and are drawn in two passes.
+//   and Y = 1 + alpha have no such form and are drawn in two passes. So
+//   is Y = 1 - alpha where alpha may pass one (0x80; smoke does): the
+//   pixels under it as a sum, the pixels over it as a difference.
 // - An alpha test that keeps part of a failing pixel (its colour but not
 //   its depth, say) is two passes as well: the pixels that pass, then the
 //   ones that fail with less written.
@@ -152,6 +154,7 @@ uniform int uBlendAlpha;    // 0 the pixel's alpha, 2 uFix
 uniform float uFix;
 uniform int uPabe;
 uniform int uFba;
+uniform int uAlphaSplit;    // 0 all, 1 only pixels whose blending alpha is at most one, 2 only the others
 uniform sampler2D uFrame;   // a copy of what is being drawn into, for uDate
 uniform int uDate;          // 0 none, 1 draw where the frame's alpha is below 0x80, 2 where it is not
 
@@ -258,6 +261,8 @@ void main()
             discard;
     }
     float alpha = (uBlendAlpha == 0 ? a : uFix) / 128.0;
+    if (uAlphaSplit != 0 && (alpha > 1.0) != (uAlphaSplit == 2))
+        discard;
     float source = max(uBlendSource.x + uBlendSource.y * alpha, 0.0);
     float dest = clamp(uBlendDest.x + uBlendDest.y * alpha, 0.0, 1.0);
     if (uPabe != 0 && a < 128.0)
@@ -452,7 +457,7 @@ void main()
         {
             GLint toClip, texture, textureMode, linear, tfx, tcc, wrap, region, texSize, texOrigin, texExtent, surfaceTexel,
                 texAlphaFixed, ta0, aem, fog, fogColour, alphaTest, atst, aref, output, blendSource, blendDest, blendAlpha, fix,
-                pabe, fba, frame, date;
+                pabe, fba, frame, date, alphaSplit;
         } at{};
         struct
         {
@@ -795,6 +800,7 @@ void main()
         PS2X_UNIFORM(fba, "uFba");
         PS2X_UNIFORM(frame, "uFrame");
         PS2X_UNIFORM(date, "uDate");
+        PS2X_UNIFORM(alphaSplit, "uAlphaSplit");
 #undef PS2X_UNIFORM
         fillAt.rect = glGetUniformLocation(fillProgram, "uRect");
         fillAt.size = glGetUniformLocation(fillProgram, "uSize");
@@ -1125,8 +1131,18 @@ void main()
                 sourceY = static_cast<float>(x1);
                 destX = static_cast<float>(y0);
                 destY = static_cast<float>(y1);
+                // A fixed alpha past one makes 1 - alpha a subtraction for every pixel.
+                if (blend == Blend::General && equation == GL_FUNC_ADD && alphaFrom == 2 && fix > 128.0f && y0 == 1 && y1 == -1)
+                {
+                    equation = GL_FUNC_SUBTRACT;
+                    destX = -1.0f;
+                    destY = 1.0f;
+                }
             }
         }
+        // ...and the pixel's own alpha past one, for those pixels.
+        const bool split = blend == Blend::General && equation == GL_FUNC_ADD && alphaFrom == 0 && p.alphaOver && destX == 1.0f &&
+                           destY == -1.0f;
 
         glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(p.colour, depthUsed ? p.depth : 0u));
         glViewport(0, 0, colour->width * colour->scaleX, colour->height * colour->scaleY);
@@ -1252,7 +1268,18 @@ void main()
                 glUniform1i(at.output, 0);
                 glUniform2f(at.blendSource, sourceX, sourceY);
                 glUniform2f(at.blendDest, destX, destY);
+                if (!split)
+                {
+                    draw(pass.rgb, pass.alpha, pass.depth);
+                    break;
+                }
+                glUniform1i(at.alphaSplit, 1);
                 draw(pass.rgb, pass.alpha, pass.depth);
+                glUniform1i(at.alphaSplit, 2);
+                glBlendEquationSeparate(GL_FUNC_SUBTRACT, GL_FUNC_ADD);
+                glUniform2f(at.blendDest, -1.0f, 1.0f);
+                draw(pass.rgb, pass.alpha, pass.depth);
+                glUniform1i(at.alphaSplit, 0);
                 break;
             case Blend::FrameAlphaAdd:
                 // The frame's alpha is 0x80 for one, which reads as a half:

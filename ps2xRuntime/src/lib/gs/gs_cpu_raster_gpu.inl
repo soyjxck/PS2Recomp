@@ -72,8 +72,10 @@ struct GSCpuBackend::GpuState
         uint64_t checkedUpload = 0;           // m_lastUploadSerial when they were last found untouched
         uint64_t hash = 0;
         uint64_t lastUsed = 0;
+        uint8_t maxAlpha = 0;
     };
     std::unordered_map<uint64_t, Texture> textures;
+    int textureMaxAlpha = 255; // of the texture GpuTexture chose last
     uint64_t clock = 0;
 
     std::vector<uint32_t> pixels;
@@ -724,6 +726,10 @@ void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
                 *out++ = p.fetch(u, v);
         const uint64_t hash = hashBytes(reinterpret_cast<const uint8_t *>(gpu.pixels.data()), gpu.pixels.size() * sizeof(uint32_t),
                                         0x452821E638D01377ull);
+        uint32_t most = 0u;
+        for (uint32_t pixel : gpu.pixels)
+            most = std::max(most, pixel >> 24);
+        texture.maxAlpha = static_cast<uint8_t>(most);
         ++gpu.statDecodes;
         // The same texels as before, as often as not: something next to
         // them was written.
@@ -743,6 +749,7 @@ void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
         texture.checkedUpload = m_lastUploadSerial;
     }
     texture.lastUsed = ++gpu.clock;
+    gpu.textureMaxAlpha = texture.maxAlpha;
     state.texture = texture.id;
     state.textureMode = GSGpu::TextureTexels;
     state.texOrigin[0] = static_cast<int16_t>(texture.x0);
@@ -818,6 +825,8 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
                     // of them leaves a seam at every strip.)
                     state.texExtent[1] = static_cast<int16_t>(std::min(p.texH, std::max(static_cast<int>(std::ceil(std::max(q.tv0, q.tv1))), 1)));
                 }
+                // A frame buffer's alpha is whatever was drawn; one read as 24 bits has TEXA's.
+                gpu.textureMaxAlpha = p.texKind == TextureKind::Direct24 ? p.texa.ta0 : 255;
                 ++gpu.statSurfaceTextures;
                 return;
             }
@@ -831,8 +840,13 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
         {
             copy.gpuTexture = gpu.renderer->NewSurface(GSGpu::SurfaceKind::Texture, copy.width, copy.height, 1, 1);
             gpu.renderer->SetTexture(copy.gpuTexture, copy.width, copy.height, copy.pixels.data());
+            uint32_t most = 0u;
+            for (uint32_t pixel : copy.pixels)
+                most = std::max(most, pixel >> 24);
+            copy.gpuMaxAlpha = static_cast<uint8_t>(most);
             ++gpu.statUploads;
         }
+        gpu.textureMaxAlpha = copy.gpuMaxAlpha;
         state.texture = copy.gpuTexture;
         state.textureMode = GSGpu::TextureTexels;
         state.texExtent[0] = static_cast<int16_t>(copy.width);
@@ -997,6 +1011,21 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
         // Q that is nothing would be divided by.
         if (std::fabs(out[0].q) < 1.0e-12f && std::fabs(out[1].q) < 1.0e-12f && std::fabs(out[2].q) < 1.0e-12f)
             out[0].q = out[1].q = out[2].q = 1.0f;
+    }
+    // Can the alpha the pixels blend with pass 0x80? From the largest the
+    // vertices have and the largest in the texture.
+    if (p.abe && p.csel == 0u)
+    {
+        int vertexAlpha = 0;
+        for (size_t i = 0; i < count; ++i)
+            vertexAlpha = std::max<int>(vertexAlpha, out[i].a);
+        int most = vertexAlpha;
+        if (p.tme && p.tcc)
+        {
+            const int texel = gpu.textureMaxAlpha;
+            most = p.tfx == 0u ? (texel * vertexAlpha) >> 7 : (p.tfx == 2u ? texel + vertexAlpha : texel);
+        }
+        state.alphaOver = most > 128 ? 1u : 0u;
     }
     gpu.renderer->Draw(state, out, count);
 
