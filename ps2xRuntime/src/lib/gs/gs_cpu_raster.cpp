@@ -26,6 +26,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
+#include "runtime/ps2_settings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -289,6 +290,33 @@ struct GSCpuBackend::FastPipeline
 {
     uint8_t *vram = nullptr;
     GSCpuBackend *backend = nullptr;
+    // Where the frame and depth buffers are: VRAM, or for a primitive drawn
+    // again at a higher resolution the backend's larger copy of them (see
+    // GSCpuBackend::m_shadow), which wraps at its own size.
+    uint8_t *target = nullptr;
+    uint32_t targetMask = kVramMask;
+
+    [[gnu::always_inline]] inline uint32_t tread32(uint32_t unit) const
+    {
+        uint32_t value;
+        std::memcpy(&value, target + ((unit * 4u) & (targetMask - 3u)), sizeof(value));
+        return value;
+    }
+    [[gnu::always_inline]] inline void twrite32(uint32_t unit, uint32_t value) const
+    {
+        std::memcpy(target + ((unit * 4u) & (targetMask - 3u)), &value, sizeof(value));
+    }
+    [[gnu::always_inline]] inline uint32_t tread16(uint32_t unit) const
+    {
+        uint16_t value;
+        std::memcpy(&value, target + ((unit * 2u) & (targetMask - 1u)), sizeof(value));
+        return value;
+    }
+    [[gnu::always_inline]] inline void twrite16(uint32_t unit, uint32_t value) const
+    {
+        const uint16_t narrow = static_cast<uint16_t>(value);
+        std::memcpy(target + ((unit * 2u) & (targetMask - 1u)), &narrow, sizeof(narrow));
+    }
 
     // Targets.
     GSMem::SurfaceLayout frame;
@@ -642,15 +670,15 @@ struct GSCpuBackend::FastPipeline
             switch (frameKind)
             {
             case FrameKind::C32:
-                rawFrame = read32(vram, frameUnit);
+                rawFrame = tread32(frameUnit);
                 frameRgba = rawFrame;
                 break;
             case FrameKind::C24:
-                rawFrame = read32(vram, frameUnit) & 0x00FFFFFFu;
+                rawFrame = tread32(frameUnit) & 0x00FFFFFFu;
                 frameRgba = rawFrame | 0x80000000u; // the GS supplies 0x80 as destination alpha
                 break;
             case FrameKind::C16:
-                rawFrame = read16(vram, frameUnit);
+                rawFrame = tread16(frameUnit);
                 frameRgba = rgba5551To8888(rawFrame);
                 break;
             }
@@ -685,13 +713,13 @@ struct GSCpuBackend::FastPipeline
             switch (depthKind)
             {
             case DepthKind::Z32:
-                stored = read32(vram, depthUnit);
+                stored = tread32(depthUnit);
                 break;
             case DepthKind::Z24:
-                stored = read32(vram, depthUnit) & 0x00FFFFFFu;
+                stored = tread32(depthUnit) & 0x00FFFFFFu;
                 break;
             case DepthKind::Z16:
-                stored = read16(vram, depthUnit);
+                stored = tread16(depthUnit);
                 break;
             }
             if (ztst == 2u ? z < stored : z <= stored)
@@ -732,13 +760,13 @@ struct GSCpuBackend::FastPipeline
             switch (frameKind)
             {
             case FrameKind::C32:
-                write32(vram, frameUnit, pixel);
+                twrite32(frameUnit, pixel);
                 break;
             case FrameKind::C24:
-                write32(vram, frameUnit, (read32(vram, frameUnit) & 0xFF000000u) | (pixel & 0x00FFFFFFu));
+                twrite32(frameUnit, (tread32(frameUnit) & 0xFF000000u) | (pixel & 0x00FFFFFFu));
                 break;
             case FrameKind::C16:
-                write16(vram, frameUnit, rgba8888To5551(pixel));
+                twrite16(frameUnit, rgba8888To5551(pixel));
                 break;
             }
         }
@@ -748,13 +776,13 @@ struct GSCpuBackend::FastPipeline
             switch (depthKind)
             {
             case DepthKind::Z32:
-                write32(vram, depthUnit, z);
+                twrite32(depthUnit, z);
                 break;
             case DepthKind::Z24:
-                write32(vram, depthUnit, (read32(vram, depthUnit) & 0xFF000000u) | (z & 0x00FFFFFFu));
+                twrite32(depthUnit, (tread32(depthUnit) & 0xFF000000u) | (z & 0x00FFFFFFu));
                 break;
             case DepthKind::Z16:
-                write16(vram, depthUnit, z);
+                twrite16(depthUnit, z);
                 break;
             }
         }
@@ -773,6 +801,8 @@ struct GSCpuBackend::FastPipeline
     backend = &owner;
     drawState = &state;
     vram = owner.m_vram;
+    target = owner.m_vram;
+    targetMask = kVramMask;
 
     framePsm = ctx.frame.psm;
     switch (ctx.frame.psm)
@@ -1207,15 +1237,15 @@ struct GSCpuBackend::FastPipeline
         {
         case FrameKind::C32:
             for (int i = 0; i < N; ++i)
-                dest[i] = read32(vram, frameUnit[i]);
+                dest[i] = tread32(frameUnit[i]);
             break;
         case FrameKind::C24:
             for (int i = 0; i < N; ++i)
-                dest[i] = (read32(vram, frameUnit[i]) & 0x00FFFFFFu) | 0x80000000u; // the GS supplies 0x80 as destination alpha
+                dest[i] = (tread32(frameUnit[i]) & 0x00FFFFFFu) | 0x80000000u; // the GS supplies 0x80 as destination alpha
             break;
         case FrameKind::C16:
             for (int i = 0; i < N; ++i)
-                dest[i] = rgba5551To8888(read16(vram, frameUnit[i]));
+                dest[i] = rgba5551To8888(tread16(frameUnit[i]));
             break;
         }
     }
@@ -1250,15 +1280,15 @@ struct GSCpuBackend::FastPipeline
         {
         case DepthKind::Z32:
             for (int i = 0; i < N; ++i)
-                stored[i] = read32(vram, depthUnit[i]);
+                stored[i] = tread32(depthUnit[i]);
             break;
         case DepthKind::Z24:
             for (int i = 0; i < N; ++i)
-                stored[i] = read32(vram, depthUnit[i]) & 0x00FFFFFFu;
+                stored[i] = tread32(depthUnit[i]) & 0x00FFFFFFu;
             break;
         case DepthKind::Z16:
             for (int i = 0; i < N; ++i)
-                stored[i] = read16(vram, depthUnit[i]);
+                stored[i] = tread16(depthUnit[i]);
             break;
         }
         if (ztst == 2u)
@@ -1327,17 +1357,17 @@ struct GSCpuBackend::FastPipeline
     case FrameKind::C32:
         for (int i = 0; i < count; ++i)
             if (frameMask[i])
-                write32(vram, frameUnit[i], pixel[i]);
+                twrite32(frameUnit[i], pixel[i]);
         break;
     case FrameKind::C24:
         for (int i = 0; i < count; ++i)
             if (frameMask[i])
-                write32(vram, frameUnit[i], (read32(vram, frameUnit[i]) & 0xFF000000u) | (pixel[i] & 0x00FFFFFFu));
+                twrite32(frameUnit[i], (tread32(frameUnit[i]) & 0xFF000000u) | (pixel[i] & 0x00FFFFFFu));
         break;
     case FrameKind::C16:
         for (int i = 0; i < count; ++i)
             if (frameMask[i])
-                write16(vram, frameUnit[i], rgba8888To5551(pixel[i]));
+                twrite16(frameUnit[i], rgba8888To5551(pixel[i]));
         break;
     }
 
@@ -1348,17 +1378,17 @@ struct GSCpuBackend::FastPipeline
         case DepthKind::Z32:
             for (int i = 0; i < count; ++i)
                 if (depthMask[i])
-                    write32(vram, depthUnit[i], in.z[i]);
+                    twrite32(depthUnit[i], in.z[i]);
             break;
         case DepthKind::Z24:
             for (int i = 0; i < count; ++i)
                 if (depthMask[i])
-                    write32(vram, depthUnit[i], (read32(vram, depthUnit[i]) & 0xFF000000u) | (in.z[i] & 0x00FFFFFFu));
+                    twrite32(depthUnit[i], (tread32(depthUnit[i]) & 0xFF000000u) | (in.z[i] & 0x00FFFFFFu));
             break;
         case DepthKind::Z16:
             for (int i = 0; i < count; ++i)
                 if (depthMask[i])
-                    write16(vram, depthUnit[i], in.z[i]);
+                    twrite16(depthUnit[i], in.z[i]);
             break;
         }
     }
@@ -2943,7 +2973,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             PixelProbe &probe = pixelProbe();
             const bool probed = probe.set && x == probe.x && y == probe.y && probe.left.load(std::memory_order_relaxed) > 0 &&
                                 probe.left.fetch_sub(1) > 0;
-            const uint32_t before = probed ? read32(p.vram, FastPipeline::unitIn(p.frame, frameRow, x)) : 0u;
+            const uint32_t before = probed ? p.tread32(FastPipeline::unitIn(p.frame, frameRow, x)) : 0u;
             p.write(x, frameRow, depthRow, static_cast<uint32_t>(z + 0.5), r, g, b, a, fog);
             if (probed)
             {
@@ -2959,7 +2989,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
                              static_cast<unsigned>(p.bsel), static_cast<unsigned>(p.csel), static_cast<unsigned>(p.dsel),
                              static_cast<unsigned>(p.fix), p.alphaTest ? 1 : 0, static_cast<unsigned>(p.atst), static_cast<unsigned>(p.aref),
                              static_cast<unsigned>(p.afail), static_cast<unsigned>(p.ztst), p.zmask ? 1 : 0, z, p.fbmsk, before,
-                             read32(p.vram, FastPipeline::unitIn(p.frame, frameRow, x)));
+                             p.tread32(FastPipeline::unitIn(p.frame, frameRow, x)));
             }
         }
     }
@@ -2967,6 +2997,283 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
 
 // Queues or draws one triangle or sprite. Returns false when the fast path
 // cannot handle the state (nothing has been drawn then).
+// --- The larger copy of the frame and depth buffers: see m_shadow -----------
+
+int GSCpuBackend::ScaleSetting()
+{
+    static const int scale = []
+    {
+        const char *asked = ps2x::setting("PS2X_GS_SCALE", "display.resolution");
+        return clampInt(asked ? std::atoi(asked) : 1, 1, 4);
+    }();
+    return scale;
+}
+
+// Whether a buffer shown a field at a time is kept as whole frames
+// (display.fields = whole, the default; "double" shows each field with its
+// lines doubled, as the game left them).
+bool GSCpuBackend::WholeFramesSetting()
+{
+    static const bool whole = []
+    {
+        const char *asked = ps2x::setting("PS2X_GS_FIELDS", "display.fields");
+        return !asked || std::strcmp(asked, "double") != 0;
+    }();
+    return whole;
+}
+
+GSCpuBackend::SurfaceScale GSCpuBackend::ScaleOf(uint32_t fbp, uint32_t fbw) const
+{
+    const int n = std::max(m_scale, 1);
+    return {n, fbp == m_fieldFbp && fbw == m_fieldFbw ? n * 2 : n};
+}
+
+GSMem::SurfaceLayout GSCpuBackend::ShadowLayout(const GSMem::SurfaceLayout &layout, SurfaceScale scale) const
+{
+    // Room for a copy twice as tall as it is wide of every page.
+    const uint32_t n = static_cast<uint32_t>(std::max(m_scale, 1));
+    GSMem::SurfaceLayout scaled = layout;
+    scaled.basePage = layout.basePage * (2u * n * n);
+    scaled.pagesPerRow = layout.pagesPerRow * static_cast<uint32_t>(scale.x);
+    return scaled;
+}
+
+namespace
+{
+    // Tells one surface's use of a page from another's: where it starts,
+    // how wide it is, how its pixels are arranged in a page (the same for a
+    // 32-bit frame and a 24-bit one, which a game switches between), and
+    // how large the copy is.
+    inline uint64_t shadowKeyOf(const GSMem::SurfaceLayout &layout, int scaleX, int scaleY)
+    {
+        return (static_cast<uint64_t>(layout.basePage) << 44) ^ (static_cast<uint64_t>(layout.pagesPerRow) << 34) ^
+               (static_cast<uint64_t>(layout.unitBits) << 28) ^ (static_cast<uint64_t>(layout.table[1]) << 14) ^
+               static_cast<uint64_t>(layout.table[static_cast<size_t>(1) << layout.pageWidthShift]) ^
+               (static_cast<uint64_t>(scaleX * 16 + scaleY) << 54) ^ (1ull << 63);
+    }
+
+    // fn(page, row, column) for each page pixels (x0, y0)..(x1, y1) of a
+    // surface are in.
+    template <typename Fn>
+    inline void forEachPageOf(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, Fn &&fn)
+    {
+        const uint32_t firstColumn = static_cast<uint32_t>(std::max(x0, 0)) >> layout.pageWidthShift;
+        const uint32_t lastColumn = static_cast<uint32_t>(std::max(x1, 0)) >> layout.pageWidthShift;
+        const uint32_t firstRow = static_cast<uint32_t>(std::max(y0, 0)) >> layout.pageHeightShift;
+        const uint32_t lastRow = static_cast<uint32_t>(std::max(y1, 0)) >> layout.pageHeightShift;
+        for (uint32_t row = firstRow; row <= lastRow; ++row)
+            for (uint32_t column = firstColumn; column <= lastColumn; ++column)
+                fn((layout.basePage + row * layout.pagesPerRow + column) % kPageCount, row, column);
+    }
+}
+
+bool GSCpuBackend::ShadowStale(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1) const
+{
+    const uint64_t key = shadowKeyOf(layout, scale.x, scale.y);
+    bool stale = false;
+    forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t, uint32_t)
+                  { stale = stale || m_shadowSerial[page] != m_pageSerial[page] || m_shadowKey[page] != key; });
+    return stale;
+}
+
+// Fills the stale shadow pages of these pixels from VRAM. Nothing queued may
+// still have those pages to write.
+void GSCpuBackend::FillShadow(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1)
+{
+    if (!m_shadow || !layout.table || (layout.unitBits != 32u && layout.unitBits != 16u))
+        return;
+    const uint64_t key = shadowKeyOf(layout, scale.x, scale.y);
+    const GSMem::SurfaceLayout scaled = ShadowLayout(layout, scale);
+    const int pageWidth = 1 << layout.pageWidthShift, pageHeight = 1 << layout.pageHeightShift;
+    const bool wide = layout.unitBits == 32u;
+    forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t row, uint32_t column)
+                  {
+                      if (m_shadowSerial[page] == m_pageSerial[page] && m_shadowKey[page] == key)
+                          return;
+                      for (int py = 0; py < pageHeight; ++py)
+                      {
+                          const int y = static_cast<int>(row) * pageHeight + py;
+                          const FastPipeline::Row from = FastPipeline::rowOf(layout, y);
+                          for (int j = 0; j < scale.y; ++j)
+                          {
+                              const FastPipeline::Row to = FastPipeline::rowOf(scaled, y * scale.y + j);
+                              for (int px = 0; px < pageWidth; ++px)
+                              {
+                                  const int x = static_cast<int>(column) * pageWidth + px;
+                                  const uint32_t unit = FastPipeline::unitIn(layout, from, x);
+                                  if (wide)
+                                  {
+                                      const uint32_t value = read32(m_vram, unit);
+                                      for (int i = 0; i < scale.x; ++i)
+                                          std::memcpy(m_shadow.get() + ((FastPipeline::unitIn(scaled, to, x * scale.x + i) * 4u) & (m_shadowMask - 3u)),
+                                                      &value, sizeof(value));
+                                  }
+                                  else
+                                  {
+                                      const uint16_t value = static_cast<uint16_t>(read16(m_vram, unit));
+                                      for (int i = 0; i < scale.x; ++i)
+                                          std::memcpy(m_shadow.get() + ((FastPipeline::unitIn(scaled, to, x * scale.x + i) * 2u) & (m_shadowMask - 1u)),
+                                                      &value, sizeof(value));
+                                  }
+                              }
+                          }
+                      }
+                      m_shadowSerial[page] = m_pageSerial[page];
+                      m_shadowKey[page] = key;
+                  });
+}
+
+// The pages were just marked written for a primitive that is drawn into the
+// shadow as well: they stay good.
+void GSCpuBackend::MarkShadowDrawn(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1)
+{
+    const uint64_t key = shadowKeyOf(layout, scale.x, scale.y);
+    forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t, uint32_t)
+                  {
+                      m_shadowSerial[page] = m_pageSerial[page];
+                      m_shadowKey[page] = key;
+                  });
+}
+
+// Turns a prepared primitive into the same one scaled, drawn into the
+// shadow. A pixel is sampled at its centre, so pixel X of the larger
+// picture is at (X + 0.5) / scale of the game's: every position is
+// multiplied, and what changes per pixel divided.
+void GSCpuBackend::ScaleUp(PreparedPrimitive &primitive, SurfaceScale scale) const
+{
+    const int nx = scale.x, ny = scale.y;
+    const float sx = static_cast<float>(nx), sy = static_cast<float>(ny);
+    FastPipeline &p = primitive.pipeline;
+    p.target = m_shadow.get();
+    p.targetMask = m_shadowMask;
+    p.frame = ShadowLayout(p.frame, scale);
+    p.depth = ShadowLayout(p.depth, scale);
+    p.scissorX0 *= nx;
+    p.scissorY0 *= ny;
+    p.scissorX1 = p.scissorX1 * nx + nx - 1;
+    p.scissorY1 = p.scissorY1 * ny + ny - 1;
+    primitive.minX *= nx;
+    primitive.minY *= ny;
+    primitive.maxX = primitive.maxX * nx + nx - 1;
+    primitive.maxY = primitive.maxY * ny + ny - 1;
+    if (primitive.line)
+    {
+        primitive.lineX0 = primitive.lineX0 * nx + nx / 2;
+        primitive.lineY0 = primitive.lineY0 * ny + ny / 2;
+        primitive.lineX1 = primitive.lineX1 * nx + nx / 2;
+        primitive.lineY1 = primitive.lineY1 * ny + ny / 2;
+        return;
+    }
+    if (primitive.sprite)
+    {
+        // The frame being squeezed into a field: the game takes it from a
+        // line further down every other field, which is what puts the two
+        // fields on different lines of a television. The whole frame is
+        // wanted in the same place every time.
+        if (ny > nx && p.tme && std::fabs(primitive.tv1 - primitive.tv0) >= primitive.spanY * 1.5f)
+        {
+            const float first = std::min(primitive.tv0, primitive.tv1);
+            const float odd = first - 2.0f * std::floor(first * 0.5f);
+            primitive.tv0 -= odd;
+            primitive.tv1 -= odd;
+        }
+        primitive.originX *= nx;
+        primitive.originY *= ny;
+        primitive.spanX *= sx;
+        primitive.spanY *= sy;
+        return;
+    }
+    // An edge, A * (X - x2) + B * (Y - y2) + C in sixteenths of the game's
+    // pixels, times both scales: whole numbers still.
+    primitive.fx2 *= sx;
+    primitive.fy2 *= sy;
+    primitive.x2Sixteenths *= nx;
+    primitive.y2Sixteenths *= ny;
+    for (int i = 0; i < 3; ++i)
+    {
+        primitive.wa[i] /= sx;
+        primitive.wb[i] /= sy;
+        primitive.invWa[i] *= sx;
+        primitive.edgeA[i] *= ny;
+        primitive.edgeB[i] *= nx;
+        primitive.edgeC[i] *= nx * ny;
+    }
+    for (PreparedPrimitive::Plane *plane : {&primitive.red, &primitive.green, &primitive.blue, &primitive.alpha, &primitive.fog,
+                                            &primitive.texS, &primitive.texT, &primitive.texQ})
+    {
+        plane->dx /= sx;
+        plane->dy /= sy;
+    }
+    primitive.zDx /= nx;
+    primitive.zDy /= ny;
+}
+
+// The picture a display circuit shows, from the shadow: `width` by `height`
+// of the game's pixels from (originX, originY) of the frame, scaled, as
+// packed RGBA. False when the frame has no copy that size.
+bool GSCpuBackend::CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width,
+                                   uint32_t height, std::vector<uint8_t> &outPixels)
+{
+    const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
+    const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, framePageBaseToBlock(frame.fbp), fbw);
+    if (!scale.larger() || !layout.table || layout.spillsIntoNextPage || width == 0u || height == 0u ||
+        (layout.unitBits != 32u && layout.unitBits != 16u))
+        return false;
+    const int x0 = static_cast<int>(originX), y0 = static_cast<int>(originY);
+    const int x1 = x0 + static_cast<int>(width) - 1, y1 = y0 + static_cast<int>(height) - 1;
+    for (int attempt = 0;; ++attempt)
+    {
+        uint64_t waitFor = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_shadow)
+                return false;
+            waitFor = LastBatchTouching(layout, x0, y0, x1, y1, false, "present");
+            if (waitFor != 0u && attempt >= 3)
+            {
+                WaitForBatch(waitFor);
+                waitFor = 0u;
+            }
+            if (waitFor == 0u)
+            {
+                if (ShadowStale(layout, scale, x0, y0, x1, y1))
+                    FillShadow(layout, scale, x0, y0, x1, y1);
+                const GSMem::SurfaceLayout scaled = ShadowLayout(layout, scale);
+                const uint32_t outWidth = width * static_cast<uint32_t>(scale.x), outHeight = height * static_cast<uint32_t>(scale.y);
+                outPixels.resize(static_cast<size_t>(outWidth) * outHeight * 4u);
+                const bool wide = layout.unitBits == 32u;
+                const uint8_t *shadow = m_shadow.get();
+                for (uint32_t y = 0; y < outHeight; ++y)
+                {
+                    const FastPipeline::Row row = FastPipeline::rowOf(scaled, y0 * scale.y + static_cast<int>(y));
+                    uint8_t *out = outPixels.data() + static_cast<size_t>(y) * outWidth * 4u;
+                    for (uint32_t x = 0; x < outWidth; ++x, out += 4)
+                    {
+                        const uint32_t unit = FastPipeline::unitIn(scaled, row, x0 * scale.x + static_cast<int>(x));
+                        uint32_t colour;
+                        if (wide)
+                        {
+                            std::memcpy(&colour, shadow + ((unit * 4u) & (m_shadowMask - 3u)), sizeof(colour));
+                        }
+                        else
+                        {
+                            uint16_t narrow;
+                            std::memcpy(&narrow, shadow + ((unit * 2u) & (m_shadowMask - 1u)), sizeof(narrow));
+                            colour = rgba5551To8888(narrow);
+                        }
+                        out[0] = static_cast<uint8_t>(colour);
+                        out[1] = static_cast<uint8_t>(colour >> 8);
+                        out[2] = static_cast<uint8_t>(colour >> 16);
+                        out[3] = 255u;
+                    }
+                }
+                return true;
+            }
+        }
+        WaitForBatch(waitFor);
+    }
+}
+
 bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
 {
     if (!m_rasterQueue)
@@ -2997,9 +3304,50 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         SubmitPrimitivesWriting(p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1, "texture");
 
     p.useDecodedTexture(primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+
+    // Drawn into the shadow as well? Then the shadow's pixels under it have
+    // to be what VRAM's are before either is drawn.
+    if (m_scale == 0)
+        m_scale = ps2xGsDrawsInBackground(m_vram) ? ScaleSetting() : 1;
+    const SurfaceScale scale = ScaleOf(batch.state.context.frame.fbp, batch.state.context.frame.fbw);
+    const bool twice = scale.larger() && !p.frame.spillsIntoNextPage && !p.depth.spillsIntoNextPage;
+    if (twice)
+    {
+        if (!m_shadow)
+        {
+            // Room for the largest copy of every page of VRAM, in a size that wraps with a mask.
+            size_t bytes = static_cast<size_t>(GSMem::MEMORY_SIZE);
+            while (bytes < static_cast<size_t>(GSMem::MEMORY_SIZE) * 2u * static_cast<size_t>(m_scale * m_scale))
+                bytes *= 2u;
+            m_shadow.reset(new uint8_t[bytes]());
+            m_shadowMask = static_cast<uint32_t>(bytes - 1u);
+        }
+        // The depth buffer only if the primitive tests against it or
+        // writes it: one that does neither names whatever was left in ZBUF,
+        // often pages that are something else altogether.
+        const bool frameStale = ShadowStale(p.frame, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        const bool depthStale = (!p.zmask || p.ztst >= 2u) &&
+                                ShadowStale(p.depth, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        if (frameStale)
+        {
+            FlushPrimitivesTouching(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, false, "shadow");
+            FillShadow(p.frame, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        }
+        if (depthStale)
+        {
+            FlushPrimitivesTouching(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, false, "shadow");
+            FillShadow(p.depth, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        }
+    }
     MarkWritten(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
     if (!p.zmask)
         MarkWritten(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+    if (twice)
+    {
+        MarkShadowDrawn(p.frame, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        if (!p.zmask)
+            MarkShadowDrawn(p.depth, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+    }
 
     // A texture sampled from VRAM while drawing can wait with the others
     // unless it is its own target (every pixel written changes what the next
@@ -3009,6 +3357,11 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     {
         queue.run("direct");
         Rasterise(primitive, primitive.minY, primitive.maxY);
+        if (twice)
+        {
+            ScaleUp(primitive, scale);
+            Rasterise(primitive, primitive.minY, primitive.maxY);
+        }
         return true;
     }
 
@@ -3039,6 +3392,13 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     // The queued copy must not point at this call's draw state.
     p.drawState = nullptr;
     queue.pending.push_back(primitive);
+    if (twice)
+    {
+        ScaleUp(primitive, scale);
+        queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
+                               static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
+        queue.pending.push_back(primitive);
+    }
 
     // Enough for the pool to start on if it has nothing to do; otherwise let
     // the batch grow.

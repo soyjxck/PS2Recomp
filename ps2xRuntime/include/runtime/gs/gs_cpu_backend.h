@@ -199,6 +199,58 @@ private:
     // Set while presenting from a snapshot that lacks the context frames.
     bool m_presentWantsContextFrames = false;
 
+    // A larger copy of the frame and depth buffers, drawn alongside VRAM
+    // and shown in its place. Two things use it:
+    //
+    // - A higher internal resolution (display.resolution in the settings
+    //   file, PS2X_GS_SCALE): everything is drawn m_scale times as large.
+    // - A display buffer the game fills a field at a time (m_fieldFbp). A
+    //   game made for an interlaced television may draw each frame whole
+    //   and then squeeze it into a buffer half as high, a different half
+    //   of its lines each field, which is what the display shows. Shown
+    //   field after field on a screen that is not interlaced that is half
+    //   the detail, and it shakes. Whatever is drawn into such a buffer is
+    //   drawn twice as tall as well, so the copy holds the whole frame the
+    //   field was made of, and what the game then draws over the field
+    //   (its subtitles).
+    //
+    // Every primitive the fast paths draw into a surface with a copy is
+    // drawn a second time, scaled, into m_shadow (see DrawFast). VRAM
+    // itself is drawn as ever, so whatever reads it (a texture taken from
+    // the frame buffer, a transfer back to the game) sees what it always
+    // did.
+    //
+    // The shadow is laid out like VRAM with room for the largest copy of
+    // every page: a surface's base page is multiplied by that and its
+    // width in pages by the scale across, and the same page table then
+    // places the pixels (see ShadowLayout). A page of it is good while the
+    // last thing written to the VRAM page was a primitive drawn into both;
+    // anything else that writes the page (an image, a clear, a move, the
+    // reference rasteriser) leaves m_pageSerial ahead of m_shadowSerial,
+    // and the page is filled from VRAM again, each pixel repeated, before
+    // it is next drawn into or shown.
+    struct SurfaceScale
+    {
+        int x = 1, y = 1;
+        bool larger() const { return x > 1 || y > 1; }
+    };
+    int m_scale = 0; // 0 until the first primitive asks
+    uint32_t m_fieldFbp = ~0u, m_fieldFbw = 0; // from Present
+    std::unique_ptr<uint8_t[]> m_shadow;
+    uint32_t m_shadowMask = 0;
+    std::array<uint64_t, kVramPages> m_shadowSerial{};
+    std::array<uint64_t, kVramPages> m_shadowKey{}; // which surface the page was filled as, and how large
+    static int ScaleSetting();
+    static bool WholeFramesSetting();
+    SurfaceScale ScaleOf(uint32_t fbp, uint32_t fbw) const;
+    GSMem::SurfaceLayout ShadowLayout(const GSMem::SurfaceLayout &layout, SurfaceScale scale) const;
+    bool ShadowStale(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1) const;
+    void FillShadow(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1);
+    void MarkShadowDrawn(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int x0, int y0, int x1, int y1);
+    void ScaleUp(PreparedPrimitive &primitive, SurfaceScale scale) const;
+    bool CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width, uint32_t height,
+                         std::vector<uint8_t> &outPixels);
+
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
     std::vector<uint8_t> m_localToHostBuffer;
@@ -210,3 +262,5 @@ private:
 // reads that memory only through Sync and Present, names its GS's memory
 // here to let the raster pool draw in the background (nullptr: no GS does).
 void ps2xSetGsBackgroundDrawing(const uint8_t *vram);
+// Whether the backend that draws into this VRAM is that one.
+bool ps2xGsDrawsInBackground(const uint8_t *vram);

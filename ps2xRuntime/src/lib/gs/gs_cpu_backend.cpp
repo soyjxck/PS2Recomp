@@ -399,17 +399,35 @@ namespace
     }
 
     // Expand a half-height field buffer (INT + FFMD) to the full display height.
-    void lineDoubleFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t fieldHeight, uint32_t fullHeight)
+    // A field as the whole picture. A game that draws fields draws each
+    // half a line below or above the last, for the lines of the picture the
+    // television is about to scan: the upper field belongs on the even
+    // lines and the lower on the odd ones. So each line of the field goes
+    // on its own lines of the picture and the lines between are the mean of
+    // their neighbours; doubling every line instead puts both fields in the
+    // same place, and the picture shakes by a line sixty times a second.
+    void lineDoubleFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t fieldHeight, uint32_t fullHeight, bool lowerField)
     {
         if (pixels.empty() || width == 0u || fieldHeight == 0u)
             return;
         const std::vector<uint8_t> source = pixels;
+        const size_t rowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const int last = static_cast<int>(fieldHeight) - 1;
         for (uint32_t y = 0; y < fullHeight && y < kHostFrameHeight; ++y)
         {
-            const uint32_t sourceY = std::min(y >> 1u, fieldHeight - 1u);
-            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u,
-                        source.data() + sourceY * kHostFrameWidth * 4u,
-                        width * 4u);
+            // Where this line is in the field, in half lines.
+            const int position = static_cast<int>(y) - (lowerField ? 1 : 0);
+            const int above = std::min(std::max(position >> 1, 0), last);
+            const uint8_t *first = source.data() + static_cast<size_t>(above) * rowBytes;
+            uint8_t *out = pixels.data() + static_cast<size_t>(y) * rowBytes;
+            if ((position & 1) == 0 || position < 0)
+            {
+                std::memcpy(out, first, width * 4u);
+                continue;
+            }
+            const uint8_t *second = source.data() + static_cast<size_t>(std::min(above + 1, last)) * rowBytes;
+            for (uint32_t i = 0; i < width * 4u; ++i)
+                out[i] = static_cast<uint8_t>((static_cast<unsigned>(first[i]) + second[i] + 1u) >> 1);
         }
     }
 
@@ -540,6 +558,11 @@ namespace
 void ps2xSetGsBackgroundDrawing(const uint8_t *vram)
 {
     g_backgroundDrawing.store(vram, std::memory_order_release);
+}
+
+bool ps2xGsDrawsInBackground(const uint8_t *vram)
+{
+    return vram != nullptr && g_backgroundDrawing.load(std::memory_order_acquire) == vram;
 }
 
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
@@ -2492,6 +2515,52 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
             return {};
         frame = snapshotBackend.PresentFromLocalMemory(request);
     }
+    if (!snapshotBackend.m_presentWantsContextFrames && frame && !frame.usedPreferred)
+    {
+        // The same picture from the shadow, when there is a larger copy of
+        // it: one circuit's frame (two circuits on the same frame are the
+        // game blending it with itself a line apart against flicker, which
+        // a sharper picture is better without). Otherwise the picture
+        // above stands.
+        const GSSmode2State smode2 = decodeSMode2(request.smode2);
+        const GSFrameReg shown1 = decodeDisplayFrame(request.dispfb1), shown2 = decodeDisplayFrame(request.dispfb2);
+        const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, shown1);
+        const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, shown2);
+        const bool one = valid1 != valid2 ||
+                         (valid1 && shown1.fbp == shown2.fbp && shown1.fbw == shown2.fbw && shown1.psm == shown2.psm);
+        if (one)
+        {
+            const GSFrameReg &shown = valid1 ? shown1 : shown2;
+            const GSDisplayReadOrigin origin = decodeDisplayReadOrigin(valid1 ? request.dispfb1 : request.dispfb2);
+            uint32_t width = 0u, height = 0u;
+            decodeDisplaySize(valid1 ? request.display1 : request.display2, width, height);
+            // A buffer shown a field at a time holds half the picture's
+            // lines: from now on it is drawn twice as tall as well.
+            const bool fields = smode2.interlaced && smode2.ffmd;
+            SurfaceScale scale;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (fields && WholeFramesSetting() && ps2xGsDrawsInBackground(m_vram))
+                {
+                    m_fieldFbp = shown.fbp;
+                    m_fieldFbw = shown.fbw;
+                }
+                else
+                {
+                    m_fieldFbp = ~0u;
+                }
+                scale = ScaleOf(shown.fbp, shown.fbw);
+            }
+            const uint32_t rows = fields ? (height + 1u) >> 1u : height;
+            std::vector<uint8_t> scaled;
+            if (scale.larger() && CopyScaledFrame(shown, scale, origin.x, origin.y, width, rows, scaled))
+            {
+                frame.pixels.swap(scaled);
+                frame.width = width * static_cast<uint32_t>(scale.x);
+                frame.height = rows * static_cast<uint32_t>(scale.y);
+            }
+        }
+    }
     return frame;
 }
 
@@ -2529,7 +2598,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     {
         if (halfHeightField)
         {
-            lineDoubleFieldPresentation(frame.pixels, frame.width, frame.height, fullHeight);
+            lineDoubleFieldPresentation(frame.pixels, frame.width, frame.height, fullHeight, !oddField);
             frame.height = fullHeight;
         }
     };

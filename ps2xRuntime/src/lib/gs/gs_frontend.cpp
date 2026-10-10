@@ -688,7 +688,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        // A picture wider than the host frame (a higher internal
+        // resolution) comes packed already.
+        const size_t sourceRowBytes = static_cast<size_t>(std::max<uint32_t>(kHostFrameWidth, outWidth)) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;

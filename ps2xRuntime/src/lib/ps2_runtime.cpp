@@ -808,6 +808,18 @@ void ps2xHoldForFrameDump(uint64_t tick)
         std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
+// The texture the picture is uploaded to, at the size of the picture.
+static void resizeFrameTexture(Texture2D &tex, int width, int height)
+{
+    if (tex.width == width && tex.height == height)
+        return;
+    UnloadTexture(tex);
+    Image blank = GenImageColor(width, height, BLANK);
+    tex = LoadTextureFromImage(blank);
+    UnloadImage(blank);
+    SetTextureFilter(tex, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -849,6 +861,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
+        resizeFrameTexture(tex, FB_WIDTH, FB_HEIGHT);
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
@@ -885,6 +898,20 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastPreferred = usedPreferredDisplaySource;
     s_lastWidth = width;
     s_lastHeight = height;
+
+    // A picture larger than the game's own (a higher internal resolution)
+    // has a texture of its own size, and comes packed.
+    const bool large = width > static_cast<uint32_t>(FB_WIDTH) || height > static_cast<uint32_t>(FB_HEIGHT);
+    resizeFrameTexture(tex, large ? static_cast<int>(width) : FB_WIDTH, large ? static_cast<int>(height) : FB_HEIGHT);
+    if (large && s_scratch.size() >= static_cast<size_t>(width) * height * 4u)
+    {
+        UpdateTexture(tex, s_scratch.data());
+        maybeDumpPresentedFrame(s_scratch.data(), width * 4u, width, height, currentTick);
+        outWidth = width;
+        outHeight = height;
+        s_hasUploadedFrame = true;
+        return;
+    }
 
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
