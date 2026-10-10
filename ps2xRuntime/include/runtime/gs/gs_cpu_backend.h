@@ -61,6 +61,9 @@ private:
         int height = 0;
         std::vector<uint32_t> pages;
         std::vector<uint32_t> pixels; // RGBA, row major
+        // Keyed by what was uploaded rather than where: never decoded again,
+        // so a transfer to its pages need not wait for primitives using it.
+        bool immutable = false;
     };
     struct PreparedPrimitive;
     // What a Rasterise call covered, for PS2X_GS_STATS.
@@ -88,6 +91,9 @@ private:
     bool HasQueuedPrimitives() const;
     const DecodedTexture *DecodedTextureFor(FastPipeline &pipeline);
     uint64_t HashPages(const std::vector<uint32_t> &pages) const;
+    void ForgetOldDecodedTextures();
+    uint64_t BorderHash(FastPipeline &p, uint64_t conversion, int imageW, int imageH, int width, int height);
+    bool PagesWrittenSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
 
     // Texture cache bookkeeping: every writer says which VRAM pages it touched.
     static constexpr uint32_t kVramPages = 512u;
@@ -136,6 +142,28 @@ private:
     std::array<uint32_t, 256> m_fastClutStamp{};
     uint64_t m_writeSerial = 1;
     std::array<uint64_t, kVramPages> m_pageSerial{};
+    // The last image each host-to-local transfer wrote, to recognise one
+    // that would write what VRAM already holds.
+    struct UploadRecord
+    {
+        uint64_t hash = 0;
+        uint64_t bytes = 0;
+        uint64_t rect = 0;   // position and size
+        uint64_t target = 0; // base, width and format
+        uint64_t serial = 0; // m_writeSerial once it was written
+    };
+    std::unordered_map<uint64_t, UploadRecord> m_uploads;
+    // The latest whole image written at each base pointer, from (0, 0).
+    std::unordered_map<uint64_t, UploadRecord> m_uploadAt;
+    struct BorderRecord
+    {
+        uint64_t hash = 0;
+        uint64_t serial = 0; // m_writeSerial when it was read; 0 = never
+    };
+    std::unordered_map<uint64_t, BorderRecord> m_borderHashes;
+    uint64_t m_clutHashLoad = ~0ull; // m_clutLoads the hash below is of
+    uint64_t m_clutHash = 0;
+    uint64_t m_decodedBytes = 0;
     std::unordered_map<uint64_t, DecodedTexture> m_decodedTextures;
     uint64_t m_decodedUseClock = 0;
     std::unique_ptr<RasterQueue, RasterQueueDeleter> m_rasterQueue;

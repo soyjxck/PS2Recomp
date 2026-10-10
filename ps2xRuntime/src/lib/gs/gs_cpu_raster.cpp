@@ -288,6 +288,8 @@ struct GSCpuBackend::FastPipeline
     int lowU = 0, highU = 0, lowV = 0, highV = 0;
     // The decoded copy, when the texture can use one.
     const uint32_t *decoded = nullptr;
+    // That copy is never decoded again (see DecodedTexture::immutable).
+    bool decodedIsFixed = false;
     // The pixels the primitive can touch, for telling a texture that is also
     // the render target.
     int boundsX0 = 0, boundsY0 = 0, boundsX1 = 0, boundsY1 = 0;
@@ -295,8 +297,10 @@ struct GSCpuBackend::FastPipeline
     // The texels the primitive can sample (the whole texture when it wraps).
     int sampledU0 = 0, sampledV0 = 0, sampledU1 = 0, sampledV1 = 0;
 
-    // Narrows the sampled rectangle to texel coordinates [u0, u1] x [v0, v1].
-    void setSampledTexels(float u0, float v0, float u1, float v1)
+    // Sets the sampled rectangle from the lowest and highest texel
+    // coordinates the primitive's pixels can have, as sample() receives them;
+    // `slack` widens them where they are only known approximately.
+    void setSampledCoordinates(float u0, float v0, float u1, float v1, float slack)
     {
         sampledU0 = 0;
         sampledV0 = 0;
@@ -308,17 +312,36 @@ struct GSCpuBackend::FastPipeline
             std::swap(u0, u1);
         if (v0 > v1)
             std::swap(v0, v1);
-        // A texel of margin for bilinear filtering and rounding.
-        if (u0 >= 2.0f && u1 < static_cast<float>(texW - 2))
+        auto range = [this, slack](float low, float high, int size, uint8_t wrap, int &first, int &last)
         {
-            sampledU0 = static_cast<int>(u0) - 2;
-            sampledU1 = static_cast<int>(u1) + 2;
-        }
-        if (v0 >= 2.0f && v1 < static_cast<float>(texH - 2))
-        {
-            sampledV0 = static_cast<int>(v0) - 2;
-            sampledV1 = static_cast<int>(v1) + 2;
-        }
+            if (!(low > -32768.0f && high < 32768.0f))
+                return;
+            // sample() reads the texel a coordinate truncates to or, when
+            // filtering, the one half a texel before it and the next.
+            int lo, hi;
+            if (linear)
+            {
+                lo = floorToInt(low - slack - 0.5f);
+                hi = floorToInt(high + slack - 0.5f) + 1;
+            }
+            else
+            {
+                lo = floorToInt(low - slack);
+                hi = static_cast<int>(high + slack);
+            }
+            if (lo < 0 || hi > size - 1)
+            {
+                // REPEAT brings those in from the far side; CLAMP holds them at the edge.
+                if (wrap != 1u)
+                    return;
+                lo = std::min(std::max(lo, 0), size - 1);
+                hi = std::min(std::max(hi, 0), size - 1);
+            }
+            first = lo;
+            last = hi;
+        };
+        range(u0, u1, texW, wrapU, sampledU0, sampledU1);
+        range(v0, v1, texH, wrapV, sampledV0, sampledV1);
     }
 
     bool setup(GSCpuBackend &owner, const GSDrawState &state);
@@ -335,7 +358,14 @@ struct GSCpuBackend::FastPipeline
         if (tme && wrapU < 2u && wrapV < 2u)
         {
             if (const DecodedTexture *copy = backend->DecodedTextureFor(*this))
+            {
                 decoded = copy->pixels.data();
+                decodedIsFixed = copy->immutable;
+                // Such a copy ends a row below its image; nothing the
+                // primitive samples is further down.
+                if (copy->immutable)
+                    highV = std::min(highV, copy->height - 1);
+            }
         }
     }
 
@@ -659,7 +689,7 @@ struct GSCpuBackend::FastPipeline
     const GSDrawState *drawState = nullptr;
 };
 
-bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &state)
+[[gnu::noinline]] bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &state)
 {
     const GSContext &ctx = state.context;
     backend = &owner;
@@ -1256,7 +1286,7 @@ bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &s
     }
 }
 
-uint64_t GSCpuBackend::HashPages(const std::vector<uint32_t> &pages) const
+[[gnu::noinline]] uint64_t GSCpuBackend::HashPages(const std::vector<uint32_t> &pages) const
 {
     uint64_t hash = 0xCBF29CE484222325ull;
     for (const uint32_t page : pages)
@@ -1264,7 +1294,36 @@ uint64_t GSCpuBackend::HashPages(const std::vector<uint32_t> &pages) const
     return hash;
 }
 
-const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline &p)
+// A hash of the texels just right of and below an image of imageW x imageH at
+// the texture's base, out to width x height. Kept until those pages change.
+uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imageW, int imageH, int width, int height)
+{
+    uint64_t key = mixKey(conversion, (static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 16) | p.texPsm);
+    key = mixKey(key, (static_cast<uint64_t>(p.texW) << 48) | (static_cast<uint64_t>(p.texH) << 32) |
+                          (static_cast<uint64_t>(imageW) << 16) | static_cast<uint64_t>(imageH));
+    if (m_borderHashes.size() > 4096u)
+        m_borderHashes.clear();
+    BorderRecord &border = m_borderHashes[key];
+    const bool right = width > imageW, below = height > imageH;
+    if (border.serial != 0u &&
+        !(right && PagesWrittenSince(p.texture, imageW, 0, imageW, height - 1, border.serial)) &&
+        !(below && PagesWrittenSince(p.texture, 0, imageH, width - 1, imageH, border.serial)))
+    {
+        return border.hash;
+    }
+    uint64_t hash = 0x452821E638D01377ull;
+    if (right)
+        for (int v = 0; v < height; ++v)
+            hash = mixKey(hash, p.fetch(imageW, v));
+    if (below)
+        for (int u = 0; u < width; ++u)
+            hash = mixKey(hash, p.fetch(u, imageH));
+    border.hash = hash;
+    border.serial = m_writeSerial;
+    return hash;
+}
+
+[[gnu::noinline]] const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline &p)
 {
     // The VRAM pages the texture occupies.
     const uint32_t lastColumn = static_cast<uint32_t>(p.texW - 1) >> p.texture.pageWidthShift;
@@ -1288,11 +1347,11 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline
         }
     }
 
-    uint64_t key = mixKey(0x243F6A8885A308D3ull, (static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 16) | p.texPsm);
-    key = mixKey(key, (static_cast<uint64_t>(p.texW) << 32) | static_cast<uint64_t>(p.texH));
+    // What turns the stored texels into colours: the CLUT entries the texture
+    // can reach (as raw words) and TEXA.
+    uint64_t conversion = 0x243F6A8885A308D3ull;
     if (p.texKind >= TextureKind::Index8)
     {
-        // The CLUT entries this texture can reach, as raw words.
         const bool fourBit = p.texKind >= TextureKind::Index4;
         const bool sixteenBit = p.cpsm == GS_PSM_CT16 || p.cpsm == GS_PSM_CT16S;
         uint64_t clutHash = (static_cast<uint64_t>(p.cpsm) << 16) | (static_cast<uint64_t>(p.csm) << 8) | p.csa;
@@ -1305,14 +1364,100 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline
         }
         else
         {
-            clutHash = hashBytes(reinterpret_cast<const uint8_t *>(m_clut.data()), m_clut.size() * sizeof(uint16_t), clutHash);
+            if (m_clutHashLoad != m_clutLoads)
+            {
+                m_clutHash = hashBytes(reinterpret_cast<const uint8_t *>(m_clut.data()), m_clut.size() * sizeof(uint16_t), 0x13198A2E03707344ull);
+                m_clutHashLoad = m_clutLoads;
+            }
+            clutHash = mixKey(clutHash, m_clutHash);
         }
-        key = mixKey(key, clutHash);
+        conversion = mixKey(conversion, clutHash);
     }
     if (p.texKind != TextureKind::Direct32)
     {
-        key = mixKey(key, (static_cast<uint64_t>(p.texa.ta0) << 16) | (static_cast<uint64_t>(p.texa.ta1) << 8) | (p.texa.aem ? 1u : 0u));
+        conversion = mixKey(conversion, (static_cast<uint64_t>(p.texa.ta0) << 16) | (static_cast<uint64_t>(p.texa.ta1) << 8) | (p.texa.aem ? 1u : 0u));
     }
+
+    static const bool wantStats = []
+    {
+        const char *value = std::getenv("PS2X_GS_STATS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    static uint64_t statLookups = 0, statFixed = 0, statFixedDecodes = 0, statNoRecord = 0, statOutside = 0, statStale = 0, statRehash = 0, statRedecode = 0;
+    if (wantStats && ++statLookups % 2000000u == 0u)
+        std::fprintf(stderr, "[gs-textures] %llu lookups: %llu by upload (%llu decoded), by location: %llu no upload, %llu outside it, %llu overwritten; %llu rehashed, %llu decoded again; %zu copies, %llu MB\n",
+                     (unsigned long long)statLookups, (unsigned long long)statFixed, (unsigned long long)statFixedDecodes,
+                     (unsigned long long)statNoRecord, (unsigned long long)statOutside, (unsigned long long)statStale,
+                     (unsigned long long)statRehash, (unsigned long long)statRedecode, m_decodedTextures.size(),
+                     (unsigned long long)(m_decodedBytes >> 20));
+
+    // A texture that is exactly what one transfer wrote, and still there, is
+    // known by the hash of that image: the same image sent again, anywhere,
+    // is the same copy, and nothing has to be read back from VRAM to tell.
+    // It holds only the transferred rectangle, so it serves a primitive that
+    // samples nothing outside it.
+    {
+        const auto found = m_uploadAt.find((static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm);
+        if (found == m_uploadAt.end())
+            ++statNoRecord;
+        if (found != m_uploadAt.end())
+        {
+            const UploadRecord &record = found->second;
+            const int imageW = std::min(static_cast<int>((record.rect >> 16) & 0xFFFFu), p.texW);
+            const int imageH = std::min(static_cast<int>(record.rect & 0xFFFFu), p.texH);
+            // Filtering at the image's last row or column reads one texel
+            // beyond it. The copy has that border too, as VRAM has it.
+            const int width = std::min(imageW + 1, p.texW);
+            const int height = std::min(imageH + 1, p.texH);
+            const bool inside = p.sampledU0 >= 0 && p.sampledV0 >= 0 && p.sampledU1 < width && p.sampledV1 < height;
+            const bool intact = inside && !PagesWrittenSince(p.texture, 0, 0, imageW - 1, imageH - 1, record.serial);
+            if (!inside)
+                ++statOutside;
+            else if (!intact)
+                ++statStale;
+            if (intact)
+            {
+                ++statFixed;
+                uint64_t key = mixKey(conversion, record.hash);
+                key = mixKey(key, (static_cast<uint64_t>(p.texPsm) << 48) | (static_cast<uint64_t>(p.texW) << 32) |
+                                      (static_cast<uint64_t>(imageW) << 16) | static_cast<uint64_t>(imageH));
+                // The border is not part of the image, so a primitive that
+                // reaches it needs a copy made with the border as it is now.
+                if (p.sampledU1 >= imageW || p.sampledV1 >= imageH)
+                    key = mixKey(key, BorderHash(p, conversion, imageW, imageH, width, height));
+                const auto [it, inserted] = m_decodedTextures.try_emplace(key);
+                DecodedTexture &copy = it->second;
+                copy.lastUsed = ++m_decodedUseClock;
+                if (inserted)
+                {
+                    ++statFixedDecodes;
+                    copy.immutable = true;
+                    copy.width = p.texW;
+                    copy.height = height;
+                    copy.pixels.assign(static_cast<size_t>(p.texW) * static_cast<size_t>(height), 0u);
+                    for (int v = 0; v < height; ++v)
+                    {
+                        uint32_t *out = copy.pixels.data() + static_cast<size_t>(v) * static_cast<size_t>(p.texW);
+                        for (int u = 0; u < width; ++u)
+                            out[u] = p.fetch(u, v);
+                    }
+                    m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);
+                    ForgetOldDecodedTextures();
+                }
+                return &copy;
+            }
+        }
+    }
+
+    // Anything else is known only by where it is. Colours stored as such are
+    // as quick to read from VRAM as from a copy, and a texture nobody sent is
+    // one that was drawn (a render target read back), which a copy would only
+    // chase. Indexed texels are worth converting once, while they stay put.
+    if (p.texKind < TextureKind::Index8)
+        return nullptr;
+
+    uint64_t key = mixKey(conversion, (static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 16) | p.texPsm);
+    key = mixKey(key, (static_cast<uint64_t>(p.texW) << 32) | static_cast<uint64_t>(p.texH));
 
     // In texture lookups: how soon a second content change marks a texture as
     // volatile, and for how long it is then read from VRAM.
@@ -1322,6 +1467,11 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline
     const auto [it, inserted] = m_decodedTextures.try_emplace(key);
     DecodedTexture &copy = it->second;
     copy.lastUsed = ++m_decodedUseClock;
+    if (copy.directUntil > m_decodedUseClock)
+    {
+        copy.checkedSerial = m_writeSerial;
+        return nullptr;
+    }
 
     bool decode = inserted;
     if (inserted)
@@ -1346,55 +1496,72 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline
             }
         }
         // Rewritten with the same bytes is still the same texture.
+        if (written)
+            ++statRehash;
         if (written && HashPages(copy.pages) != copy.contentHash)
+        {
             decode = true;
+            ++statRedecode;
+        }
     }
 
     if (decode && !inserted)
     {
-        // A texture whose contents keep changing is a render target being
-        // read back (a feedback or blur pass). Decoding all of it for the few
-        // texels a pass reads costs more than reading them from VRAM.
+        // Contents that keep changing: decoding all of it for the few texels
+        // one use reads costs more than reading them from VRAM.
         const bool changedRecently = copy.lastDecoded + kVolatileWindow > m_decodedUseClock;
         copy.lastDecoded = m_decodedUseClock;
         if (changedRecently)
         {
             copy.directUntil = m_decodedUseClock + kVolatileHold;
+            m_decodedBytes -= copy.pixels.size() * sizeof(uint32_t);
             copy.pixels.clear();
             copy.pixels.shrink_to_fit();
+            copy.checkedSerial = m_writeSerial;
+            return nullptr;
         }
-    }
-    if (copy.directUntil > m_decodedUseClock)
-    {
-        copy.checkedSerial = m_writeSerial;
-        return nullptr;
     }
     if (copy.pixels.empty())
         decode = true;
     if (decode)
     {
+        m_decodedBytes -= copy.pixels.size() * sizeof(uint32_t);
         copy.pixels.resize(static_cast<size_t>(p.texW) * static_cast<size_t>(p.texH));
+        m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);
         uint32_t *out = copy.pixels.data();
         for (int v = 0; v < p.texH; ++v)
             for (int u = 0; u < p.texW; ++u)
                 *out++ = p.fetch(u, v);
         copy.contentHash = HashPages(copy.pages);
+        if (inserted)
+            ForgetOldDecodedTextures();
     }
     copy.checkedSerial = m_writeSerial;
+    return &copy;
+}
 
-    // Forget copies that have not been used for a long while (queued
-    // primitives hold pointers into them, so only between batches).
-    if (m_decodedTextures.size() > 1024u && !HasQueuedPrimitives())
+// Drops copies that have not been used for a while once they add up to a lot
+// of memory. Queued primitives hold pointers into them, so only between
+// batches.
+void GSCpuBackend::ForgetOldDecodedTextures()
+{
+    constexpr uint64_t kBudgetBytes = 256ull << 20;
+    if (m_decodedBytes <= kBudgetBytes || HasQueuedPrimitives())
+        return;
+    // In texture lookups, one per primitive: a few seconds of drawing.
+    for (uint64_t unusedFor = 2000000u; m_decodedBytes > kBudgetBytes / 2u && unusedFor >= 2000u; unusedFor /= 10u)
     {
         for (auto entry = m_decodedTextures.begin(); entry != m_decodedTextures.end();)
         {
-            if (entry->second.lastUsed + 2048u < m_decodedUseClock)
+            if (entry->second.lastUsed + unusedFor < m_decodedUseClock)
+            {
+                m_decodedBytes -= entry->second.pixels.size() * sizeof(uint32_t);
                 entry = m_decodedTextures.erase(entry);
+            }
             else
                 ++entry;
         }
     }
-    return &copy;
 }
 
 bool GSCpuBackend::UseReferenceRasteriser()
@@ -1746,7 +1913,7 @@ void GSCpuBackend::FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, i
 
 // Sets `primitive` up for the triangle in `batch`. Returns false when the fast
 // path cannot draw it; a primitive that covers nothing comes back empty.
-bool GSCpuBackend::PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive)
+[[gnu::noinline]] bool GSCpuBackend::PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive)
 {
     const GSDrawState &state = batch.state;
     FastPipeline &p = primitive.pipeline;
@@ -1859,12 +2026,14 @@ bool GSCpuBackend::PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimit
             lowV = std::min(lowV, v);
             highV = std::max(highV, v);
         }
-        p.setSampledTexels(lowU, lowV, highU, highV);
+        // Every pixel's coordinates lie between the vertices', give or take rounding.
+        const float largest = std::max(std::max(std::fabs(lowU), std::fabs(highU)), std::max(std::fabs(lowV), std::fabs(highV)));
+        p.setSampledCoordinates(lowU, lowV, highU, highV, 0.05f + 1.0e-5f * largest);
     }
     return true;
 }
 
-bool GSCpuBackend::PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive)
+[[gnu::noinline]] bool GSCpuBackend::PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive)
 {
     const GSDrawState &state = batch.state;
     FastPipeline &p = primitive.pipeline;
@@ -1911,7 +2080,6 @@ bool GSCpuBackend::PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitiv
 
     if (!p.tme)
         return true;
-    p.setSampledTexels(0.0f, 0.0f, 0.0f, 0.0f);
 
     // Texel coordinates at the two vertices.
     float tu0, tv0, tu1, tv1;
@@ -1942,7 +2110,26 @@ bool GSCpuBackend::PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitiv
     primitive.tv0 = tv0;
     primitive.tu1 = tu1;
     primitive.tv1 = tv1;
-    p.setSampledTexels(tu0, tv0, tu1, tv1);
+    // The coordinates of the first and last pixel drawn, computed as
+    // RasteriseRows does; the others lie between them.
+    {
+        const float stepU = (primitive.tu1 - primitive.tu0) / primitive.spanX;
+        const float stepV = (primitive.tv1 - primitive.tv0) / primitive.spanY;
+        const bool fst = p.fst;
+        auto quantise = [fst](float coordinate)
+        {
+            return fst ? static_cast<float>(clampInt(static_cast<int>((coordinate * 16.0f) + 0.5f), 0, 0xFFFF)) * 0.0625f
+                       : coordinate;
+        };
+        const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
+        const float firstU = quantise(rowU);
+        const float lastU = quantise(rowU + static_cast<float>(primitive.maxX - primitive.minX) * stepU);
+        const float firstV = quantise(primitive.tv0 + (static_cast<float>(primitive.minY - primitive.originY) + 0.5f) * stepV);
+        const float lastV = quantise(primitive.tv0 + (static_cast<float>(primitive.maxY - primitive.originY) + 0.5f) * stepV);
+        // Fixed-point coordinates come out the same here as there; a divide
+        // by Q may round differently.
+        p.setSampledCoordinates(firstU, firstV, lastU, lastV, fst ? 0.0f : 1.0f / 64.0f);
+    }
     return true;
 }
 
@@ -2428,7 +2615,9 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, bool sprite)
     }
     for (size_t i = 0; i < writes.size(); ++i)
         queue.written[i] |= writes[i];
-    if (p.tme)
+    // A copy that is never decoded again is no reason for a transfer to its
+    // pages to wait.
+    if (p.tme && !p.decodedIsFixed)
     {
         addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
         if (live)
