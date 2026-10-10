@@ -674,10 +674,11 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     }
 }
 
+// Sees that what is queued gets drawn; it does not wait for it.
 void GSCpuBackend::Flush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives();
+    SubmitPrimitives();
 }
 
 void GSCpuBackend::TextureFlush()
@@ -686,10 +687,15 @@ void GSCpuBackend::TextureFlush()
     m_texturePageCache.Invalidate();
 }
 
-void GSCpuBackend::Sync(GSSyncReason)
+void GSCpuBackend::Sync(GSSyncReason reason)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives();
+    // FINISH and the display need nothing from VRAM themselves: whoever reads
+    // it (a transfer back to the host, Present) waits for the pages it reads.
+    if (reason == GSSyncReason::Finish || reason == GSSyncReason::Presentation)
+        SubmitPrimitives();
+    else
+        FlushPrimitives();
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const

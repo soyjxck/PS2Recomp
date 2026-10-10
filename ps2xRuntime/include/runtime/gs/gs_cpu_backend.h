@@ -86,6 +86,8 @@ private:
     // Draw what is queued: all of it, or only if it involves these pixels of
     // a surface (anything that reads or writes VRAM outside the queue asks).
     void FlushPrimitives();
+    void SubmitPrimitives();
+    void SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, const char *why);
     void FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
                                  const char *why = "upload");
     bool HasQueuedPrimitives() const;

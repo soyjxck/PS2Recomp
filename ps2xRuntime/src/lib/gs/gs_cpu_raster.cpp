@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -1311,6 +1312,10 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
     {
         return border.hash;
     }
+    if (right)
+        FlushPrimitivesTouching(p.texture, imageW, 0, imageW, height - 1, false, "texture");
+    if (below)
+        FlushPrimitivesTouching(p.texture, 0, imageH, width - 1, imageH, false, "texture");
     uint64_t hash = 0x452821E638D01377ull;
     if (right)
         for (int v = 0; v < height; ++v)
@@ -1431,6 +1436,9 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
                 if (inserted)
                 {
                     ++statFixedDecodes;
+                    // The image is in VRAM (nothing queued writes it, or it
+                    // would not be intact); its border may still be drawn to.
+                    FlushPrimitivesTouching(p.texture, 0, 0, width - 1, height - 1, false, "texture");
                     copy.immutable = true;
                     copy.width = p.texW;
                     copy.height = height;
@@ -1473,6 +1481,9 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
         return nullptr;
     }
 
+    // From here VRAM is read: after whatever is still to be drawn into it.
+    FlushPrimitivesTouching(p.texture, 0, 0, p.texW - 1, p.texH - 1, false, "texture");
+
     bool decode = inserted;
     if (inserted)
     {
@@ -1507,6 +1518,8 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
 
     if (decode && !inserted)
     {
+        // Queued primitives may be sampling the copy this replaces.
+        FlushPrimitives();
         // Contents that keep changing: decoding all of it for the few texels
         // one use reads costs more than reading them from VRAM.
         const bool changedRecently = copy.lastDecoded + kVolatileWindow > m_decodedUseClock;
@@ -1541,13 +1554,14 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
 }
 
 // Drops copies that have not been used for a while once they add up to a lot
-// of memory. Queued primitives hold pointers into them, so only between
-// batches.
+// of memory. Queued primitives hold pointers into them, so those are drawn
+// first.
 void GSCpuBackend::ForgetOldDecodedTextures()
 {
     constexpr uint64_t kBudgetBytes = 256ull << 20;
-    if (m_decodedBytes <= kBudgetBytes || HasQueuedPrimitives())
+    if (m_decodedBytes <= kBudgetBytes)
         return;
+    FlushPrimitives();
     // In texture lookups, one per primitive: a few seconds of drawing.
     for (uint64_t unusedFor = 2000000u; m_decodedBytes > kBudgetBytes / 2u && unusedFor >= 2000u; unusedFor /= 10u)
     {
@@ -1692,47 +1706,71 @@ struct GSCpuBackend::PreparedPrimitive
     bool empty() const { return maxX < minX || maxY < minY; }
 };
 
-// Primitives waiting to be drawn, and the workers that draw them. Rows are
-// handed out in bands; within a band primitives are drawn in submission order,
-// so the result is the same as drawing them one after another.
+// Primitives waiting to be drawn, and the pool that draws them.
+//
+// The GS thread collects primitives and hands them over a batch at a time; the
+// pool draws the batches one after another, in the order they were handed
+// over, while the GS thread carries on decoding. Within a batch rows are given
+// out in bands, and within a band primitives are drawn in submission order, so
+// the pixels are the ones drawing them one by one would give.
+//
+// What keeps that safe is knowing which VRAM pages the primitives not yet
+// drawn write and read: anything else that reads or writes VRAM (a transfer, a
+// CLUT load, decoding a texture, the display) first waits for the pool if its
+// pages are among them.
 struct GSCpuBackend::RasterQueue
 {
     static constexpr int kBandHeight = 16;
-    // Below this many bounding-box pixels a batch is drawn by the caller alone.
-    static constexpr uint64_t kParallelPixels = 24000u;
+    // Bounding-box pixels worth waking an idle pool for.
+    static constexpr uint64_t kEagerPixels = 24000u;
     static constexpr size_t kMaxPending = 4096u;
+    // Primitives the pool may have outstanding before the GS thread stops to
+    // help, so a slow pool cannot fall behind without limit.
+    static constexpr size_t kMaxInFlight = 24000u;
 
+    // --- GS thread only -----------------------------------------------------
     std::vector<PreparedPrimitive> pending;
     uint64_t pendingPixels = 0;
     PageSet written{};  // pages pending primitives write
-    PageSet read{};     // pages their textures occupy
+    PageSet read{};     // pages of textures they sample that could change under them
     PageSet readLive{}; // ...of those, pages sampled from VRAM while drawing
+    // The same for everything handed to the pool since it was last seen idle.
+    PageSet flightWritten{};
+    PageSet flightRead{};
+    PageSet flightReadLive{};
     // Target of the pending primitives.
     uint32_t fbp = 0, fbw = 0, zbp = 0;
     uint8_t fpsm = 0, zpsm = 0;
 
-    // Worker pool.
+    // --- shared with the pool -----------------------------------------------
+    struct Batch
+    {
+        std::vector<PreparedPrimitive> primitives;
+        int firstRow = 0;
+        int bandCount = 0;
+        std::atomic<int> nextBand{0};
+        int drawing = 0; // threads inside drawBands (under the mutex)
+    };
     std::vector<std::thread> workers;
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable done;
-    uint64_t generation = 0;
-    int active = 0;
+    std::condition_variable wake; // the front batch has bands to take
+    std::condition_variable done; // a batch was finished
+    std::deque<Batch *> flight;   // handed over, in order; only the front one is drawn
+    std::vector<Batch *> spare;
+    size_t flightPrimitives = 0;
+    std::atomic<size_t> flightBatches{0};
     bool quit = false;
-    std::atomic<int> nextBand{0};
-    int bandCount = 0;
-    int firstRow = 0;
 
-    void drawBands()
+    static void drawBands(Batch &batch)
     {
         for (;;)
         {
-            const int band = nextBand.fetch_add(1, std::memory_order_relaxed);
-            if (band >= bandCount)
+            const int band = batch.nextBand.fetch_add(1, std::memory_order_relaxed);
+            if (band >= batch.bandCount)
                 return;
-            const int bandFirst = firstRow + band * kBandHeight;
+            const int bandFirst = batch.firstRow + band * kBandHeight;
             const int bandLast = bandFirst + kBandHeight - 1;
-            for (const PreparedPrimitive &primitive : pending)
+            for (const PreparedPrimitive &primitive : batch.primitives)
             {
                 const int y0 = std::max(primitive.minY, bandFirst);
                 const int y1 = std::min(primitive.maxY, bandLast);
@@ -1742,22 +1780,41 @@ struct GSCpuBackend::RasterQueue
         }
     }
 
+    // Draws bands of the front batch until none are left to take, and retires
+    // the batch if this was the last thread in it. Takes and returns the lock
+    // held. False when there was no band to take.
+    bool drawFront(std::unique_lock<std::mutex> &lock)
+    {
+        if (flight.empty())
+            return false;
+        Batch *batch = flight.front();
+        if (batch->nextBand.load(std::memory_order_relaxed) >= batch->bandCount)
+            return false;
+        ++batch->drawing;
+        lock.unlock();
+        drawBands(*batch);
+        lock.lock();
+        if (--batch->drawing == 0)
+        {
+            flight.pop_front();
+            flightPrimitives -= batch->primitives.size();
+            batch->primitives.clear();
+            spare.push_back(batch);
+            flightBatches.fetch_sub(1, std::memory_order_release);
+            done.notify_all();
+            if (!flight.empty())
+                wake.notify_all();
+        }
+        return true;
+    }
+
     void workerLoop()
     {
-        uint64_t seen = 0;
         std::unique_lock<std::mutex> lock(mutex);
-        for (;;)
+        while (!quit)
         {
-            wake.wait(lock, [&]
-                      { return quit || generation != seen; });
-            if (quit)
-                return;
-            seen = generation;
-            lock.unlock();
-            drawBands();
-            lock.lock();
-            if (--active == 0)
-                done.notify_one();
+            if (!drawFront(lock))
+                wake.wait(lock);
         }
     }
 
@@ -1765,8 +1822,8 @@ struct GSCpuBackend::RasterQueue
     {
         if (!workers.empty())
             return;
-        // Leave cores for the EE, the IOP and the window; efficiency cores
-        // would only hold a band up.
+        // Leave cores for the EE, VU1, the GS thread and the window;
+        // efficiency cores would only hold a band up.
         unsigned count = std::thread::hardware_concurrency();
         count = count > 3u ? std::min(count - 3u, 6u) : 0u;
         if (const char *value = std::getenv("PS2X_GS_THREADS"))
@@ -1776,51 +1833,56 @@ struct GSCpuBackend::RasterQueue
                                  { workerLoop(); });
     }
 
+    bool busy() const
+    {
+        return flightBatches.load(std::memory_order_acquire) != 0u;
+    }
+
     // PS2X_GS_STATS=1: how the queue is being used, every few thousand batches.
     struct Stats
     {
-        uint64_t batches = 0, parallelBatches = 0, primitives = 0, parallelPixels = 0, inlinePixels = 0;
-        double parallelSeconds = 0.0, inlineSeconds = 0.0;
-        uint64_t reason[6]{};
+        uint64_t batches = 0, primitives = 0, waits = 0;
+        double waitSeconds = 0.0;
+        uint64_t reason[8]{};
     } stats;
-    const char *nextReason = "other";
 
-    void run(const char *why = nullptr)
+    static bool wantStats()
     {
-        if (pending.empty())
-            return;
-
-        static const bool wantStats = []
+        static const bool wanted = []
         {
             const char *value = std::getenv("PS2X_GS_STATS");
             return value != nullptr && value[0] != '\0' && value[0] != '0';
         }();
-        if (wantStats)
+        return wanted;
+    }
+
+    // Hands the pending primitives to the pool. Does not wait for them.
+    void submit(const char *why = nullptr)
+    {
+        if (pending.empty())
+            return;
+
+        if (wantStats())
         {
-            static const char *const kReasons[6] = {"target", "texture", "direct", "full", "upload", "other"};
+            static const char *const kReasons[8] = {"target", "texture", "direct", "full", "upload", "idle", "present", "other"};
             const char *reason = why ? why : "other";
-            for (int i = 0; i < 6; ++i)
+            int slot = 7;
+            for (int i = 0; i < 7; ++i)
                 if (std::strcmp(reason, kReasons[i]) == 0)
-                    ++stats.reason[i];
+                    slot = i;
+            ++stats.reason[slot];
             ++stats.batches;
             stats.primitives += pending.size();
-            if (pendingPixels >= kParallelPixels)
+            if (stats.batches % 4000u == 0u)
             {
-                ++stats.parallelBatches;
-                stats.parallelPixels += pendingPixels;
-            }
-            else
-                stats.inlinePixels += pendingPixels;
-            if (stats.batches % 2000u == 0u)
-            {
-                std::fprintf(stderr, "[gs-queue] batches=%llu (parallel %llu) prims/batch=%.1f bbox pixels: parallel=%lluM inline=%lluM; flushed by",
-                             (unsigned long long)stats.batches, (unsigned long long)stats.parallelBatches,
-                             static_cast<double>(stats.primitives) / static_cast<double>(stats.batches),
-                             (unsigned long long)(stats.parallelPixels / 1000000u), (unsigned long long)(stats.inlinePixels / 1000000u));
-                for (int i = 0; i < 6; ++i)
+                std::fprintf(stderr, "[gs-queue] batches=%llu prims/batch=%.1f; handed over for",
+                             (unsigned long long)stats.batches,
+                             static_cast<double>(stats.primitives) / static_cast<double>(stats.batches));
+                for (int i = 0; i < 8; ++i)
                     std::fprintf(stderr, " %s=%llu", kReasons[i], (unsigned long long)stats.reason[i]);
-                std::fprintf(stderr, "; drawing took %.2fs parallel, %.2fs inline\n", stats.parallelSeconds, stats.inlineSeconds);
-                if (rasterClassStatsWanted() && stats.batches % 8000u == 0u)
+                std::fprintf(stderr, "; the GS thread waited for the pool %llu times, %.2fs\n",
+                             (unsigned long long)stats.waits, stats.waitSeconds);
+                if (rasterClassStatsWanted() && stats.batches % 16000u == 0u)
                     printRasterClasses();
             }
         }
@@ -1834,40 +1896,85 @@ struct GSCpuBackend::RasterQueue
         }
 
         startWorkers();
-        const auto drawStart = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool parallel = !workers.empty() && pendingPixels >= kParallelPixels;
-        if (!parallel)
+        Batch *batch = nullptr;
         {
-            for (const PreparedPrimitive &primitive : pending)
-                Rasterise(primitive, primitive.minY, primitive.maxY);
-        }
-        else
-        {
-            firstRow = top;
-            bandCount = (bottom - top) / kBandHeight + 1;
-            nextBand.store(0, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!spare.empty())
             {
-                std::lock_guard<std::mutex> lock(mutex);
-                active = static_cast<int>(workers.size());
-                ++generation;
+                batch = spare.back();
+                spare.pop_back();
             }
-            wake.notify_all();
-            drawBands();
-            std::unique_lock<std::mutex> lock(mutex);
-            done.wait(lock, [&]
-                      { return active == 0; });
         }
-        if (wantStats)
-        {
-            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - drawStart).count();
-            (parallel ? stats.parallelSeconds : stats.inlineSeconds) += seconds;
-        }
+        if (!batch)
+            batch = new Batch();
+        batch->primitives.swap(pending);
+        batch->firstRow = top;
+        batch->bandCount = (bottom - top) / kBandHeight + 1;
+        batch->nextBand.store(0, std::memory_order_relaxed);
+        batch->drawing = 0;
 
-        pending.clear();
+        for (size_t i = 0; i < written.size(); ++i)
+        {
+            flightWritten[i] |= written[i];
+            flightRead[i] |= read[i];
+            flightReadLive[i] |= readLive[i];
+        }
         pendingPixels = 0;
         written.fill(0u);
         read.fill(0u);
         readLive.fill(0u);
+
+        size_t outstanding = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            flight.push_back(batch);
+            flightPrimitives += batch->primitives.size();
+            outstanding = flightPrimitives;
+            flightBatches.fetch_add(1, std::memory_order_release);
+        }
+        wake.notify_all();
+
+        if (workers.empty())
+            waitIdle();
+        else if (outstanding > kMaxInFlight)
+            waitUntil(kMaxInFlight / 2u);
+    }
+
+    // Helps the pool until it has at most `limit` primitives left.
+    void waitUntil(size_t limit)
+    {
+        const bool timed = wantStats();
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (flightPrimitives > limit)
+            {
+                if (!drawFront(lock))
+                    done.wait(lock);
+            }
+        }
+        if (timed)
+        {
+            ++stats.waits;
+            stats.waitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        }
+    }
+
+    // Returns once everything handed over has been drawn.
+    void waitIdle()
+    {
+        if (busy())
+            waitUntil(0u);
+        flightWritten.fill(0u);
+        flightRead.fill(0u);
+        flightReadLive.fill(0u);
+    }
+
+    // Hands over and waits: everything queued is in VRAM on return.
+    void run(const char *why = nullptr)
+    {
+        submit(why);
+        waitIdle();
     }
 
     ~RasterQueue()
@@ -1879,6 +1986,10 @@ struct GSCpuBackend::RasterQueue
         wake.notify_all();
         for (std::thread &worker : workers)
             worker.join();
+        for (Batch *batch : flight)
+            delete batch;
+        for (Batch *batch : spare)
+            delete batch;
     }
 };
 
@@ -1889,26 +2000,55 @@ void GSCpuBackend::RasterQueueDeleter::operator()(RasterQueue *queue) const
 
 bool GSCpuBackend::HasQueuedPrimitives() const
 {
-    return m_rasterQueue && !m_rasterQueue->pending.empty();
+    return m_rasterQueue && (!m_rasterQueue->pending.empty() || m_rasterQueue->busy());
 }
 
 void GSCpuBackend::FlushPrimitives()
 {
-    if (m_rasterQueue && !m_rasterQueue->pending.empty())
+    if (m_rasterQueue)
         m_rasterQueue->run();
 }
 
+// Hands the pending primitives to the pool without waiting for them.
+void GSCpuBackend::SubmitPrimitives()
+{
+    if (m_rasterQueue)
+        m_rasterQueue->submit();
+}
+
+// Before reading (or, with `writes`, writing) those pixels of a surface in
+// VRAM: waits for queued primitives that write them and, for a writer, for
+// those that still have to read them.
 void GSCpuBackend::FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
                                            const char *why)
 {
-    if (!m_rasterQueue || m_rasterQueue->pending.empty() || !layout.table)
+    if (!m_rasterQueue || !layout.table)
         return;
-    // A reader has to wait for pending writes to its pages; a writer also for
-    // pending reads of them.
+    RasterQueue &queue = *m_rasterQueue;
+    const bool busy = queue.busy();
+    if (queue.pending.empty() && !busy)
+        return;
     PageSet pages{};
     addPages(pages, layout, x0, y0, x1, y1);
-    if (intersects(pages, m_rasterQueue->written) || (writes && intersects(pages, m_rasterQueue->read)))
-        m_rasterQueue->run(why);
+    if (!queue.pending.empty() && (intersects(pages, queue.written) || (writes && intersects(pages, queue.read))))
+    {
+        queue.run(why);
+        return;
+    }
+    if (busy && (intersects(pages, queue.flightWritten) || (writes && intersects(pages, queue.flightRead))))
+        queue.waitIdle();
+}
+
+// Before queueing a primitive that samples those texels while it is drawn:
+// what still has to write them goes to the pool first, so it is drawn first.
+void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, const char *why)
+{
+    if (!m_rasterQueue || m_rasterQueue->pending.empty() || !layout.table)
+        return;
+    PageSet pages{};
+    addPages(pages, layout, x0, y0, x1, y1);
+    if (intersects(pages, m_rasterQueue->written))
+        m_rasterQueue->submit(why);
 }
 
 // Sets `primitive` up for the triangle in `batch`. Returns false when the fast
@@ -2572,12 +2712,12 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, bool sprite)
         (queue.fbp != ctx.frame.fbp || queue.fbw != ctx.frame.fbw || queue.fpsm != ctx.frame.psm ||
          queue.zbp != ctx.zbuf.zbp || queue.zpsm != ctx.zbuf.psm))
     {
-        queue.run("target");
+        queue.submit("target");
     }
 
     // Its texture has to be read after everything that draws into it.
     if (p.tme)
-        FlushPrimitivesTouching(p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1, false, "texture");
+        SubmitPrimitivesWriting(p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1, "texture");
 
     p.useDecodedTexture(primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
     MarkWritten(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
@@ -2603,7 +2743,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, bool sprite)
     if (!p.zmask)
         addPages(writes, p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
     if (!queue.pending.empty() && intersects(writes, queue.readLive))
-        queue.run("texture");
+        queue.submit("texture");
 
     if (queue.pending.empty())
     {
@@ -2629,7 +2769,11 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, bool sprite)
     p.drawState = nullptr;
     queue.pending.push_back(primitive);
 
+    // Enough for the pool to start on if it has nothing to do; otherwise let
+    // the batch grow.
     if (queue.pending.size() >= RasterQueue::kMaxPending)
-        queue.run("full");
+        queue.submit("full");
+    else if (queue.pendingPixels >= RasterQueue::kEagerPixels && !queue.busy())
+        queue.submit("idle");
     return true;
 }
