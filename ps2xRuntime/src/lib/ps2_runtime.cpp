@@ -806,6 +806,10 @@ namespace
 // at its tick, whatever the host's speed: the emulation stops at a tick that
 // is to be dumped until the window thread has saved it (or stopped drawing).
 void ps2xSetGsBackgroundDrawing(const uint8_t *vram); // gs/gs_cpu_backend.cpp
+namespace GSGpu
+{
+    bool PrepareContext(); // gs/gs_gpu_renderer.cpp
+}
 
 void ps2xHoldForFrameDump(uint64_t tick)
 {
@@ -1242,6 +1246,10 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(hostDisplay().windowWidth, hostDisplay().windowHeight, title);
         if (hostDisplay().fullscreen)
             ToggleBorderlessWindowed();
+        // A second GL context beside the window's, for a GS drawn by the
+        // graphics card (display.renderer = gpu).
+        if (const char *renderer = ps2x::setting("PS2X_GS_RENDERER", "display.renderer"); renderer && std::strcmp(renderer, "gpu") == 0)
+            GSGpu::PrepareContext();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         // [audio] volume (PS2X_VOLUME): 0 to 100, of everything that is played.

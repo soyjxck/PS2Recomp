@@ -589,6 +589,7 @@ void GSCpuBackend::ResetUnlocked()
     m_clutCbp.fill(0u);
     ++m_clutLoads;
     m_clutHeld.fill({});
+    GpuForgetTextures();
     m_decodedTextures.clear();
     m_decodedBytes = 0;
     m_uploads.clear();
@@ -2553,7 +2554,7 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
             }
             const uint32_t rows = fields ? (height + 1u) >> 1u : height;
             std::vector<uint8_t> scaled;
-            if (scale.larger() && CopyScaledFrame(shown, scale, origin.x, origin.y, width, rows, scaled))
+            if ((scale.larger() || GpuSetting()) && CopyScaledFrame(shown, scale, origin.x, origin.y, width, rows, scaled))
             {
                 frame.pixels.swap(scaled);
                 frame.width = width * static_cast<uint32_t>(scale.x);

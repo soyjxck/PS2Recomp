@@ -14,6 +14,11 @@ namespace GSMem
     struct SurfaceLayout;
 }
 
+namespace GSGpu
+{
+    struct Pipeline;
+}
+
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
@@ -59,6 +64,7 @@ private:
         int width = 0;  // of a row: the texture's
         int height = 0; // rows it has: the image's
         std::vector<uint32_t> pixels; // RGBA, row major
+        uint32_t gpuTexture = 0; // the same as a texture of the graphics card's, once it has drawn with it
     };
     struct PreparedPrimitive;
     // What a Rasterise call covered, for PS2X_GS_STATS.
@@ -252,6 +258,37 @@ private:
     static void BlitRows(const PreparedPrimitive &primitive, int yFirst, int yLast);
     bool CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width, uint32_t height,
                          std::vector<uint8_t> &outPixels);
+    bool PageGood(uint32_t page, uint64_t key);
+    bool PagesStale(const GSMem::SurfaceLayout &layout, uint64_t key, int x0, int y0, int x1, int y1);
+    void MarkPages(const GSMem::SurfaceLayout &layout, uint64_t key, int x0, int y0, int x1, int y1);
+
+    // The larger copy kept by the graphics card (display.renderer in the
+    // settings file, PS2X_GS_RENDERER) rather than in m_shadow, and drawn
+    // by it: gs_cpu_raster_gpu.inl. The pages are accounted for in the same
+    // way, with m_shadowSerial and m_shadowKey; a surface of the card's
+    // stands for each frame or depth buffer where the shadow has room for
+    // every page. `depthKind` is -1 for a frame buffer.
+    struct GpuState;
+    struct GpuStateDeleter
+    {
+        void operator()(GpuState *state) const;
+    };
+    std::unique_ptr<GpuState, GpuStateDeleter> m_gpu;
+    bool m_gpuAsked = false;
+    static bool GpuSetting();
+    bool GpuReady();
+    uint64_t GpuKey(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind) const;
+    uint32_t GpuSurface(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind, int rows);
+    void GpuFill(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind, int x0, int y0, int x1, int y1, bool overwritten);
+    void GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive, SurfaceScale scale);
+    void GpuTexture(PreparedPrimitive &primitive, const GSContext &context, GSGpu::Pipeline &state);
+    void GpuTextureFromVram(FastPipeline &pipeline, GSGpu::Pipeline &state);
+    void GpuForgetTexture(uint32_t texture);
+    void GpuForgetTextures();
+    void GpuFlush();
+    void GpuCompare();
+    bool GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width, uint32_t height,
+                      std::vector<uint8_t> &outPixels);
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

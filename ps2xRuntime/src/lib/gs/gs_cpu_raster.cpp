@@ -370,6 +370,7 @@ struct GSCpuBackend::FastPipeline
     int lowU = 0, highU = 0, lowV = 0, highV = 0;
     // The decoded copy, when the texture can use one. It never changes.
     const uint32_t *decoded = nullptr;
+    DecodedTexture *decodedCopy = nullptr; // what `decoded` is the pixels of
     // For an indexed texture sampled from VRAM: the CLUT as it was when the
     // primitive was queued (see ClutSnapshotFor). Without one, the backend's
     // live CLUT is used, on the GS thread only.
@@ -462,6 +463,7 @@ struct GSCpuBackend::FastPipeline
             if (const DecodedTexture *copy = backend->DecodedTextureFor(*this))
             {
                 decoded = copy->pixels.data();
+                decodedCopy = const_cast<DecodedTexture *>(copy);
                 // The copy ends with its image; nothing the primitive samples
                 // is further down.
                 highV = std::min(highV, copy->height - 1);
@@ -1546,6 +1548,7 @@ void GSCpuBackend::ForgetOldDecodedTextures()
         {
             if (entry->second.lastUsed + unusedFor < m_decodedUseClock)
             {
+                GpuForgetTexture(entry->second.gpuTexture);
                 m_decodedBytes -= entry->second.pixels.size() * sizeof(uint32_t);
                 entry = m_decodedTextures.erase(entry);
             }
@@ -1844,11 +1847,20 @@ struct GSCpuBackend::RasterQueue
     {
         if (!workers.empty())
             return;
-        // Leave cores for the EE, VU1, the GS thread and the window;
-        // efficiency cores would only hold a band up.
+        // Leave cores for the EE, VU1, the GS thread and the window. On
+        // Apple's processors the cores past the first six or so are
+        // efficiency cores, which would only hold a band up; elsewhere a
+        // few more help, until the EE is what everything waits for.
+        // performance.raster_threads in the settings file (PS2X_GS_THREADS)
+        // says how many threads draw, this one included.
         unsigned count = std::thread::hardware_concurrency();
-        count = count > 3u ? std::min(count - 3u, 6u) : 0u;
-        if (const char *value = std::getenv("PS2X_GS_THREADS"))
+#if defined(__APPLE__)
+        constexpr unsigned kMost = 6u;
+#else
+        constexpr unsigned kMost = 8u;
+#endif
+        count = count > 3u ? std::min(count - 3u, kMost) : 0u;
+        if (const char *value = ps2x::setting("PS2X_GS_THREADS", "performance.raster_threads"))
             count = static_cast<unsigned>(std::max(0, std::atoi(value) - 1));
         for (unsigned i = 0; i < count; ++i)
             workers.emplace_back([this]
@@ -2154,6 +2166,7 @@ void GSCpuBackend::SubmitPrimitives()
 {
     if (m_rasterQueue)
         m_rasterQueue->submit();
+    GpuFlush();
 }
 
 // Before reading (or, with `writes`, writing) those pixels of a surface in
@@ -3341,6 +3354,13 @@ void GSCpuBackend::BlitRows(const PreparedPrimitive &q, int yFirst, int yLast)
 bool GSCpuBackend::CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width,
                                    uint32_t height, std::vector<uint8_t> &outPixels)
 {
+    bool card;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        card = m_gpu != nullptr;
+    }
+    if (card)
+        return GpuCopyFrame(frame, scale, originX, originY, width, height, outPixels);
     const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
     const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, framePageBaseToBlock(frame.fbp), fbw);
     if (!scale.larger() || !layout.table || layout.spillsIntoNextPage || width == 0u || height == 0u ||
@@ -3437,8 +3457,41 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     if (m_scale == 0)
         m_scale = ps2xGsDrawsInBackground(m_vram) ? ScaleSetting() : 1;
     const SurfaceScale scale = ScaleOf(batch.state.context.frame.fbp, batch.state.context.frame.fbw);
-    const bool twice = scale.larger() && !p.frame.spillsIntoNextPage && !p.depth.spillsIntoNextPage;
-    if (twice)
+    // By the graphics card when it keeps the copy (of anything it can: a
+    // 16-bit frame stays VRAM's alone), at any size.
+    const bool card = GpuReady() && p.frameKind != FrameKind::C16;
+    const bool twice = (card || scale.larger()) && !p.frame.spillsIntoNextPage && !p.depth.spillsIntoNextPage;
+    const bool depthUsed = !p.zmask || p.ztst >= 2u;
+    const uint64_t cardFrame = card ? GpuKey(p.frame, scale, -1) : 0u;
+    const uint64_t cardDepth = card ? GpuKey(p.depth, scale, static_cast<int>(p.depthKind)) : 0u;
+    if (twice && card)
+    {
+        // A sprite that writes every pixel it covers, whatever is there:
+        // a clear, a copy. What its pages hold is of no interest then.
+        const bool everyPixel = primitive.sprite && p.ztst == 1u && !p.date &&
+                                (!p.alphaTest || p.atst == 1u || (p.atst == 0u && p.afail == 1u && p.zmask));
+        const bool overFrame = everyPixel && p.fbmsk == 0u && p.frameKind == FrameKind::C32 &&
+                               (!p.abe || (!p.pabe && p.asel != 1u && p.bsel != 1u && p.dsel != 1u && p.csel != 1u));
+        const bool overDepth = everyPixel && !p.zmask && (!p.alphaTest || p.atst == 1u);
+        auto fill = [&](const GSMem::SurfaceLayout &layout, uint64_t key, int depthKind, bool overwritten)
+        {
+            if (!PagesStale(layout, key, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY))
+                return;
+            if (overwritten)
+            {
+                // Only the pages it covers part of need VRAM's pixels.
+                GpuFill(layout, scale, depthKind, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, true);
+                if (!PagesStale(layout, key, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY))
+                    return;
+            }
+            FlushPrimitivesTouching(layout, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, false, "shadow");
+            GpuFill(layout, scale, depthKind, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, false);
+        };
+        fill(p.frame, cardFrame, -1, overFrame);
+        if (depthUsed)
+            fill(p.depth, cardDepth, static_cast<int>(p.depthKind), overDepth);
+    }
+    else if (twice)
     {
         if (!m_shadow)
         {
@@ -3469,7 +3522,13 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     MarkWritten(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
     if (!p.zmask)
         MarkWritten(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
-    if (twice)
+    if (twice && card)
+    {
+        MarkPages(p.frame, cardFrame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        if (!p.zmask)
+            MarkPages(p.depth, cardDepth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+    }
+    else if (twice)
     {
         MarkShadowDrawn(p.frame, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
         if (!p.zmask)
@@ -3483,8 +3542,10 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     if (live && p.textureIsTarget)
     {
         queue.run("direct");
+        if (twice && card)
+            GpuDraw(batch, primitive, scale);
         Rasterise(primitive, primitive.minY, primitive.maxY);
-        if (twice)
+        if (twice && !card)
         {
             ScaleUp(primitive, scale);
             PrepareBlit(primitive, ctx);
@@ -3517,10 +3578,12 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
     queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
                            static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
+    if (twice && card)
+        GpuDraw(batch, primitive, scale);
     // The queued copy must not point at this call's draw state.
     p.drawState = nullptr;
     queue.pending.push_back(primitive);
-    if (twice)
+    if (twice && !card)
     {
         ScaleUp(primitive, scale);
         PrepareBlit(primitive, ctx);
@@ -3537,3 +3600,5 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         queue.submit("idle");
     return true;
 }
+
+#include "gs_cpu_raster_gpu.inl"
