@@ -377,9 +377,95 @@ namespace
     }
 }
 
+// Set while a traced VU1 run is in flight; ps2_vu1_core.cpp logs XGKICK packets.
+int g_ps2xVu1TraceKicks = 0;
+
 namespace
 {
     constexpr double kTestVBlanksPerSecond = 59.94; // NTSC
+
+    // PS2X_VU1_TRACE=<secs>[:count[:skip]]  log VU1 runs starting at that
+    // emulated time: the data memory the game uploaded, the registers after
+    // the run and every packet it kicked. `skip` runs are passed over first.
+    struct Vu1TracePlan
+    {
+        uint64_t fromTick = 0;
+        uint32_t remaining = 0;
+        uint32_t skip = 0;
+    };
+
+    Vu1TracePlan &vu1TracePlan()
+    {
+        static Vu1TracePlan plan = []
+        {
+            Vu1TracePlan p;
+            if (const char *value = std::getenv("PS2X_VU1_TRACE"))
+            {
+                p.fromTick = static_cast<uint64_t>(std::atof(value) * kTestVBlanksPerSecond);
+                p.remaining = 4u;
+                if (const char *colon = std::strchr(value, ':'))
+                {
+                    p.remaining = static_cast<uint32_t>(std::atoi(colon + 1));
+                    if (const char *colon2 = std::strchr(colon + 1, ':'))
+                        p.skip = static_cast<uint32_t>(std::atoi(colon2 + 1));
+                }
+            }
+            return p;
+        }();
+        return plan;
+    }
+
+    bool vu1TraceBegin(uint64_t tick, const char *kind, uint32_t startPC, uint32_t top, uint32_t itop, const uint8_t *data)
+    {
+        Vu1TracePlan &plan = vu1TracePlan();
+        if (plan.remaining == 0u || plan.fromTick == 0u || tick < plan.fromTick)
+            return false;
+        if (plan.skip != 0u)
+        {
+            --plan.skip;
+            return false;
+        }
+        --plan.remaining;
+        std::fprintf(stderr, "[vu1] %s t=%.2fs pc=0x%x top=%u itop=%u\n", kind,
+                     static_cast<double>(tick) / kTestVBlanksPerSecond, startPC, top, itop);
+        if (data)
+        {
+            bool gap = false;
+            for (uint32_t q = 0; q < PS2_VU1_DATA_SIZE / 16u; ++q)
+            {
+                uint32_t w[4];
+                float f[4];
+                std::memcpy(w, data + q * 16u, sizeof(w));
+                std::memcpy(f, w, sizeof(f));
+                if ((w[0] | w[1] | w[2] | w[3]) == 0u)
+                {
+                    gap = true;
+                    continue;
+                }
+                if (gap)
+                    std::fprintf(stderr, "[vu1]   ...\n");
+                gap = false;
+                std::fprintf(stderr, "[vu1]   in %4u: %08x %08x %08x %08x  % .5g % .5g % .5g % .5g\n",
+                             q, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+            }
+        }
+        g_ps2xVu1TraceKicks = 1;
+        return true;
+    }
+
+    void vu1TraceEnd(const VU1State &state)
+    {
+        g_ps2xVu1TraceKicks = 0;
+        std::fprintf(stderr, "[vu1] done pc=0x%x cycles=%llu ebit=%d q=%g p=%g\n", state.pc,
+                     static_cast<unsigned long long>(state.cycles), state.ebit ? 1 : 0, state.q, state.p);
+        for (uint32_t r = 0; r < 32u; ++r)
+            std::fprintf(stderr, "[vu1]   vf%02u % .6g % .6g % .6g % .6g\n", r,
+                         state.vf[r][0], state.vf[r][1], state.vf[r][2], state.vf[r][3]);
+        std::fprintf(stderr, "[vu1]   vi");
+        for (uint32_t r = 0; r < 16u; ++r)
+            std::fprintf(stderr, " %d", state.vi[r]);
+        std::fprintf(stderr, "\n");
+    }
 
     uint64_t envEmulatedTicks(const char *name)
     {
@@ -767,9 +853,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
+                                                                       "MSCAL", startPC, top, itop, m_memory.getVU1Data());
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     if (traced)
+                                         vu1TraceEnd(m_vu1.state());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -785,9 +875,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
+                                                                       "MSCNT", m_vu1.state().pc, top, itop, m_memory.getVU1Data());
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     if (traced)
+                                         vu1TraceEnd(m_vu1.state());
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
