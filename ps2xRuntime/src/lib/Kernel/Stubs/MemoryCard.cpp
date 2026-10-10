@@ -34,6 +34,7 @@ namespace ps2_stubs
         constexpr int32_t kMcFormatted = 1;
         constexpr int32_t kMcUnformatted = 0;
         constexpr int32_t kMcFreeClusters = 0x2000;
+        constexpr int32_t kMcFreeDirEntries = 1024;
         constexpr size_t kMcMaxPathLen = 1024;
         constexpr size_t kMcMaxOpenFiles = 32;
 
@@ -852,10 +853,41 @@ namespace ps2_stubs
 
     void sceMcGetEntSpace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
+        const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
+        const uint32_t pathAddr = getRegU32(ctx, 6);
+        const std::string rawPath =
+            (pathAddr != 0u) ? readPs2CStringBounded(rdram, pathAddr, kMcMaxPathLen) : std::string{};
+
+        // Games use this to ask whether their save directory exists, so a
+        // missing directory has to be reported as such.
+        int32_t result = kMcResultNoEntry;
         {
             std::lock_guard<std::mutex> lock(g_mcStateMutex);
-            setMcCommandResultLocked(kMcCmdGetEntSpace, 1024);
+            if (isValidMcPortSlot(port, slot))
+            {
+                McPortState &state = g_mcPorts[static_cast<size_t>(port)];
+                if (!state.formatted)
+                {
+                    result = kMcResultNoFormat;
+                }
+                else
+                {
+                    ensureMcRootExists(port);
+                    const std::filesystem::path hostDir = guestMcPathToHostPath(
+                        port, normalizeGuestMcPathLocked(port, rawPath.empty() ? "." : rawPath));
+                    std::error_code ec;
+                    if (std::filesystem::exists(hostDir, ec) && !ec &&
+                        std::filesystem::is_directory(hostDir, ec))
+                    {
+                        result = kMcFreeDirEntries;
+                    }
+                }
+            }
+
+            setMcCommandResultLocked(kMcCmdGetEntSpace, result);
         }
+        RUNTIME_LOG("[MC] GetEntSpace port=" << port << " '" << rawPath << "' -> result=" << result);
         setReturnS32(ctx, 0);
     }
 
