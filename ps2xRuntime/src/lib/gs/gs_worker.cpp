@@ -65,8 +65,26 @@ namespace
     }
 }
 
+namespace
+{
+    std::atomic<void (*)()> g_interruptSentHook{nullptr};
+}
+
 namespace GsWorker
 {
+    void setInterruptSentHook(void (*hook)())
+    {
+        g_interruptSentHook.store(hook, std::memory_order_release);
+    }
+
+    void interruptSent()
+    {
+        if (void (*hook)() = g_interruptSentHook.load(std::memory_order_acquire))
+            hook();
+        else
+            drain();
+    }
+
     bool raisesInterrupt(const uint8_t *data, uint32_t sizeBytes)
     {
         const uint32_t qwords = sizeBytes / 16u;
@@ -196,7 +214,7 @@ namespace GsWorker
         // Sent straight from the EE (no VU1 worker in between): an interrupt
         // this packet raises is pending when the send returns.
         if (!Vu1Worker::onWorkerThread() && raisesInterrupt(data, sizeBytes))
-            drain();
+            interruptSent();
     }
 
     bool drain()

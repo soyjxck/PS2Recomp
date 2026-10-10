@@ -1,6 +1,36 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/gs_worker.h"
 
+namespace
+{
+    // Ids of the Dmac-type events used to time the GS (not DMAC causes).
+    constexpr uint32_t kGsSyncRequested = 0x47530001u;
+    constexpr uint32_t kGsSyncDue = 0x47530002u;
+
+    uint64_t gsFinishDelayCycles()
+    {
+        static const uint64_t cycles = []
+        {
+            const char *value = std::getenv("PS2X_GS_FINISH_DELAY_US");
+            const uint64_t microseconds = value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : 0u;
+            return (microseconds * EeScheduler::kEeClockHz) / 1000000ull;
+        }();
+        return cycles;
+    }
+}
+
+// Has the scheduler wait for the GS a set emulated time after an interrupt was
+// sent to it, when PS2X_GS_FINISH_DELAY_US asks for that.
+void ps2xInstallGsFinishDelay(EeScheduler &scheduler)
+{
+    static EeScheduler *target = nullptr;
+    target = &scheduler;
+    if (gsFinishDelayCycles() == 0u)
+        return;
+    GsWorker::setInterruptSentHook([]
+                                   { target->postEvent(EeEvent{EeEventType::Dmac, kGsSyncRequested, 0}); });
+}
+
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
@@ -1953,6 +1983,23 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        // PS2X_GS_FINISH_DELAY_US: a packet that raises FINISH or SIGNAL was
+        // sent; wait for the GS that much emulated time later instead of at
+        // the send (see GsWorker::interruptSent).
+        if (event.id == kGsSyncRequested)
+        {
+            scheduleEvent(m_eeCycle + gsFinishDelayCycles(), std::chrono::steady_clock::now(),
+                          EeEvent{EeEventType::Dmac, kGsSyncDue, 0});
+        }
+        else if (event.id == kGsSyncDue && GsWorker::drain())
+        {
+            const uint32_t gsInterrupts = pendingGsInterrupts();
+            if ((gsInterrupts & ~m_gsIrqLatched) != 0u)
+            {
+                dispatchIrq(false, 0u); // INTC_GS
+            }
+            m_gsIrqLatched = gsInterrupts;
+        }
         break;
     case EeEventType::Alarm:
     {

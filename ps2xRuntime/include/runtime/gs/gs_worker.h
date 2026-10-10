@@ -28,6 +28,14 @@ namespace GsWorker
     // was anything to wait for. Does nothing on the worker thread itself.
     bool drain();
 
+    // Called by a sender on the EE side after posting a packet that raises an
+    // interrupt. Without a hook the caller waits for the queue (the interrupt
+    // is pending when the send returns). A hook takes over the wait: it is
+    // expected to arrange a drain() a fixed emulated time later, which models
+    // the time the GS takes to draw and lets the EE run meanwhile.
+    void interruptSent();
+    void setInterruptSentHook(void (*hook)());
+
     // Whether a GIF packet writes the FINISH or SIGNAL register.
     bool raisesInterrupt(const uint8_t *gifPacket, uint32_t sizeBytes);
 

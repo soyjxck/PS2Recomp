@@ -151,7 +151,7 @@ namespace Vu1Worker
             return;
         worker().post(false, data, sizeBytes);
         if (GsWorker::mayRaiseInterrupt(data, sizeBytes))
-            GsWorker::drain();
+            GsWorker::interruptSent();
     }
 
     void postPath3(const uint8_t *data, uint32_t sizeBytes)
@@ -160,7 +160,7 @@ namespace Vu1Worker
             return;
         worker().post(true, data, sizeBytes);
         if (GsWorker::raisesInterrupt(data, sizeBytes))
-            GsWorker::drain();
+            GsWorker::interruptSent();
     }
 
     bool drain()

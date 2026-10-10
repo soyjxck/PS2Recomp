@@ -425,6 +425,7 @@ void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, 
                  ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u);
 }
 extern int g_ps2xGifTraceRemaining; // ps2_memory.cpp
+void ps2xInstallGsFinishDelay(EeScheduler &scheduler); // EeScheduler.cpp
 
 namespace
 {
@@ -945,6 +946,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     GsWorker::start(m_gs);
     Vu1Worker::start(m_memory);
+    if (m_eeScheduler)
+        ps2xInstallGsFinishDelay(*m_eeScheduler);
     m_gifArbiter.setProcessPacketFn([](const uint8_t *data, uint32_t size)
                                     { GsWorker::post(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
