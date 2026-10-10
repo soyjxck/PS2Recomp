@@ -583,23 +583,30 @@ namespace
     //   PS2X_FRAME_DUMP_AT=<t1,t2>    ...and/or at specific times
     //   PS2X_EXIT_AT=<secs>           dump a last frame and exit
     //   PS2X_PERF_LOG=<secs>          print emulated-vs-wall speed periodically
-    void maybeDumpPresentedFrame(const uint8_t *rgba, uint32_t strideBytes, uint32_t width, uint32_t height, uint64_t tick)
+    struct FrameDumpPlan
     {
-        struct DumpPlan
+        std::string dir;
+        uint64_t everyTicks = 0;
+        std::vector<uint64_t> atTicks;
+
+        bool dueAt(uint64_t tick) const
         {
-            std::string dir;
-            uint64_t everyTicks = 0;
-            uint64_t nextEveryTick = 0;
-            std::vector<uint64_t> atTicks;
-            size_t nextAt = 0;
-        };
-        static DumpPlan plan = []
+            if (dir.empty() || tick == 0u)
+                return false;
+            if (everyTicks != 0u && tick % everyTicks == 0u)
+                return true;
+            return std::binary_search(atTicks.begin(), atTicks.end(), tick);
+        }
+    };
+
+    const FrameDumpPlan &frameDumpPlan()
+    {
+        static const FrameDumpPlan plan = []
         {
-            DumpPlan p;
+            FrameDumpPlan p;
             if (const char *dir = std::getenv("PS2X_FRAME_DUMP_DIR"))
                 p.dir = dir;
             p.everyTicks = envEmulatedTicks("PS2X_FRAME_DUMP_EVERY");
-            p.nextEveryTick = p.everyTicks;
             if (const char *list = std::getenv("PS2X_FRAME_DUMP_AT"))
             {
                 std::stringstream stream(list);
@@ -613,24 +620,41 @@ namespace
             std::sort(p.atTicks.begin(), p.atTicks.end());
             return p;
         }();
+        return plan;
+    }
 
-        if (plan.dir.empty() || !rgba || width == 0u || height == 0u)
+    // The last tick whose frame the window thread has saved.
+    std::atomic<uint64_t> g_frameDumpSavedTick{0};
+
+    void maybeDumpPresentedFrame(const uint8_t *rgba, uint32_t strideBytes, uint32_t width, uint32_t height, uint64_t tick)
+    {
+        const FrameDumpPlan &plan = frameDumpPlan();
+        // Ticks at or before this one are done with, saved or not.
+        static uint64_t nextEveryTick = plan.everyTicks;
+        static size_t nextAt = 0;
+
+        if (plan.dir.empty())
             return;
 
         bool due = false;
-        if (plan.everyTicks != 0u && tick >= plan.nextEveryTick)
+        if (plan.everyTicks != 0u && tick >= nextEveryTick)
         {
             due = true;
-            while (plan.nextEveryTick <= tick)
-                plan.nextEveryTick += plan.everyTicks;
+            while (nextEveryTick <= tick)
+                nextEveryTick += plan.everyTicks;
         }
-        while (plan.nextAt < plan.atTicks.size() && tick >= plan.atTicks[plan.nextAt])
+        while (nextAt < plan.atTicks.size() && tick >= plan.atTicks[nextAt])
         {
             due = true;
-            ++plan.nextAt;
+            ++nextAt;
         }
         if (!due)
             return;
+        if (!rgba || width == 0u || height == 0u)
+        {
+            g_frameDumpSavedTick.store(tick, std::memory_order_release);
+            return;
+        }
 
         std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4u);
         for (uint32_t y = 0; y < height; ++y)
@@ -645,7 +669,20 @@ namespace
         char name[64];
         std::snprintf(name, sizeof(name), "/f_%07.2f.png", static_cast<double>(tick) / kTestVBlanksPerSecond);
         ExportImage(image, (plan.dir + name).c_str());
+        g_frameDumpSavedTick.store(tick, std::memory_order_release);
     }
+}
+
+// Called by the EE at each vblank. A frame dump is of the picture on display
+// at its tick, whatever the host's speed: the emulation stops at a tick that
+// is to be dumped until the window thread has saved it (or stopped drawing).
+void ps2xHoldForFrameDump(uint64_t tick)
+{
+    if (!frameDumpPlan().dueAt(tick))
+        return;
+    const auto giveUp = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (g_frameDumpSavedTick.load(std::memory_order_acquire) < tick && std::chrono::steady_clock::now() < giveUp)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
@@ -692,6 +729,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
+        maybeDumpPresentedFrame(nullptr, 0u, 0u, 0u, currentTick); // nothing to save for this tick
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
