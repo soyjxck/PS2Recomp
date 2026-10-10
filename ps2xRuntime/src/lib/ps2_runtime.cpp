@@ -1,4 +1,5 @@
 #include "ps2_runtime.h"
+#include "runtime/gs/gs_worker.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -760,6 +761,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        GsWorker::stop();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -896,8 +898,9 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    GsWorker::start(m_gs);
+    m_gifArbiter.setProcessPacketFn([](const uint8_t *data, uint32_t size)
+                                    { GsWorker::post(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -2411,12 +2414,14 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     ps2TraceGuestWrite(rdram, GIF_TADR, 4u, tadr, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(GIF_TADR, tadr);
     ps2TraceGuestWrite(rdram, GIF_CHCR, 4u, chcr, 0u, "WRITE32", ctx);
-    if (m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
+    // The native shortcuts call into the GS directly; with the GS on its own
+    // thread everything goes through the packet queue instead.
+    if (!GsWorker::running() && m_memory.tryProcessNativeGifImageUploadChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;
     }
-    if (m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
+    if (!GsWorker::running() && m_memory.tryProcessNativeGifPackedChain(m_gs, tadr, chcr))
     {
         drainCompletedDmacHandlers(rdram);
         return;

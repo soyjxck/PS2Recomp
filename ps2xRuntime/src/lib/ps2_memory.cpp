@@ -1,4 +1,5 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/gs/gs_worker.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -749,6 +750,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -796,6 +798,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -2429,6 +2432,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))

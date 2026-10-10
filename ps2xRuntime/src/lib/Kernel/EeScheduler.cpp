@@ -1,4 +1,5 @@
 #include "runtime/ee_scheduler.h"
+#include "runtime/gs/gs_worker.h"
 
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
@@ -172,6 +173,10 @@ void EeScheduler::run()
             GuestThread *next = selectReady();
             if (!next && m_pendingInvocations.empty())
             {
+                // Nothing to run: the interrupt the guest is waiting for may
+                // be in the packets the GS has not reached yet.
+                if (GsWorker::drain())
+                    continue;
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
                 publishSnapshot();
@@ -1894,6 +1899,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        // The frame the guest sent is drawn before its vblank arrives.
+        GsWorker::drain();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
