@@ -115,6 +115,62 @@ namespace
 
     thread_local DispatchHistory g_dispatchHistory;
 
+    // Set from the moment guest code starts handing control back to the
+    // scheduler (a checkpoint that is due, or a jump out of the function) until
+    // the scheduler enters guest code again. While it is set, ctx->pc is where
+    // to resume and says nothing about which call has returned.
+    thread_local bool t_guestUnwinding = false;
+
+    // PS2X_CALL_HISTORY=1: keep the last few thousand calls, jumps and
+    // returns to a call site, with the stack pointer and return address at
+    // each, and print them when the guest ends up at an address that is not
+    // code. For a return through a clobbered stack slot this shows which
+    // call came back with the stack where it was not.
+    struct CallRecord
+    {
+        uint32_t target, source, sp, ra;
+        char kind; // 'c' call, 'j' jump, 'r' back at the call site, 'x' left another way
+    };
+    struct CallHistory
+    {
+        std::array<CallRecord, 4096> records{};
+        uint32_t next = 0u;
+        uint64_t count = 0u;
+    };
+    thread_local CallHistory g_callHistory;
+    const bool g_callHistoryWanted = []
+    {
+        const char *value = std::getenv("PS2X_CALL_HISTORY");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+
+    inline void pushCall(char kind, uint32_t target, uint32_t source, const R5900Context *ctx)
+    {
+        CallHistory &h = g_callHistory;
+        h.records[h.next] = {target, source, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                             static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), kind};
+        h.next = (h.next + 1u) % static_cast<uint32_t>(h.records.size());
+        ++h.count;
+    }
+
+    void printCallHistory(size_t last)
+    {
+        const CallHistory &h = g_callHistory;
+        const size_t size = h.records.size();
+        const size_t available = static_cast<size_t>(std::min<uint64_t>(h.count, size));
+        last = std::min(last, available);
+        int depth = 0;
+        for (size_t i = 0; i < last; ++i)
+        {
+            const CallRecord &r = h.records[(h.next + size - last + i) % size];
+            if (r.kind == 'r' || r.kind == 'x')
+                depth = std::max(depth - 1, 0);
+            std::fprintf(stderr, "[calls] %*s%c %08x from %08x sp=%08x ra=%08x\n", depth * 2, "", r.kind, r.target, r.source, r.sp, r.ra);
+            if (r.kind == 'c')
+                ++depth;
+        }
+    }
+
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
         std::ifstream file(path, std::ios::binary);
@@ -388,8 +444,13 @@ uint32_t g_ps2xWatchSize = 0;
 namespace
 {
     int g_ps2xWatchReports = 0;
+    // With a fourth field, only stores of that value (its low 32 bits) count:
+    // for a slot that is written all the time, such as one on the stack.
+    bool g_ps2xWatchOneValue = false;
+    uint32_t g_ps2xWatchValue = 0;
 
-    // Arms PS2X_WATCH before any guest code runs.
+    // Arms PS2X_WATCH=<hex address>[:bytes[:reports[:hex value]]] before any
+    // guest code runs.
     const bool g_ps2xWatchArmed = []
     {
         const char *value = std::getenv("PS2X_WATCH");
@@ -403,7 +464,14 @@ namespace
         {
             size = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
             if (end && *end == ':')
-                g_ps2xWatchReports = std::atoi(end + 1);
+            {
+                g_ps2xWatchReports = static_cast<int>(std::strtol(end + 1, &end, 0));
+                if (end && *end == ':')
+                {
+                    g_ps2xWatchValue = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
+                    g_ps2xWatchOneValue = true;
+                }
+            }
         }
         g_ps2xWatchSize = size != 0u ? size : 16u;
         return true;
@@ -413,6 +481,8 @@ namespace
 void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
                            const char *op, const R5900Context *ctx)
 {
+    if (g_ps2xWatchOneValue && static_cast<uint32_t>(valueLo) != g_ps2xWatchValue)
+        return;
     if (g_ps2xWatchReports <= 0)
     {
         g_ps2xWatchSize = 0u;
@@ -1484,6 +1554,8 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
+    // Guest code is about to be entered: whatever was unwinding has arrived.
+    t_guestUnwinding = false;
 
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
@@ -1540,6 +1612,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 {
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
+    if (firstReport && g_callHistoryWanted)
+        printCallHistory(400u);
 
     const uint32_t pc = ctx->pc;
     const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
@@ -1699,12 +1773,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+    if (g_callHistoryWanted) [[unlikely]]
+        pushCall(isCall ? 'c' : 'j', targetPc, sourcePc, ctx);
 
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        t_guestUnwinding = true;
         return false;
     }
 
@@ -1716,6 +1793,12 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        // A jump leaves this function for the scheduler to continue at the
+        // target; a return (strict diagnostics only) goes to the caller.
+        if (kind != GuestBranchKind::Return)
+        {
+            t_guestUnwinding = true;
+        }
         return false;
     }
 
@@ -1744,12 +1827,27 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
+    if (g_callHistoryWanted) [[unlikely]]
+        pushCall((ctx->pc == entryPc || ctx->pc == fallthroughPc) ? 'r' : 'x', ctx->pc, targetPc, ctx);
 
     if (isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
 
+    // Something below is on its way back to the scheduler. ctx->pc is where
+    // it resumes, and may well equal this call's target or return address
+    // without this call having returned: a recursive function interrupted as
+    // it calls itself comes back up through its own outer call with pc at
+    // its own entry, and taking that for "the callee finished" (as below)
+    // carried on in the outer caller with the inner call's stack.
+    if (t_guestUnwinding)
+    {
+        return false;
+    }
+
+    // A callee that never touched pc is a host function (an HLE stub, an
+    // override): it has returned.
     if (ctx->pc == entryPc)
     {
         ctx->pc = fallthroughPc;
@@ -2563,7 +2661,13 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    // Generated code returns to the scheduler when this is true.
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+    {
+        t_guestUnwinding = true;
+    }
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
