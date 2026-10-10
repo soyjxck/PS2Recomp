@@ -555,6 +555,7 @@ void GSCpuBackend::ResetUnlocked()
     m_clut.fill(0u);
     m_clutCbp.fill(0u);
     ++m_clutLoads;
+    m_clutHeld.fill({});
     m_decodedTextures.clear();
     m_decodedBytes = 0;
     m_uploads.clear();
@@ -617,22 +618,52 @@ void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    // The CLUT is read out of VRAM: anything queued that draws there first.
-    if (HasQueuedPrimitives())
-    {
-        if (tex0.csm == 0u)
-            FlushPrimitivesTouching(GSMem::LayoutOf(tex0.cpsm, tex0.cbp, 1u), 0, 0, 15, 15, false);
-        else
-            FlushPrimitivesTouching(GSMem::LayoutOf(tex0.cpsm, tex0.cbp, std::max<uint32_t>(texclut.cbw, 1u)),
-                                    static_cast<int>(texclut.cou) << 4, static_cast<int>(texclut.cov),
-                                    (static_cast<int>(texclut.cou) << 4) + 255, static_cast<int>(texclut.cov), false);
-    }
-    ++m_clutLoads;
     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
+
+    // Where in VRAM the entries come from.
+    const uint32_t sourceWidthBlocks = tex0.csm == 0u ? 1u : std::max<uint32_t>(texclut.cbw, 1u);
+    const GSMem::SurfaceLayout sourceLayout = GSMem::LayoutOf(tex0.cpsm, tex0.cbp, sourceWidthBlocks);
+    const int sourceX0 = tex0.csm == 0u ? 0 : static_cast<int>(texclut.cou) << 4;
+    const int sourceY0 = tex0.csm == 0u ? 0 : static_cast<int>(texclut.cov);
+    const int sourceX1 = tex0.csm == 0u ? 15 : sourceX0 + 255;
+    const int sourceY1 = tex0.csm == 0u ? 15 : sourceY0;
+
+    // A game sets TEX0 for nearly every draw and each time asks for the CLUT
+    // to be loaded. When the part of the buffer this load fills still holds
+    // exactly this load, from pages nothing has written since, there is
+    // nothing to do, and what was converted from the buffer stays valid.
+    const uint32_t csaMaskForSlot = sixteenBit ? 0x1Fu : 0x0Fu;
+    const uint32_t firstSlot = fourBit ? (static_cast<uint32_t>(tex0.csa) & csaMaskForSlot) : 0u;
+    const uint32_t slotCount = fourBit ? 1u : static_cast<uint32_t>(m_clutHeld.size());
+    const uint64_t loadKey = ((static_cast<uint64_t>(tex0.cbp) << 40) | (static_cast<uint64_t>(tex0.cpsm) << 32) |
+                              (static_cast<uint64_t>(tex0.csm) << 31) | (static_cast<uint64_t>(tex0.csa) << 24) |
+                              (static_cast<uint64_t>(texclut.cbw) << 16) | (static_cast<uint64_t>(texclut.cou) << 10) |
+                              static_cast<uint64_t>(texclut.cov)) ^
+                             (fourBit ? 0x8000000000000000ull : 0ull) ^ 0x4000000000000000ull;
+    if (sourceLayout.table && (sixteenBit || thirtyTwoBit))
+    {
+        bool held = true;
+        uint64_t oldest = ~0ull;
+        for (uint32_t slot = firstSlot; slot < firstSlot + slotCount && held; ++slot)
+        {
+            const ClutHeld &entry = m_clutHeld[slot % m_clutHeld.size()];
+            held = entry.key == loadKey;
+            oldest = std::min(oldest, entry.serial);
+        }
+        if (held && !PagesWrittenSince(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, oldest))
+            return;
+    }
+
+    // The CLUT is read out of VRAM: anything queued that draws there first.
+    if (HasQueuedPrimitives() && sourceLayout.table)
+        FlushPrimitivesTouching(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, false);
+    ++m_clutLoads;
     if (!sixteenBit && !thirtyTwoBit)
         return;
+    for (uint32_t slot = firstSlot; slot < firstSlot + slotCount; ++slot)
+        m_clutHeld[slot % m_clutHeld.size()] = {loadKey, m_writeSerial};
 
     const uint32_t entryCount = fourBit ? 16u : 256u;
     const uint32_t csaMask = sixteenBit ? 0x1Fu : 0x0Fu;
@@ -640,6 +671,13 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
     const bool loadCsm1Suffix = tex0.csm == 0u && thirtyTwoBit && !fourBit;
     const uint32_t firstEntry = loadCsm1Suffix ? destinationBase : 0u;
+
+    // Entries are read straight from VRAM: going through the texture page
+    // cache decoded a whole page for sixteen of them, and the next transfer
+    // threw the page away.
+    const uint32_t clutWidth = tex0.csm == 0u ? 1u : (texclut.cbw != 0u ? static_cast<uint32_t>(texclut.cbw) : 1u);
+    const GSMem::SurfaceLayout clutLayout = GSMem::LayoutOf(tex0.cpsm, tex0.cbp, clutWidth);
+    constexpr uint32_t kVramMask = static_cast<uint32_t>(GSMem::MEMORY_SIZE) - 1u;
 
     for (uint32_t entry = firstEntry; entry < entryCount; ++entry)
     {
@@ -660,7 +698,23 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             sourceY = static_cast<uint32_t>(texclut.cov);
         }
 
-        const uint32_t raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY); 
+        uint32_t raw;
+        if (!clutLayout.table)
+        {
+            raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
+        }
+        else if (sixteenBit)
+        {
+            uint16_t word;
+            std::memcpy(&word, m_vram + ((clutLayout.unit(sourceX, sourceY) * 2u) & (kVramMask - 1u)), sizeof(word));
+            raw = word;
+        }
+        else
+        {
+            std::memcpy(&raw, m_vram + ((clutLayout.unit(sourceX, sourceY) * 4u) & (kVramMask - 3u)), sizeof(raw));
+            if (tex0.cpsm == GS_PSM_CT24)
+                raw &= 0x00FFFFFFu;
+        }
         const uint32_t destination = (loadCsm1Suffix ? entry : destinationBase + entry) & (sixteenBit ? 0x1FFu : 0x0FFu);
         if (sixteenBit)
         {
@@ -1565,16 +1619,101 @@ void GSCpuBackend::MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y
         for (uint32_t column = firstColumn; column <= lastColumn; ++column)
         {
             m_pageSerial[(rowPage + column) % kVramPages] = m_writeSerial;
+            m_pageDrawSerial[(rowPage + column) % kVramPages] = m_writeSerial;
+            if (layout.spillsIntoNextPage)
+            {
+                m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
+                m_pageDrawSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
+            }
+        }
+    }
+}
+
+namespace
+{
+    // Calls fn(block) for each 256-byte VRAM block pixels (x0, y0)..(x1, y1)
+    // of a surface have a part in. Blocks are tiles of the surface: 8x8
+    // pixels at 32 bits, 16x8 at 16, 16x16 at 8 and 32x16 at 4.
+    template <typename Fn>
+    void forEachBlock(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, Fn &&fn)
+    {
+        const uint32_t tileW = layout.unitBits == 32u ? 8u : (layout.unitBits == 4u ? 32u : 16u);
+        const uint32_t tileH = layout.unitBits >= 16u ? 8u : 16u;
+        const uint32_t firstX = static_cast<uint32_t>(std::max(x0, 0)) & ~(tileW - 1u);
+        const uint32_t firstY = static_cast<uint32_t>(std::max(y0, 0)) & ~(tileH - 1u);
+        for (uint32_t y = firstY; y <= static_cast<uint32_t>(std::max(y1, 0)); y += tileH)
+            for (uint32_t x = firstX; x <= static_cast<uint32_t>(std::max(x1, 0)); x += tileW)
+                fn(((layout.unit(x, y) * layout.unitBits) >> 11) & 0x3FFFu);
+    }
+}
+
+// As MarkWritten, for an image stored by a host-to-local transfer, which is
+// known to the block: a texture and the CLUT uploaded next to it share a page
+// more often than not, and neither changes the other.
+void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    if (!layout.table || x1 < x0 || y1 < y0)
+        return;
+    x0 = std::max(x0, 0);
+    y0 = std::max(y0, 0);
+    ++m_writeSerial;
+    m_lastUploadSerial = m_writeSerial;
+    const uint32_t firstColumn = static_cast<uint32_t>(x0) >> layout.pageWidthShift;
+    const uint32_t lastColumn = static_cast<uint32_t>(x1) >> layout.pageWidthShift;
+    const uint32_t firstRow = static_cast<uint32_t>(y0) >> layout.pageHeightShift;
+    const uint32_t lastRow = static_cast<uint32_t>(y1) >> layout.pageHeightShift;
+    for (uint32_t row = firstRow; row <= lastRow; ++row)
+    {
+        const uint32_t rowPage = layout.basePage + row * layout.pagesPerRow;
+        for (uint32_t column = firstColumn; column <= lastColumn; ++column)
+        {
+            m_pageSerial[(rowPage + column) % kVramPages] = m_writeSerial;
             if (layout.spillsIntoNextPage)
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
         }
     }
+    forEachBlock(layout, x0, y0, x1, y1, [this](uint32_t block)
+                 { m_blockUploadSerial[block] = m_writeSerial; });
+}
+
+// Whether any of those pixels may have been written since `serial` by
+// something other than an image transfer (known to the page).
+bool GSCpuBackend::DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
+{
+    const uint32_t firstColumn = static_cast<uint32_t>(std::max(x0, 0)) >> layout.pageWidthShift;
+    const uint32_t lastColumn = static_cast<uint32_t>(std::max(x1, 0)) >> layout.pageWidthShift;
+    const uint32_t firstRow = static_cast<uint32_t>(std::max(y0, 0)) >> layout.pageHeightShift;
+    const uint32_t lastRow = static_cast<uint32_t>(std::max(y1, 0)) >> layout.pageHeightShift;
+    for (uint32_t row = firstRow; row <= lastRow; ++row)
+    {
+        const uint32_t rowPage = layout.basePage + row * layout.pagesPerRow;
+        for (uint32_t column = firstColumn; column <= lastColumn; ++column)
+        {
+            if (m_pageDrawSerial[(rowPage + column) % kVramPages] > serial)
+                return true;
+            if (layout.spillsIntoNextPage && m_pageDrawSerial[(rowPage + column + 1u) % kVramPages] > serial)
+                return true;
+        }
+    }
+    return false;
+}
+
+// ...or by an image transfer (known to the block).
+bool GSCpuBackend::UploadedSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
+{
+    if (m_lastUploadSerial <= serial)
+        return false;
+    bool written = false;
+    forEachBlock(layout, x0, y0, x1, y1, [&](uint32_t block)
+                 { written = written || m_blockUploadSerial[block] > serial; });
+    return written;
 }
 
 void GSCpuBackend::MarkAllWritten()
 {
     ++m_writeSerial;
     m_pageSerial.fill(m_writeSerial);
+    m_pageDrawSerial.fill(m_writeSerial);
 }
 
 bool GSCpuBackend::PagesWrittenSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
@@ -1624,6 +1763,109 @@ namespace
             hash = (hash ^ data[i]) * 0x100000001B3ull;
         return hash ^ (hash >> 32);
     }
+}
+
+// Stores pixels [pixel, endPixel) of a host-to-local transfer, counted row by
+// row from the rectangle's corner, as far as `data` goes; `data` starts at
+// pixel `streamPixel`. Returns the pixel it stopped at. Rows a multiple of 16
+// apart share no VRAM bytes in any format, so such bands can be stored by
+// different threads.
+uint32_t GSCpuBackend::StoreImagePixels(uint8_t *vram, const GSMem::SurfaceLayout &layout, uint8_t dpsm, uint32_t streamBits,
+                                        uint32_t dsax, uint32_t dsay, uint32_t rrw, uint32_t pixel, uint32_t endPixel,
+                                        const uint8_t *data, size_t sizeBytes, uint32_t streamPixel)
+{
+    constexpr uint32_t kMask = static_cast<uint32_t>(GSMem::MEMORY_SIZE) - 1u;
+    const uint32_t pageWidthMask = (1u << layout.pageWidthShift) - 1u;
+    const uint32_t pageHeightMask = (1u << layout.pageHeightShift) - 1u;
+    while (pixel < endPixel)
+    {
+        // The rest of the row this pixel is on, as far as the data goes.
+        const uint32_t column = pixel % rrw;
+        const uint32_t x = dsax + column;
+        const uint32_t y = dsay + pixel / rrw;
+        uint64_t run = std::min(rrw - column, endPixel - pixel);
+        const uint16_t *const rowTable = layout.table + ((y & pageHeightMask) << layout.pageWidthShift);
+        const uint32_t rowPage = layout.basePage + (y >> layout.pageHeightShift) * layout.pagesPerRow;
+        auto unitAt = [&](uint32_t px)
+        {
+            return ((rowPage + (px >> layout.pageWidthShift)) << layout.unitsPerPageShift) + rowTable[px & pageWidthMask];
+        };
+        const uint64_t streamed = pixel - streamPixel; // pixels of the stream before this one
+
+        switch (streamBits)
+        {
+        case 32u:
+        {
+            const uint64_t offset = streamed * 4u;
+            run = offset < sizeBytes ? std::min<uint64_t>(run, (sizeBytes - offset) / 4u) : 0u;
+            for (uint32_t i = 0; i < run; ++i)
+                std::memcpy(vram + ((unitAt(x + i) * 4u) & (kMask - 3u)), data + offset + i * 4u, 4u);
+            break;
+        }
+        case 24u:
+        {
+            // The top byte of each word belongs to whatever shares it (alpha, T8H).
+            const uint64_t offset = streamed * 3u;
+            run = offset < sizeBytes ? std::min<uint64_t>(run, (sizeBytes - offset) / 3u) : 0u;
+            for (uint32_t i = 0; i < run; ++i)
+                std::memcpy(vram + ((unitAt(x + i) * 4u) & (kMask - 3u)), data + offset + i * 3u, 3u);
+            break;
+        }
+        case 16u:
+        {
+            const uint64_t offset = streamed * 2u;
+            run = offset < sizeBytes ? std::min<uint64_t>(run, (sizeBytes - offset) / 2u) : 0u;
+            for (uint32_t i = 0; i < run; ++i)
+                std::memcpy(vram + ((unitAt(x + i) * 2u) & (kMask - 1u)), data + offset + i * 2u, 2u);
+            break;
+        }
+        case 8u:
+        {
+            const uint64_t offset = streamed;
+            run = offset < sizeBytes ? std::min<uint64_t>(run, sizeBytes - offset) : 0u;
+            if (dpsm == GS_PSM_T8)
+            {
+                for (uint32_t i = 0; i < run; ++i)
+                    vram[unitAt(x + i) & kMask] = data[offset + i];
+            }
+            else
+            {
+                for (uint32_t i = 0; i < run; ++i)
+                    vram[(unitAt(x + i) * 4u + 3u) & kMask] = data[offset + i];
+            }
+            break;
+        }
+        default:
+        {
+            // Two pixels per byte, low nibble first.
+            const uint64_t available = static_cast<uint64_t>(sizeBytes) * 2u;
+            run = streamed < available ? std::min<uint64_t>(run, available - streamed) : 0u;
+            for (uint32_t i = 0; i < run; ++i)
+            {
+                const uint64_t n = streamed + i;
+                const uint32_t index = (data[n >> 1] >> ((n & 1u) * 4u)) & 0x0Fu;
+                const uint32_t unit = unitAt(x + i);
+                if (dpsm == GS_PSM_T4)
+                {
+                    uint8_t &byte = vram[(unit >> 1) & kMask];
+                    const uint32_t shift = (unit & 1u) * 4u;
+                    byte = static_cast<uint8_t>((byte & ~(0x0Fu << shift)) | (index << shift));
+                }
+                else
+                {
+                    uint8_t &byte = vram[(unit * 4u + 3u) & kMask];
+                    byte = dpsm == GS_PSM_T4HL ? static_cast<uint8_t>((byte & 0xF0u) | index)
+                                               : static_cast<uint8_t>((byte & 0x0Fu) | (index << 4));
+                }
+            }
+            break;
+        }
+        }
+        if (run == 0u)
+            break;
+        pixel += static_cast<uint32_t>(run);
+    }
+    return pixel;
 }
 
 void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
@@ -1688,6 +1930,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     static uint64_t statUploads = 0, statSkipped = 0, statPartial = 0, statBytes = 0, statSkippedBytes = 0;
+    static uint64_t statWrittenByBits[33] = {};
 
     // A game that streams its textures sends the same images to the same
     // places every frame. While VRAM still holds exactly what a transfer
@@ -1707,7 +1950,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         const bool same = found != m_uploads.end() && found->second.hash == uploadHash && found->second.bytes == wholeBytes &&
                           found->second.rect == ((static_cast<uint64_t>(dsax) << 48) | (static_cast<uint64_t>(dsay) << 32) | (static_cast<uint64_t>(rrw) << 16) | rrh) &&
                           found->second.target == ((static_cast<uint64_t>(dbp) << 32) | (static_cast<uint64_t>(dbw) << 8) | dpsm) &&
-                          !PagesWrittenSince(layout, left, top, right, bottom, found->second.serial);
+                          !DrawnSince(layout, left, top, right, bottom, found->second.serial) &&
+                          !UploadedSince(layout, left, top, right, bottom, found->second.serial);
         if (wantStats)
         {
             ++statUploads;
@@ -1717,10 +1961,15 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
                 ++statSkipped;
                 statSkippedBytes += wholeBytes;
             }
+            if (!same)
+                statWrittenByBits[streamBits] += wholeBytes;
             if (statUploads % 20000u == 0u)
-                std::fprintf(stderr, "[gs-upload] %llu uploads (%llu MB), %llu already in VRAM (%llu MB), %llu arrived in pieces\n",
+                std::fprintf(stderr, "[gs-upload] %llu uploads (%llu MB), %llu already in VRAM (%llu MB), %llu arrived in pieces; written by depth: 4-bit %llu MB, 8-bit %llu MB, 16-bit %llu MB, 24-bit %llu MB, 32-bit %llu MB\n",
                              (unsigned long long)statUploads, (unsigned long long)(statBytes >> 20), (unsigned long long)statSkipped,
-                             (unsigned long long)(statSkippedBytes >> 20), (unsigned long long)statPartial);
+                             (unsigned long long)(statSkippedBytes >> 20), (unsigned long long)statPartial,
+                             (unsigned long long)(statWrittenByBits[4] >> 20), (unsigned long long)(statWrittenByBits[8] >> 20),
+                             (unsigned long long)(statWrittenByBits[16] >> 20), (unsigned long long)(statWrittenByBits[24] >> 20),
+                             (unsigned long long)(statWrittenByBits[32] >> 20));
         }
         if (same)
         {
@@ -1735,98 +1984,26 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         ++statPartial;
     }
 
-    FlushPrimitivesTouching(layout, left, top, right, bottom, true, "upload");
-
-    constexpr uint32_t kMask = static_cast<uint32_t>(GSMem::MEMORY_SIZE) - 1u;
-    const uint32_t pageWidthMask = (1u << layout.pageWidthShift) - 1u;
-    const uint32_t pageHeightMask = (1u << layout.pageHeightShift) - 1u;
+    // An image of some size is stored by the raster pool, in its turn among
+    // the batches of primitives, while this thread carries on. A small one (a
+    // CLUT, which the next register write reads back) is stored here, as is a
+    // transfer that arrives in pieces.
+    constexpr uint64_t kQueuedImageBytes = 2048u;
     uint32_t pixel = firstPixel;
-    uint32_t offset = 0u;
-    while (pixel < total)
+    if (whole && wholeBytes >= kQueuedImageBytes)
     {
-        // The rest of the row this pixel is on, as far as the data goes.
-        const uint32_t column = pixel % rrw;
-        const uint32_t x = dsax + column;
-        const uint32_t y = dsay + pixel / rrw;
-        uint32_t run = std::min(rrw - column, total - pixel);
-        const uint16_t *const rowTable = layout.table + ((y & pageHeightMask) << layout.pageWidthShift);
-        const uint32_t rowPage = layout.basePage + (y >> layout.pageHeightShift) * layout.pagesPerRow;
-        auto unitAt = [&](uint32_t px)
-        {
-            return ((rowPage + (px >> layout.pageWidthShift)) << layout.unitsPerPageShift) + rowTable[px & pageWidthMask];
-        };
-
-        switch (streamBits)
-        {
-        case 32u:
-            run = std::min(run, (sizeBytes - offset) / 4u);
-            for (uint32_t i = 0; i < run; ++i)
-                std::memcpy(m_vram + ((unitAt(x + i) * 4u) & (kMask - 3u)), data + offset + i * 4u, 4u);
-            offset += run * 4u;
-            break;
-        case 24u:
-            // The top byte of each word belongs to whatever shares it (alpha, T8H).
-            run = std::min(run, (sizeBytes - offset) / 3u);
-            for (uint32_t i = 0; i < run; ++i)
-                std::memcpy(m_vram + ((unitAt(x + i) * 4u) & (kMask - 3u)), data + offset + i * 3u, 3u);
-            offset += run * 3u;
-            break;
-        case 16u:
-            run = std::min(run, (sizeBytes - offset) / 2u);
-            for (uint32_t i = 0; i < run; ++i)
-                std::memcpy(m_vram + ((unitAt(x + i) * 2u) & (kMask - 1u)), data + offset + i * 2u, 2u);
-            offset += run * 2u;
-            break;
-        case 8u:
-            run = std::min(run, sizeBytes - offset);
-            if (dpsm == GS_PSM_T8)
-            {
-                for (uint32_t i = 0; i < run; ++i)
-                    m_vram[unitAt(x + i) & kMask] = data[offset + i];
-            }
-            else
-            {
-                for (uint32_t i = 0; i < run; ++i)
-                    m_vram[(unitAt(x + i) * 4u + 3u) & kMask] = data[offset + i];
-            }
-            offset += run;
-            break;
-        default:
-        {
-            // Two pixels per byte, low nibble first; the stream of this call
-            // starts at pixel `firstPixel`.
-            const uint32_t nibble = pixel - firstPixel;
-            const uint64_t available = static_cast<uint64_t>(sizeBytes) * 2u;
-            run = nibble < available ? static_cast<uint32_t>(std::min<uint64_t>(run, available - nibble)) : 0u;
-            for (uint32_t i = 0; i < run; ++i)
-            {
-                const uint32_t n = nibble + i;
-                const uint32_t index = (data[n >> 1] >> ((n & 1u) * 4u)) & 0x0Fu;
-                const uint32_t unit = unitAt(x + i);
-                if (dpsm == GS_PSM_T4)
-                {
-                    uint8_t &byte = m_vram[(unit >> 1) & kMask];
-                    const uint32_t shift = (unit & 1u) * 4u;
-                    byte = static_cast<uint8_t>((byte & ~(0x0Fu << shift)) | (index << shift));
-                }
-                else
-                {
-                    uint8_t &byte = m_vram[(unit * 4u + 3u) & kMask];
-                    byte = dpsm == GS_PSM_T4HL ? static_cast<uint8_t>((byte & 0xF0u) | index)
-                                               : static_cast<uint8_t>((byte & 0x0Fu) | (index << 4));
-                }
-            }
-            break;
-        }
-        }
-        if (run == 0u)
-            break;
-        pixel += run;
+        QueueImage(layout, dpsm, streamBits, dsax, dsay, rrw, rrh, data, static_cast<size_t>(wholeBytes));
+        pixel = total;
+    }
+    else
+    {
+        FlushPrimitivesTouching(layout, left, top, right, bottom, true, "upload");
+        pixel = StoreImagePixels(m_vram, layout, dpsm, streamBits, dsax, dsay, rrw, firstPixel, total, data, sizeBytes, firstPixel);
     }
 
     if (pixel > firstPixel)
     {
-        MarkWritten(layout, left, static_cast<int>(dsay + firstPixel / rrw), right, static_cast<int>(dsay + (pixel - 1u) / rrw));
+        MarkUploaded(layout, left, static_cast<int>(dsay + firstPixel / rrw), right, static_cast<int>(dsay + (pixel - 1u) / rrw));
     }
 
     m_transferState.copiedPixels = pixel;
@@ -1842,6 +2019,7 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
             record.rect = (static_cast<uint64_t>(dsax) << 48) | (static_cast<uint64_t>(dsay) << 32) | (static_cast<uint64_t>(rrw) << 16) | rrh;
             record.target = (static_cast<uint64_t>(dbp) << 32) | (static_cast<uint64_t>(dbw) << 8) | dpsm;
             record.serial = m_writeSerial;
+            record.checkedUpload = m_lastUploadSerial;
             if (m_uploads.size() > 8192u)
                 m_uploads.clear();
             if (dsax == 0u && dsay == 0u)

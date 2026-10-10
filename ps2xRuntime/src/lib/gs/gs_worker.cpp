@@ -15,6 +15,9 @@
 
 namespace
 {
+    // PS2X_GS_STATS: how long callers of drain() waited, VU1's part first.
+    std::atomic<uint64_t> g_drainWaits{0}, g_drainVu1Nanoseconds{0}, g_drainGsNanoseconds{0};
+
     struct Worker
     {
         GS *gs = nullptr;
@@ -77,8 +80,11 @@ namespace
                     const double window = std::chrono::duration<double>(finished - windowStart).count();
                     if (window >= 2.0)
                     {
-                        std::fprintf(stderr, "[gs-worker] busy %.0f%% of the time, %.0f packets/s\n",
-                                     100.0 * busySeconds / window, static_cast<double>(packets) / window);
+                        std::fprintf(stderr, "[gs-worker] busy %.0f%% of the time, %.0f packets/s; the EE waited %.0f%% of the time for VU1 and %.0f%% for the GS, %.0f waits/s\n",
+                                     100.0 * busySeconds / window, static_cast<double>(packets) / window,
+                                     100.0 * static_cast<double>(g_drainVu1Nanoseconds.exchange(0)) * 1e-9 / window,
+                                     100.0 * static_cast<double>(g_drainGsNanoseconds.exchange(0)) * 1e-9 / window,
+                                     static_cast<double>(g_drainWaits.exchange(0)) / window);
                         busySeconds = 0.0;
                         packets = 0;
                         windowStart = finished;
@@ -272,8 +278,17 @@ namespace GsWorker
         Worker &w = worker();
         if (std::this_thread::get_id() == w.threadId || Vu1Worker::onWorkerThread())
             return false;
+        static const bool wantStats = []
+        {
+            const char *value = std::getenv("PS2X_GS_STATS");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        const auto start = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // VU1 produces GS packets: it has to finish before the GS can.
         const bool waitedForVu1 = Vu1Worker::drain();
+        const auto afterVu1 = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (wantStats && waitedForVu1)
+            g_drainVu1Nanoseconds.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(afterVu1 - start).count()));
         if (!w.active.load(std::memory_order_acquire))
             return waitedForVu1;
         std::unique_lock<std::mutex> lock(w.mutex);
@@ -282,6 +297,11 @@ namespace GsWorker
         const uint64_t target = w.posted;
         w.workDone.wait(lock, [&]
                         { return w.completed >= target; });
+        if (wantStats)
+        {
+            g_drainWaits.fetch_add(1u);
+            g_drainGsNanoseconds.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - afterVu1).count()));
+        }
         return true;
     }
 }

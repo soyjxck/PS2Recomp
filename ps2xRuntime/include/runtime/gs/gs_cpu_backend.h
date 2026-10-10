@@ -87,6 +87,11 @@ private:
     // a surface (anything that reads or writes VRAM outside the queue asks).
     void FlushPrimitives();
     void SubmitPrimitives();
+    void QueueImage(const GSMem::SurfaceLayout &layout, uint8_t dpsm, uint32_t streamBits, uint32_t dsax, uint32_t dsay,
+                    uint32_t rrw, uint32_t rrh, const uint8_t *data, size_t bytes);
+    static uint32_t StoreImagePixels(uint8_t *vram, const GSMem::SurfaceLayout &layout, uint8_t dpsm, uint32_t streamBits,
+                                     uint32_t dsax, uint32_t dsay, uint32_t rrw, uint32_t pixel, uint32_t endPixel,
+                                     const uint8_t *data, size_t sizeBytes, uint32_t streamPixel);
     uint64_t LastBatchTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes, const char *why);
     void WaitForBatch(uint64_t batch);
     void SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, const char *why);
@@ -102,6 +107,9 @@ private:
     // Texture cache bookkeeping: every writer says which VRAM pages it touched.
     static constexpr uint32_t kVramPages = 512u;
     void MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    void MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    bool DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
+    bool UploadedSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
     void MarkAllWritten();
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
@@ -140,6 +148,14 @@ private:
     std::array<uint32_t, 2> m_clutCbp{};
     // CLUT entries converted to RGBA for the fast paths, filled on first use.
     // A stamp other than m_fastClutKey marks an entry stale.
+    // What each sixteen-entry stretch of the CLUT buffer was last loaded with
+    // (the load's parameters) and when (m_writeSerial).
+    struct ClutHeld
+    {
+        uint64_t key = 0;
+        uint64_t serial = 0;
+    };
+    std::array<ClutHeld, 32> m_clutHeld{};
     uint64_t m_clutLoads = 0;
     uint64_t m_fastClutLoad = ~0ull;
     uint64_t m_fastClutConversion = ~0ull;
@@ -147,7 +163,11 @@ private:
     std::array<uint32_t, 256> m_fastClut{};
     std::array<uint32_t, 256> m_fastClutStamp{};
     uint64_t m_writeSerial = 1;
-    std::array<uint64_t, kVramPages> m_pageSerial{};
+    std::array<uint64_t, kVramPages> m_pageSerial{};     // last write of any kind
+    std::array<uint64_t, kVramPages> m_pageDrawSerial{}; // ...other than an image transfer
+    // Image transfers, by 256-byte block.
+    std::array<uint64_t, 16384> m_blockUploadSerial{};
+    uint64_t m_lastUploadSerial = 0;
     // The last image each host-to-local transfer wrote, to recognise one
     // that would write what VRAM already holds.
     struct UploadRecord
@@ -157,6 +177,7 @@ private:
         uint64_t rect = 0;   // position and size
         uint64_t target = 0; // base, width and format
         uint64_t serial = 0; // m_writeSerial once it was written
+        uint64_t checkedUpload = 0; // m_lastUploadSerial when its blocks were last found untouched
     };
     std::unordered_map<uint64_t, UploadRecord> m_uploads;
     // The latest whole image written at each base pointer, from (0, 0).
