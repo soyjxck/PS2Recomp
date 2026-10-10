@@ -15,7 +15,7 @@ function(EnableFastReleaseMode TargetName)
                 /Gw # global data in COMDAT
                 /GF # string pooling
                 /Zc:inline # remove unreferenced inline
-                /fp:fast # fast math (graphics friendly)
+                /fp:precise # the runtime emulates PS2 float semantics exactly (NaN/Inf-free FPU, VU MAX/MINI on bit patterns); fast-math breaks the tests
                 /DNDEBUG
                 /arch:AVX2 # Advanced Vector Extensions 2
                 /GS- # Disable Buffer Security Check (faster)
