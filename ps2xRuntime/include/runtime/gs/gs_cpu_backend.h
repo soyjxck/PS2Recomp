@@ -111,6 +111,8 @@ private:
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
     PresentationFrame PresentFromLocalMemory(const GSPresentationRequest &request);
+    void SnapshotFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count,
+                        std::vector<uint8_t> &out);
     bool CopyFrameToHostRgba(const GSFrameReg &frame,
                              uint32_t width,
                              uint32_t height,
@@ -168,6 +170,9 @@ private:
     uint64_t m_decodedUseClock = 0;
     std::unique_ptr<RasterQueue, RasterQueueDeleter> m_rasterQueue;
     GSMem::TexturePageCache m_texturePageCache;
+
+    // Set while presenting from a snapshot that lacks the context frames.
+    bool m_presentWantsContextFrames = false;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

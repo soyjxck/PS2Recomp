@@ -14,10 +14,12 @@ class PS2Memory;
 // the worker owns (VIF1 registers, VU1 memory) the EE waits for the queue to
 // empty first, and so does anything that waits for the GS.
 //
-// Opt-in with PS2X_VU_THREAD=1. A game that sends its display list and FINISH
-// in one go (most do) makes the EE wait for the whole list either way, because
-// the interrupt has to be pending when the send returns; the worker then only
-// moves the VU1 work to another core without shortening the frame.
+// On by default on a host with six or more cores; PS2X_VU_THREAD=0 or 1
+// overrides. A game that sends its display list and FINISH in one go (most do)
+// makes the EE wait for the whole list when the interrupt has to be pending
+// as the send returns, and the worker then only moves the VU1 work to another
+// core. With PS2X_GS_FINISH_DELAY_US the EE carries on meanwhile, and the
+// frame gets shorter by what VU1 took.
 namespace Vu1Worker
 {
     void start(PS2Memory &memory);

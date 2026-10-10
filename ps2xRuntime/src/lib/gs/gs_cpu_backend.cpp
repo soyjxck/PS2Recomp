@@ -2116,18 +2116,101 @@ bool GSCpuBackend::CopyFrameToHostRgba(const GSFrameReg &frame,
     return true;
 }
 
+// Copies the VRAM pages `count` frames occupy into `out` (a whole-VRAM image
+// whose other pages keep whatever an earlier call left), waiting only for
+// queued drawing that touches them.
+void GSCpuBackend::SnapshotFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count,
+                                  std::vector<uint8_t> &out)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram || m_vramSize == 0u)
+    {
+        out.clear();
+        return;
+    }
+    if (out.size() != m_vramSize)
+        out.assign(m_vramSize, 0u);
+    for (size_t i = 0; i < count; ++i)
+    {
+        const GSFrameReg &frame = frames[i];
+        const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
+        const uint32_t base = baseIsPages[i] ? framePageBaseToBlock(frame.fbp) : frame.fbp;
+        const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frame.psm, base, fbw);
+        if (!layout.table || heights[i] == 0u)
+            continue;
+        const int lastX = static_cast<int>(fbw * 64u) - 1;
+        const int lastY = static_cast<int>(heights[i]) - 1;
+        FlushPrimitivesTouching(layout, 0, 0, lastX, lastY, false, "present");
+        const uint32_t rows = (static_cast<uint32_t>(lastY) >> layout.pageHeightShift) + 1u;
+        const uint32_t pages = std::min<uint32_t>(rows * layout.pagesPerRow + (layout.spillsIntoNextPage ? 1u : 0u), kVramPages);
+        for (uint32_t page = 0; page < pages; ++page)
+        {
+            const size_t offset = static_cast<size_t>((layout.basePage + page) % kVramPages) * GSMem::GS_PAGE_SIZE;
+            if (offset + GSMem::GS_PAGE_SIZE <= m_vramSize)
+                std::memcpy(out.data() + offset, m_vram + offset, GSMem::GS_PAGE_SIZE);
+        }
+    }
+}
+
 PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
 {
-    // Snapshot local memory under the backend lock, then perform the expensive
-    // display conversion without holding the producer-side raster lock.
+    // The display conversion works on a copy, so the lock the GS thread draws
+    // under is held only while the pages being shown are copied. Drawing
+    // queued for other buffers (the one being rendered) is left alone.
     thread_local std::vector<uint8_t> snapshot;
-    SnapshotVram(snapshot);
+    thread_local GSCpuBackend snapshotBackend;
+
+    GSFrameReg frames[5];
+    uint32_t heights[5];
+    bool baseIsPages[5];
+    size_t count = 0;
+    const GSPmodeState pmode = decodePmode(request.pmode);
+    auto addDisplay = [&](bool enabled, uint64_t dispfb, uint64_t display)
+    {
+        if (!enabled)
+            return;
+        uint32_t width = 0u, height = 0u;
+        decodeDisplaySize(display, width, height);
+        frames[count] = decodeDisplayFrame(dispfb);
+        heights[count] = std::min<uint32_t>(decodeDisplayReadOrigin(dispfb).y + height, 2048u);
+        baseIsPages[count] = true;
+        ++count;
+    };
+    addDisplay(pmode.enableCrt1, request.dispfb1, request.display1);
+    addDisplay(pmode.enableCrt2, request.dispfb2, request.display2);
+    uint32_t tallest = 0u;
+    for (size_t i = 0; i < count; ++i)
+        tallest = std::max(tallest, heights[i]);
+    if (request.hasPreferredSource)
+    {
+        frames[count] = request.preferredSource;
+        heights[count] = tallest;
+        baseIsPages[count] = false;
+        ++count;
+    }
+    SnapshotFrames(frames, heights, baseIsPages, count, snapshot);
     if (snapshot.empty())
         return {};
 
-    thread_local GSCpuBackend snapshotBackend;
-    snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
-    return snapshotBackend.PresentFromLocalMemory(request);
+    if (snapshotBackend.m_vram != snapshot.data() || snapshotBackend.m_vramSize != snapshot.size())
+        snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
+    snapshotBackend.m_presentWantsContextFrames = false;
+    PresentationFrame frame = snapshotBackend.PresentFromLocalMemory(request);
+    if (snapshotBackend.m_presentWantsContextFrames)
+    {
+        // A black display made it look at the buffers being drawn instead.
+        for (size_t i = 0; i < 2; ++i)
+        {
+            frames[i] = request.contextFrames[i];
+            heights[i] = std::max<uint32_t>(tallest, 512u);
+            baseIsPages[i] = true;
+        }
+        SnapshotFrames(frames, heights, baseIsPages, 2, snapshot);
+        if (snapshot.empty())
+            return {};
+        frame = snapshotBackend.PresentFromLocalMemory(request);
+    }
+    return frame;
 }
 
 PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationRequest &request)
@@ -2189,6 +2272,7 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
 
         if (!usedPreferred && displayFrame.fbp == 0u && countNonBlackPixels(pixels, width, height) == 0u)
         {
+            m_presentWantsContextFrames = true;
             for (const GSFrameReg &candidate : request.contextFrames)
             {
                 if (candidate.fbp == selected.fbp && candidate.fbw == selected.fbw && candidate.psm == selected.psm)

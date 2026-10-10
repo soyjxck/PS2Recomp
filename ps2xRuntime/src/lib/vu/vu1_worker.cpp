@@ -100,9 +100,12 @@ namespace Vu1Worker
         if (w.active.load(std::memory_order_acquire))
             return;
         w.memory = &memory;
-        // Off unless asked for: see the header.
-        const char *value = std::getenv("PS2X_VU_THREAD");
-        if (value == nullptr || value[0] == '\0' || value[0] == '0')
+        // On where there are cores for it (the EE, this, the GS thread and
+        // its raster pool); PS2X_VU_THREAD=0 or 1 decides otherwise.
+        bool wanted = std::thread::hardware_concurrency() >= 6u;
+        if (const char *value = std::getenv("PS2X_VU_THREAD"); value != nullptr && value[0] != '\0')
+            wanted = value[0] != '0';
+        if (!wanted)
             return;
         w.quit = false;
         w.thread = std::thread([&w]
