@@ -1621,10 +1621,13 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    // VCALLMS runs the program to its E bit before the EE continues. The cap
+    // only guards against a program that never ends; a vertex loop over a
+    // full VU0 data memory takes far more than a few thousand cycles.
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
-                  startPC, 0u, ctx->vu0_itop, 4096);
+                  startPC, 0u, ctx->vu0_itop, 1u << 20);
     copyVu0StateToContext(m_vu0.state(), ctx);
 }
 

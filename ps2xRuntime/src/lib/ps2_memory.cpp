@@ -1601,20 +1601,39 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     const uint32_t originalMadr = m_ioRegisters[channelBase + 0x10u] & 0x7FFFFFF0u;
     const uint32_t originalSadr = m_ioRegisters[channelBase + 0x80u] & 0x3FF0u;
 
-    uint32_t mainOffset = 0u;
-    try
-    {
-        mainOffset = translateAddress(originalMadr);
-    }
-    catch (const std::exception &)
-    {
-        return false;
-    }
-
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
-        return false;
-
     const bool fromScratchpad = channelBase == kSprFromChannel;
+
+    // MADR is not always main memory: games also pull results straight out of
+    // VU memory (0x11000000-0x1100FFFF) with a toSPR transfer, or push data
+    // into it with fromSPR.
+    uint8_t *mainBase = m_rdram;
+    uint32_t mainOffset = 0u;
+    bool mainIsRdram = true;
+    {
+        const uint32_t physMadr = originalMadr & 0x1FFFFFFFu;
+        uint32_t vuOffset = 0u;
+        uint32_t vuLimit = 0u;
+        if (uint8_t *vuMemory = mapVuMemory(physMadr, byteCount, vuOffset, vuLimit))
+        {
+            mainBase = vuMemory;
+            mainOffset = vuOffset;
+            mainIsRdram = false;
+        }
+        else
+        {
+            try
+            {
+                mainOffset = translateAddress(originalMadr);
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+
+            if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+                return false;
+        }
+    }
     uint32_t scratchOffset = originalSadr;
     uint32_t bytesLeft = byteCount;
     uint32_t copied = 0u;
@@ -1624,12 +1643,15 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         const uint32_t chunk = std::min(bytesLeft, scratchChunk);
         if (fromScratchpad)
         {
-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            markModified(mainOffset + copied, chunk);
+            std::memcpy(mainBase + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
+            if (mainIsRdram)
+                markModified(mainOffset + copied, chunk);
+            else if (mainBase == m_vu1Code)
+                markVU1CodeModified();
         }
         else
         {
-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            std::memcpy(m_scratchpad + scratchOffset, mainBase + mainOffset + copied, chunk);
         }
 
         copied += chunk;
