@@ -1159,7 +1159,12 @@ namespace ps2_stubs
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
-            if (hasSeededGsClearPacket(db.clear0))
+            // The clear is the sprite sceGsSetDefDBuff put in the packet;
+            // drawing it is all the library does. (Clearing the buffer by
+            // hand first as well made the EE wait for everything queued and
+            // then write every pixel itself, once a frame.) By hand only if
+            // the packet cannot be drawn.
+            if (hasSeededGsClearPacket(db.clear0) && !runtime->syncCoreSubsystems())
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
                 GsWorker::drain();
@@ -1171,7 +1176,7 @@ namespace ps2_stubs
         {
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
             applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
-            if (hasSeededGsClearPacket(db.clear1))
+            if (hasSeededGsClearPacket(db.clear1) && !runtime->syncCoreSubsystems())
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
                 GsWorker::drain();

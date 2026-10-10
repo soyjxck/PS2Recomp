@@ -551,7 +551,7 @@ void GSCpuBackend::Reset()
 
 void GSCpuBackend::ResetUnlocked()
 {
-    FlushPrimitives();
+    FlushPrimitives("reset");
     m_clut.fill(0u);
     m_clutCbp.fill(0u);
     ++m_clutLoads;
@@ -560,7 +560,7 @@ void GSCpuBackend::ResetUnlocked()
     m_decodedBytes = 0;
     m_uploads.clear();
     m_uploadAt.clear();
-    m_borderHashes.clear();
+    m_clutSnapshots.clear();
     MarkAllWritten();
     m_texturePageCache.Invalidate();
     m_transfer = {};
@@ -656,9 +656,28 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             return;
     }
 
-    // The CLUT is read out of VRAM: anything queued that draws there first.
-    if (HasQueuedPrimitives() && sourceLayout.table)
-        FlushPrimitivesTouching(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, false);
+    // A CLUT that is exactly an image just uploaded (the usual case) is taken
+    // from that image, which may not have reached VRAM yet. Otherwise it is
+    // read out of VRAM, after anything queued that writes there.
+    const UploadRecord *uploaded = nullptr;
+    uint32_t uploadedW = 0u, uploadedH = 0u;
+    if (tex0.csm == 0u && sourceLayout.table)
+    {
+        const auto found = m_uploadAt.find((static_cast<uint64_t>(tex0.cbp) << 32) | (1ull << 8) | tex0.cpsm);
+        if (found != m_uploadAt.end() && !found->second.pixels.empty())
+        {
+            uploadedW = static_cast<uint32_t>((found->second.rect >> 16) & 0xFFFFu);
+            uploadedH = static_cast<uint32_t>(found->second.rect & 0xFFFFu);
+            const bool covers = fourBit ? (uploadedW >= 8u && uploadedH >= 2u) : (uploadedW >= 16u && uploadedH >= 16u);
+            if (covers && !DrawnSince(sourceLayout, 0, 0, static_cast<int>(uploadedW) - 1, static_cast<int>(uploadedH) - 1, found->second.serial) &&
+                !UploadedSince(sourceLayout, 0, 0, static_cast<int>(uploadedW) - 1, static_cast<int>(uploadedH) - 1, found->second.serial))
+            {
+                uploaded = &found->second;
+            }
+        }
+    }
+    if (!uploaded && HasQueuedPrimitives() && sourceLayout.table)
+        FlushPrimitivesTouching(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, false, "clut");
     ++m_clutLoads;
     if (!sixteenBit && !thirtyTwoBit)
         return;
@@ -699,7 +718,15 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
         }
 
         uint32_t raw;
-        if (!clutLayout.table)
+        if (uploaded)
+        {
+            const uint32_t bytesPerPixel = sixteenBit ? 2u : (tex0.cpsm == GS_PSM_CT24 ? 3u : 4u);
+            const size_t offset = (static_cast<size_t>(sourceY) * uploadedW + sourceX) * bytesPerPixel;
+            raw = 0u;
+            if (offset + bytesPerPixel <= uploaded->pixels.size())
+                std::memcpy(&raw, uploaded->pixels.data() + offset, bytesPerPixel);
+        }
+        else if (!clutLayout.table)
         {
             raw = ReadTextureVramUnlocked(tex0.cpsm, tex0.cbp, sourceWidth, sourceX, sourceY);
         }
@@ -749,13 +776,13 @@ void GSCpuBackend::Sync(GSSyncReason reason)
     if (reason == GSSyncReason::Finish || reason == GSSyncReason::Presentation)
         SubmitPrimitives();
     else
-        FlushPrimitives();
+        FlushPrimitives("sync");
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const_cast<GSCpuBackend *>(this)->FlushPrimitives();
+    const_cast<GSCpuBackend *>(this)->FlushPrimitives("vram");
     return ReadVramUnlocked(psm, base, bw, x, y);
 }
 
@@ -777,7 +804,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives();
+    FlushPrimitives("vram");
     MarkWritten(GSMem::LayoutOf(psm, base, std::max<uint32_t>(bw, 1u)), static_cast<int>(x), static_cast<int>(y),
                 static_cast<int>(x), static_cast<int>(y));
     WriteVramUnlocked(psm, base, bw, x, y, value);
@@ -793,7 +820,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const_cast<GSCpuBackend *>(this)->FlushPrimitives();
+    const_cast<GSCpuBackend *>(this)->FlushPrimitives("snapshot");
     if (!m_vram || m_vramSize == 0u)
     {
         out.clear();
@@ -923,16 +950,16 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         }
     });
 
-    // Triangles and sprites go through the fast path, which may queue them.
-    // Everything else is drawn here and now, after whatever is queued, and
-    // does not say which pages it wrote.
+    // Triangles, sprites and lines go through the fast path, which queues
+    // them. Anything it turns down, and points, are drawn here and now, after
+    // whatever is queued, and do not say which pages they wrote.
     const bool reference = UseReferenceRasteriser();
     switch (state.prim.type)
     {
     case GS_PRIM_SPRITE:
-        if (reference || !DrawFast(batch, true))
+        if (reference || !DrawFast(batch, FastKind::Sprite))
         {
-            FlushPrimitives();
+            FlushPrimitives("reference");
             DrawSprite(batch);
             MarkAllWritten();
         }
@@ -940,22 +967,25 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        if (reference || !DrawFast(batch, false))
+        if (reference || !DrawFast(batch, FastKind::Triangle))
         {
-            FlushPrimitives();
+            FlushPrimitives("reference");
             DrawTriangle(batch);
             MarkAllWritten();
         }
         break;
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
-        FlushPrimitives();
-        DrawLine(batch);
-        MarkAllWritten();
+        if (reference || !DrawFast(batch, FastKind::Line))
+        {
+            FlushPrimitives("reference");
+            DrawLine(batch);
+            MarkAllWritten();
+        }
         break;
     case GS_PRIM_POINT:
     {
-        FlushPrimitives();
+        FlushPrimitives("reference");
         MarkAllWritten();
         const GSVertex &v = batch.vertices[0];
         const auto &ctx = state.context;
@@ -1595,7 +1625,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
     m_transferState.localToHostPendingBytes = 0u;
 
     if (command.direction == 2u || command.direction == 1u)
-        FlushPrimitives();
+        FlushPrimitives("move");
     if (command.direction == 2u)
         PerformLocalToLocalTransfer();
     else if (command.direction == 1u)
@@ -1984,13 +2014,11 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         ++statPartial;
     }
 
-    // An image of some size is stored by the raster pool, in its turn among
-    // the batches of primitives, while this thread carries on. A small one (a
-    // CLUT, which the next register write reads back) is stored here, as is a
-    // transfer that arrives in pieces.
-    constexpr uint64_t kQueuedImageBytes = 2048u;
+    // A whole image is stored by the raster pool, in its turn among the
+    // batches of primitives, while this thread carries on. Only a transfer
+    // that arrives in pieces is stored here.
     uint32_t pixel = firstPixel;
-    if (whole && wholeBytes >= kQueuedImageBytes)
+    if (whole)
     {
         QueueImage(layout, dpsm, streamBits, dsax, dsay, rrw, rrh, data, static_cast<size_t>(wholeBytes));
         pixel = total;
@@ -2020,6 +2048,10 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
             record.target = (static_cast<uint64_t>(dbp) << 32) | (static_cast<uint64_t>(dbw) << 8) | dpsm;
             record.serial = m_writeSerial;
             record.checkedUpload = m_lastUploadSerial;
+            if (streamBits >= 16u && wholeBytes <= 1024u && dsax == 0u && dsay == 0u)
+                record.pixels.assign(data, data + wholeBytes);
+            else
+                record.pixels.clear();
             if (m_uploads.size() > 8192u)
                 m_uploads.clear();
             if (dsax == 0u && dsay == 0u)
@@ -2163,7 +2195,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives();
+    FlushPrimitives("clear");
     if (!m_vram || context.frame.fbw == 0u)
         return false;
 

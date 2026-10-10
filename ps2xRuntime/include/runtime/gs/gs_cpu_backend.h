@@ -50,20 +50,15 @@ private:
     // gs_cpu_raster.cpp: the same pixels as DrawTriangle/DrawSprite from a
     // pipeline resolved once per primitive. Return false to fall back.
     struct FastPipeline;
+    // An uploaded image as RGBA, keyed by what was uploaded rather than where
+    // (see DecodedTextureFor). It is decoded once and never again, so nothing
+    // has to wait for the primitives that use it.
     struct DecodedTexture
     {
-        uint64_t contentHash = 0;   // of the VRAM pages it was decoded from
-        uint64_t checkedSerial = 0; // m_writeSerial when it was last known current
         uint64_t lastUsed = 0;
-        uint64_t lastDecoded = 0;   // lookup clock at the last content change
-        uint64_t directUntil = 0;   // sample VRAM directly until this lookup
-        int width = 0;
-        int height = 0;
-        std::vector<uint32_t> pages;
+        int width = 0;  // of a row: the texture's
+        int height = 0; // rows it has: the image's
         std::vector<uint32_t> pixels; // RGBA, row major
-        // Keyed by what was uploaded rather than where: never decoded again,
-        // so a transfer to its pages need not wait for primitives using it.
-        bool immutable = false;
     };
     struct PreparedPrimitive;
     // What a Rasterise call covered, for PS2X_GS_STATS.
@@ -77,15 +72,22 @@ private:
         void operator()(RasterQueue *queue) const;
     };
     static bool UseReferenceRasteriser();
-    bool DrawFast(const GSPrimitiveBatch &batch, bool sprite);
+    enum class FastKind
+    {
+        Triangle,
+        Sprite,
+        Line,
+    };
+    bool DrawFast(const GSPrimitiveBatch &batch, FastKind kind);
     bool PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
+    bool PrepareLine(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     static void Rasterise(const PreparedPrimitive &primitive, int yFirst, int yLast);
     static void RasteriseRows(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally);
     static void RasteriseRowsScalar(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally);
     // Draw what is queued: all of it, or only if it involves these pixels of
     // a surface (anything that reads or writes VRAM outside the queue asks).
-    void FlushPrimitives();
+    void FlushPrimitives(const char *why = "sync");
     void SubmitPrimitives();
     void QueueImage(const GSMem::SurfaceLayout &layout, uint8_t dpsm, uint32_t streamBits, uint32_t dsax, uint32_t dsay,
                     uint32_t rrw, uint32_t rrh, const uint8_t *data, size_t bytes);
@@ -99,9 +101,9 @@ private:
                                  const char *why = "upload");
     bool HasQueuedPrimitives() const;
     const DecodedTexture *DecodedTextureFor(FastPipeline &pipeline);
-    uint64_t HashPages(const std::vector<uint32_t> &pages) const;
     void ForgetOldDecodedTextures();
-    uint64_t BorderHash(FastPipeline &p, uint64_t conversion, int imageW, int imageH, int width, int height);
+    uint64_t ConversionKey(const FastPipeline &pipeline);
+    const uint32_t *ClutSnapshotFor(FastPipeline &pipeline);
     bool PagesWrittenSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
 
     // Texture cache bookkeeping: every writer says which VRAM pages it touched.
@@ -178,16 +180,14 @@ private:
         uint64_t target = 0; // base, width and format
         uint64_t serial = 0; // m_writeSerial once it was written
         uint64_t checkedUpload = 0; // m_lastUploadSerial when its blocks were last found untouched
+        // The image itself when it is small enough to be a CLUT, so that
+        // loading the CLUT need not wait for it to reach VRAM.
+        std::vector<uint8_t> pixels;
     };
     std::unordered_map<uint64_t, UploadRecord> m_uploads;
     // The latest whole image written at each base pointer, from (0, 0).
     std::unordered_map<uint64_t, UploadRecord> m_uploadAt;
-    struct BorderRecord
-    {
-        uint64_t hash = 0;
-        uint64_t serial = 0; // m_writeSerial when it was read; 0 = never
-    };
-    std::unordered_map<uint64_t, BorderRecord> m_borderHashes;
+    std::unordered_map<uint64_t, std::unique_ptr<std::array<uint32_t, 256>>> m_clutSnapshots;
     uint64_t m_clutHashLoad = ~0ull; // m_clutLoads the hash below is of
     uint64_t m_clutHash = 0;
     uint64_t m_decodedBytes = 0;
