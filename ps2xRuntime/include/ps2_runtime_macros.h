@@ -717,8 +717,37 @@ static inline float ps2ClampF(float value)
 #define FPU_ADD_S(a, b) ps2ClampF(ps2ClampF((float)(a)) + ps2ClampF((float)(b)))
 #define FPU_SUB_S(a, b) ps2ClampF(ps2ClampF((float)(a)) - ps2ClampF((float)(b)))
 #define FPU_MUL_S(a, b) ps2ClampF(ps2ClampF((float)(a)) * ps2ClampF((float)(b)))
-// Division by zero yields +/-max on the R5900 (sign = sign(a) ^ sign(b)).
-#define FPU_DIV_S(a, b) ps2ClampF(ps2ClampF((float)(a)) / ps2ClampF((float)(b)))
+static inline float ps2FpuSignedMax(uint32_t signSource)
+{
+    const uint32_t bits = (signSource & 0x80000000u) | 0x7F7FFFFFu;
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+// DIV.S: a zero (or denormal) divisor gives the largest float with the sign of
+// fs ^ ft, also for 0/0; nothing is ever NaN or infinite.
+static inline float ps2FpuDiv(float a, float b)
+{
+    uint32_t aBits, bBits;
+    std::memcpy(&aBits, &a, sizeof(aBits));
+    std::memcpy(&bBits, &b, sizeof(bBits));
+    if ((bBits & 0x7F800000u) == 0u)
+        return ps2FpuSignedMax(aBits ^ bBits);
+    return ps2ClampF(ps2ClampF(a) / ps2ClampF(b));
+}
+
+// RSQRT.S: fs / sqrt(|ft|); a zero ft gives the largest float with ft's sign.
+static inline float ps2FpuRsqrt(float a, float b)
+{
+    uint32_t bBits;
+    std::memcpy(&bBits, &b, sizeof(bBits));
+    if ((bBits & 0x7F800000u) == 0u)
+        return ps2FpuSignedMax(bBits);
+    return ps2ClampF(ps2ClampF(a) / sqrtf(fabsf(ps2ClampF(b))));
+}
+#define FPU_DIV_S(a, b) ps2FpuDiv((float)(a), (float)(b))
+#define FPU_RSQRT_S(a, b) ps2FpuRsqrt((float)(a), (float)(b))
 #define FPU_SQRT_S(a) sqrtf(fabsf(ps2ClampF((float)(a))))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
@@ -760,6 +789,9 @@ static inline int64_t ps2FpuOrderKey(float value)
 #define PS2_FPU_EQ(a, b) (ps2FpuOrderKey((float)(a)) == ps2FpuOrderKey((float)(b)))
 #define PS2_FPU_LT(a, b) (ps2FpuOrderKey((float)(a)) < ps2FpuOrderKey((float)(b)))
 #define PS2_FPU_LE(a, b) (ps2FpuOrderKey((float)(a)) <= ps2FpuOrderKey((float)(b)))
+// MAX.S/MIN.S order their operands the same way as the comparisons.
+#define FPU_MAX_S(a, b) (PS2_FPU_LT(a, b) ? (float)(b) : (float)(a))
+#define FPU_MIN_S(a, b) (PS2_FPU_LT(b, a) ? (float)(b) : (float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (0)
 #define FPU_C_EQ_S(a, b) PS2_FPU_EQ(a, b)

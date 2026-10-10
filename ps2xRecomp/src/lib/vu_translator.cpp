@@ -205,7 +205,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Only the sticky flags can be written.
+                return fmt::format("ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0x03Fu) | (GPR_U32(ctx, {}) & 0xFC0u));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:

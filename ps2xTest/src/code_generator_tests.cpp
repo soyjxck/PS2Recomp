@@ -234,7 +234,7 @@ void register_code_generator_tests()
         const uint32_t rawFpu = (OPCODE_COP1 << 26) | (COP1_S << 21) | (4u << 16) |
                                 (9u << 11) | (2u << 6) | COP1_S_RSQRT;
         const auto fpu = gen.translateInstruction(decoder.decodeInstruction(0x1000, rawFpu));
-        t.IsTrue(fpu.find("ctx->f[2] = ctx->f[9] / sqrtf(ctx->f[4]);") != std::string::npos,
+        t.IsTrue(fpu.find("ctx->f[2] = FPU_RSQRT_S(ctx->f[9], ctx->f[4]);") != std::string::npos,
                  "RSQRT.S divides fs by the root of ft");
 
         // vrsqrt Q, vf12x, vf6x, as Dragon Quest VIII's distance constraints use it.

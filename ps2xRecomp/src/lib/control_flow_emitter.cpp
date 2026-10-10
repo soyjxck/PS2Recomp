@@ -443,9 +443,10 @@ namespace ps2recomp
             if (m_branchInst.rs == COP2_BC)
             {
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
+                // The COP2 condition is VU1 busy (VPU_STAT.VBS1), not a status flag.
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "!(ctx->vu0_vpu_stat & 0x100u)"
+                           : "(ctx->vu0_vpu_stat & 0x100u)";
             }
             break;
         default:
