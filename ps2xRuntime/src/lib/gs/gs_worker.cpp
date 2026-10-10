@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_worker.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/vu1_worker.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -66,6 +67,70 @@ namespace
 
 namespace GsWorker
 {
+    bool raisesInterrupt(const uint8_t *data, uint32_t sizeBytes)
+    {
+        const uint32_t qwords = sizeBytes / 16u;
+        uint32_t q = 0;
+        while (q < qwords)
+        {
+            uint64_t tagLo, tagHi;
+            std::memcpy(&tagLo, data + q * 16u, sizeof(tagLo));
+            std::memcpy(&tagHi, data + q * 16u + 8u, sizeof(tagHi));
+            ++q;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            if (flg == 1u)
+            {
+                q += (nloop * nreg + 1u) / 2u;
+                continue;
+            }
+            if (flg >= 2u)
+            {
+                q += nloop;
+                continue;
+            }
+            // PACKED: only A+D entries can address FINISH (0x61) or SIGNAL (0x60).
+            uint32_t addressAndData = 0u;
+            for (uint32_t r = 0; r < nreg; ++r)
+                if (((tagHi >> (4u * r)) & 0xFu) == 0xEu)
+                    addressAndData |= 1u << r;
+            if (addressAndData == 0u)
+            {
+                q += nloop * nreg;
+                continue;
+            }
+            for (uint32_t loop = 0; loop < nloop && q < qwords; ++loop)
+            {
+                for (uint32_t r = 0; r < nreg && q < qwords; ++r, ++q)
+                {
+                    if ((addressAndData >> r) & 1u)
+                    {
+                        const uint8_t address = data[q * 16u + 8u];
+                        if (address == 0x60u || address == 0x61u)
+                            return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    bool mayRaiseInterrupt(const uint8_t *data, uint32_t sizeBytes)
+    {
+        // An A+D entry is a data doubleword followed by the register address.
+        for (uint32_t offset = 8u; offset + 8u <= sizeBytes; offset += 8u)
+        {
+            uint64_t address;
+            std::memcpy(&address, data + offset, sizeof(address));
+            if (address == 0x60u || address == 0x61u)
+                return true;
+        }
+        return false;
+    }
+
     void start(GS &gs)
     {
         Worker &w = worker();
@@ -127,16 +192,25 @@ namespace GsWorker
         ++w.posted;
         lock.unlock();
         w.workReady.notify_one();
+
+        // Sent straight from the EE (no VU1 worker in between): an interrupt
+        // this packet raises is pending when the send returns.
+        if (!Vu1Worker::onWorkerThread() && raisesInterrupt(data, sizeBytes))
+            drain();
     }
 
     bool drain()
     {
         Worker &w = worker();
-        if (!w.active.load(std::memory_order_acquire) || std::this_thread::get_id() == w.threadId)
+        if (std::this_thread::get_id() == w.threadId || Vu1Worker::onWorkerThread())
             return false;
+        // VU1 produces GS packets: it has to finish before the GS can.
+        const bool waitedForVu1 = Vu1Worker::drain();
+        if (!w.active.load(std::memory_order_acquire))
+            return waitedForVu1;
         std::unique_lock<std::mutex> lock(w.mutex);
         if (w.completed == w.posted)
-            return false;
+            return waitedForVu1;
         const uint64_t target = w.posted;
         w.workDone.wait(lock, [&]
                         { return w.completed >= target; });

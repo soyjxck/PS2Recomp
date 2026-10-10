@@ -1,5 +1,6 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_worker.h"
+#include "runtime/vu1_worker.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -551,6 +552,10 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
         limit = rangeSize;
         return ptr;
     };
+
+    // VU1 memory belongs to the VU1 worker while it has work queued.
+    if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
+        Vu1Worker::drain();
 
     if (const uint8_t *ptr = mapRange(PS2_VU0_CODE_BASE, PS2_VU0_CODE_SIZE, m_vu0Code))
     {
@@ -1224,6 +1229,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
+        Vu1Worker::drain(); // the worker owns the VIF1 registers while it has work
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
 
         switch (address)
@@ -1885,7 +1891,8 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    // With VIF1 and PATH3 queued for the worker, the arbiter is the worker's.
+    if (m_gifArbiter && !Vu1Worker::defers())
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -2068,6 +2075,14 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+
+    // PATH3 is ordered against PATH1/PATH2 by going through the queue VIF1
+    // goes through.
+    if (pathId == GifPathId::Path3 && Vu1Worker::defers())
+    {
+        Vu1Worker::postPath3(data, sizeBytes);
+        return;
+    }
 
     if (g_ps2xGifTraceRemaining > 0 && pathId != GifPathId::Path1)
         traceWildGifPrimitives(m_rdram, pathId, data, sizeBytes);

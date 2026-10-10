@@ -1879,6 +1879,18 @@ void EeScheduler::processDueDeadlines()
         {
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
+                // What the guest sent during the frame is drawn before its
+                // vblank, and a FINISH or SIGNAL among it reaches the guest
+                // first, as it would on hardware that kept up.
+                if (GsWorker::drain())
+                {
+                    const uint32_t gsInterrupts = pendingGsInterrupts();
+                    if ((gsInterrupts & ~m_gsIrqLatched) != 0u)
+                    {
+                        dispatchIrq(false, 0u); // INTC_GS
+                    }
+                    m_gsIrqLatched = gsInterrupts;
+                }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
                               scheduled.hostDeadline + kVBlankDuration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
@@ -1899,8 +1911,6 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
-        // The frame the guest sent is drawn before its vblank arrives.
-        GsWorker::drain();
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

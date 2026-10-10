@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "runtime/gs/gs_worker.h"
+#include "runtime/vu1_worker.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
@@ -761,6 +762,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        Vu1Worker::stop();
         GsWorker::stop();
         m_iopSubsystem.reset();
         m_iopHost.reset();
@@ -899,6 +901,7 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     GsWorker::start(m_gs);
+    Vu1Worker::start(m_memory);
     m_gifArbiter.setProcessPacketFn([](const uint8_t *data, uint32_t size)
                                     { GsWorker::post(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
@@ -906,15 +909,19 @@ bool PS2Runtime::syncCoreSubsystems()
                                  {
                                      if (skipVu1ForFastForward(m_gs))
                                          return;
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // On the VU1 worker the EE's registers belong to another
+                                     // thread: the D/T stop enables are taken as off and the
+                                     // stop bits are not reported back.
+                                     const bool onWorker = Vu1Worker::onWorkerThread();
+                                     R5900Context *cpuContext = (!onWorker && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         !onWorker && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         !onWorker && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
                                                                        "MSCAL", startPC, top, itop, m_memory.getVU1Data(), m_memory.getVU1Code());
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
@@ -922,23 +929,30 @@ bool PS2Runtime::syncCoreSubsystems()
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      if (traced)
                                          vu1TraceEnd(m_vu1.state());
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (!onWorker)
+                                     {
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     } });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      if (skipVu1ForFastForward(m_gs))
                                          return;
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // On the VU1 worker the EE's registers belong to another
+                                     // thread: the D/T stop enables are taken as off and the
+                                     // stop bits are not reported back.
+                                     const bool onWorker = Vu1Worker::onWorkerThread();
+                                     R5900Context *cpuContext = (!onWorker && m_eeScheduler) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
                                      m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
+                                         !onWorker && (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                         !onWorker && (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
                                                                        "MSCNT", m_vu1.state().pc, top, itop, m_memory.getVU1Data(), m_memory.getVU1Code());
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
@@ -946,10 +960,13 @@ bool PS2Runtime::syncCoreSubsystems()
                                                   m_gs, &m_memory, top, itop, 65536);
                                      if (traced)
                                          vu1TraceEnd(m_vu1.state());
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     if (!onWorker)
+                                     {
+                                         cpuContext->vu0_vpu_stat =
+                                             (cpuContext->vu0_vpu_stat & ~0x0600u) |
+                                             (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u);
+                                     } });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();

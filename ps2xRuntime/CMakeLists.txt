@@ -385,6 +385,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/gs/gs_cpu_raster.cpp
     src/lib/gs/gs_worker.cpp
+    src/lib/vu/vu1_worker.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp

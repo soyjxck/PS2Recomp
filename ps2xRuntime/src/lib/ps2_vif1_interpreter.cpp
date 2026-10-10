@@ -1,5 +1,6 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "runtime/vu1_worker.h"
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -489,6 +490,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+
+    if (Vu1Worker::defers())
+    {
+        Vu1Worker::postVif1(data, sizeBytes);
+        return;
+    }
 
     uint32_t pos = 0;
 
