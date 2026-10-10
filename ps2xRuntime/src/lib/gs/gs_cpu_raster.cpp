@@ -34,6 +34,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 using namespace GSInternal;
 
@@ -211,6 +212,23 @@ namespace
                 return true;
         return false;
     }
+}
+
+namespace
+{
+    // Pixels are shaded a block of neighbours on one row at a time: every
+    // stage is a short loop over the lanes with nothing in it that depends on
+    // another lane, which the compiler turns into vector code.
+    constexpr int kLanes = 8;
+
+    struct PixelBlock
+    {
+        alignas(32) float dx[kLanes];
+        alignas(32) uint32_t z[kLanes];
+        alignas(32) int32_t r[kLanes], g[kLanes], b[kLanes], a[kLanes];
+        alignas(32) int32_t fog[kLanes];
+        alignas(32) float texU[kLanes], texV[kLanes];
+    };
 }
 
 // Everything a pixel needs, resolved from the draw state once per primitive.
@@ -634,6 +652,10 @@ struct GSCpuBackend::FastPipeline
         }
     }
 
+    // write() for the first `count` lanes of a block starting at column x0,
+    // sampling and applying the texture first.
+    void shade(const PixelBlock &in, int x0, int count, const Row &frameRow, const Row &depthRow) const;
+
     const GSDrawState *drawState = nullptr;
 };
 
@@ -813,6 +835,427 @@ bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &s
     return true;
 }
 
+// The stages are the ones sample(), combine() and write() go through for one
+// pixel, in the same order and with the same arithmetic, so a lane comes out
+// exactly as that pixel would.
+[[gnu::noinline]] void GSCpuBackend::FastPipeline::shade(const PixelBlock &in, int x0, int count, const Row &frameRow,
+                                                         const Row &depthRow) const
+{
+    constexpr int N = kLanes;
+    if (ztst == 0u)
+        return;
+
+    int32_t r[N], g[N], b[N], a[N];
+    for (int i = 0; i < N; ++i)
+    {
+        r[i] = in.r[i];
+        g[i] = in.g[i];
+        b[i] = in.b[i];
+        a[i] = in.a[i];
+    }
+
+    if (tme)
+    {
+        uint32_t texels[N];
+        const uint32_t *const pixels = decoded;
+        const int width = texW;
+        auto wrap = [&](int32_t *u, int32_t *v)
+        {
+            if (regionRepeat) [[unlikely]]
+            {
+                for (int i = 0; i < N; ++i)
+                {
+                    u[i] = wrapCoordinate(u[i], texW, wrapU, minU, maxU);
+                    v[i] = wrapCoordinate(v[i], texH, wrapV, minV, maxV);
+                }
+                return;
+            }
+            const int mu = maskU, mv = maskV, lu = lowU, hu = highU, lv = lowV, hv = highV;
+            for (int i = 0; i < N; ++i)
+            {
+                const int cu = u[i] & mu;
+                const int cv = v[i] & mv;
+                u[i] = cu < lu ? lu : (cu > hu ? hu : cu);
+                v[i] = cv < lv ? lv : (cv > hv ? hv : cv);
+            }
+        };
+
+        if (!linear)
+        {
+            int32_t u[N], v[N];
+            for (int i = 0; i < N; ++i)
+            {
+                u[i] = static_cast<int>(in.texU[i]);
+                v[i] = static_cast<int>(in.texV[i]);
+            }
+            wrap(u, v);
+            if (pixels)
+            {
+                for (int i = 0; i < N; ++i)
+                    texels[i] = pixels[v[i] * width + u[i]];
+            }
+            else
+            {
+                for (int i = 0; i < N; ++i)
+                    texels[i] = fetch(u[i], v[i]);
+            }
+        }
+        else
+        {
+            int32_t u0[N], v0[N], u1[N], v1[N];
+            uint32_t wx[N], wy[N];
+            for (int i = 0; i < N; ++i)
+            {
+                const float su = in.texU[i] - 0.5f;
+                const float sv = in.texV[i] - 0.5f;
+                const int iu = floorToInt(su);
+                const int iv = floorToInt(sv);
+                wx[i] = static_cast<uint32_t>((su - static_cast<float>(iu)) * 256.0f + 0.5f);
+                wy[i] = static_cast<uint32_t>((sv - static_cast<float>(iv)) * 256.0f + 0.5f);
+                u0[i] = iu;
+                v0[i] = iv;
+                u1[i] = iu + 1;
+                v1[i] = iv + 1;
+            }
+            wrap(u0, v0);
+            wrap(u1, v1);
+            uint32_t c00[N], c10[N], c01[N], c11[N];
+            if (pixels)
+            {
+                for (int i = 0; i < N; ++i)
+                {
+                    const uint32_t *const top = pixels + v0[i] * width;
+                    const uint32_t *const bottom = pixels + v1[i] * width;
+                    c00[i] = top[u0[i]];
+                    c10[i] = top[u1[i]];
+                    c01[i] = bottom[u0[i]];
+                    c11[i] = bottom[u1[i]];
+                }
+            }
+            else
+            {
+                for (int i = 0; i < N; ++i)
+                {
+                    c00[i] = fetch(u0[i], v0[i]);
+                    c10[i] = fetch(u1[i], v0[i]);
+                    c01[i] = fetch(u0[i], v1[i]);
+                    c11[i] = fetch(u1[i], v1[i]);
+                }
+            }
+            for (int i = 0; i < N; ++i)
+                texels[i] = lerpColor(lerpColor(c00[i], c10[i], wx[i]), lerpColor(c01[i], c11[i], wx[i]), wy[i]);
+        }
+
+        // The texture function.
+        int32_t tr[N], tg[N], tb[N], ta[N];
+        for (int i = 0; i < N; ++i)
+        {
+            tr[i] = static_cast<int32_t>(texels[i] & 0xFFu);
+            tg[i] = static_cast<int32_t>((texels[i] >> 8) & 0xFFu);
+            tb[i] = static_cast<int32_t>((texels[i] >> 16) & 0xFFu);
+            ta[i] = static_cast<int32_t>(texels[i] >> 24);
+        }
+        switch (tfx)
+        {
+        case 0: // MODULATE
+            for (int i = 0; i < N; ++i)
+            {
+                r[i] = std::min((tr[i] * r[i]) >> 7, 255);
+                g[i] = std::min((tg[i] * g[i]) >> 7, 255);
+                b[i] = std::min((tb[i] * b[i]) >> 7, 255);
+            }
+            if (tcc)
+                for (int i = 0; i < N; ++i)
+                    a[i] = std::min((ta[i] * a[i]) >> 7, 255);
+            break;
+        case 1: // DECAL
+            for (int i = 0; i < N; ++i)
+            {
+                r[i] = tr[i];
+                g[i] = tg[i];
+                b[i] = tb[i];
+            }
+            if (tcc)
+                for (int i = 0; i < N; ++i)
+                    a[i] = ta[i];
+            break;
+        default: // HIGHLIGHT, HIGHLIGHT2
+            for (int i = 0; i < N; ++i)
+            {
+                r[i] = std::min(((tr[i] * r[i]) >> 7) + a[i], 255);
+                g[i] = std::min(((tg[i] * g[i]) >> 7) + a[i], 255);
+                b[i] = std::min(((tb[i] * b[i]) >> 7) + a[i], 255);
+            }
+            if (tcc)
+            {
+                if (tfx == 2u)
+                    for (int i = 0; i < N; ++i)
+                        a[i] = std::min(ta[i] + a[i], 255);
+                else
+                    for (int i = 0; i < N; ++i)
+                        a[i] = ta[i];
+            }
+            break;
+        }
+    }
+
+    if (fge)
+    {
+        const int fr = fogR, fg = fogG, fb = fogB;
+        for (int i = 0; i < N; ++i)
+        {
+            const int fog = in.fog[i];
+            const int inverse = 255 - fog;
+            r[i] = ((fog * r[i]) >> 8) + ((inverse * fr) >> 8);
+            g[i] = ((fog * g[i]) >> 8) + ((inverse * fg) >> 8);
+            b[i] = ((fog * b[i]) >> 8) + ((inverse * fb) >> 8);
+        }
+    }
+
+    // Which lanes store to the frame and to the depth buffer, and which of
+    // those keep the alpha that is there.
+    int32_t frameMask[N], depthMask[N];
+    uint32_t keep[N];
+    for (int i = 0; i < N; ++i)
+    {
+        frameMask[i] = i < count ? -1 : 0;
+        depthMask[i] = frameMask[i];
+        keep[i] = fbmsk;
+    }
+
+    bool keepsAlpha = false;
+    if (alphaTest && atst != 1u)
+    {
+        int32_t pass[N];
+        const int ref = aref;
+        switch (atst)
+        {
+        case 0:
+            for (int i = 0; i < N; ++i)
+                pass[i] = 0;
+            break;
+        case 2:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] < ref ? -1 : 0;
+            break;
+        case 3:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] <= ref ? -1 : 0;
+            break;
+        case 4:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] == ref ? -1 : 0;
+            break;
+        case 5:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] >= ref ? -1 : 0;
+            break;
+        case 6:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] > ref ? -1 : 0;
+            break;
+        default:
+            for (int i = 0; i < N; ++i)
+                pass[i] = a[i] != ref ? -1 : 0;
+            break;
+        }
+        switch (afail)
+        {
+        case 1: // FB_ONLY
+            for (int i = 0; i < N; ++i)
+                depthMask[i] &= pass[i];
+            break;
+        case 2: // ZB_ONLY
+            for (int i = 0; i < N; ++i)
+                frameMask[i] &= pass[i];
+            break;
+        case 3: // RGB_ONLY (only distinct for RGBA32)
+            keepsAlpha = framePsm == GS_PSM_CT32;
+            for (int i = 0; i < N; ++i)
+            {
+                depthMask[i] &= pass[i];
+                if (keepsAlpha)
+                    keep[i] |= ~static_cast<uint32_t>(pass[i]) & 0xFF000000u;
+            }
+            break;
+        default: // KEEP
+            for (int i = 0; i < N; ++i)
+            {
+                frameMask[i] &= pass[i];
+                depthMask[i] &= pass[i];
+            }
+            break;
+        }
+    }
+
+    uint32_t frameUnit[N];
+    for (int i = 0; i < N; ++i)
+        frameUnit[i] = unitIn(frame, frameRow, x0 + i);
+
+    uint32_t dest[N];
+    if (date || fbmsk != 0u || abe || keepsAlpha)
+    {
+        switch (frameKind)
+        {
+        case FrameKind::C32:
+            for (int i = 0; i < N; ++i)
+                dest[i] = read32(vram, frameUnit[i]);
+            break;
+        case FrameKind::C24:
+            for (int i = 0; i < N; ++i)
+                dest[i] = (read32(vram, frameUnit[i]) & 0x00FFFFFFu) | 0x80000000u; // the GS supplies 0x80 as destination alpha
+            break;
+        case FrameKind::C16:
+            for (int i = 0; i < N; ++i)
+                dest[i] = rgba5551To8888(read16(vram, frameUnit[i]));
+            break;
+        }
+    }
+    else
+    {
+        for (int i = 0; i < N; ++i)
+            dest[i] = 0u;
+    }
+
+    if (date)
+    {
+        const uint32_t wanted = datm ? 1u : 0u;
+        for (int i = 0; i < N; ++i)
+        {
+            const int32_t pass = (dest[i] >> 31) == wanted ? -1 : 0;
+            frameMask[i] &= pass;
+            depthMask[i] &= pass;
+        }
+    }
+
+    const bool storesDepth = !zmask;
+    uint32_t depthUnit[N];
+    if (ztst >= 2u || storesDepth)
+    {
+        for (int i = 0; i < N; ++i)
+            depthUnit[i] = unitIn(depth, depthRow, x0 + i);
+    }
+    if (ztst >= 2u)
+    {
+        uint32_t stored[N];
+        switch (depthKind)
+        {
+        case DepthKind::Z32:
+            for (int i = 0; i < N; ++i)
+                stored[i] = read32(vram, depthUnit[i]);
+            break;
+        case DepthKind::Z24:
+            for (int i = 0; i < N; ++i)
+                stored[i] = read32(vram, depthUnit[i]) & 0x00FFFFFFu;
+            break;
+        case DepthKind::Z16:
+            for (int i = 0; i < N; ++i)
+                stored[i] = read16(vram, depthUnit[i]);
+            break;
+        }
+        if (ztst == 2u)
+        {
+            for (int i = 0; i < N; ++i)
+            {
+                const int32_t pass = in.z[i] >= stored[i] ? -1 : 0;
+                frameMask[i] &= pass;
+                depthMask[i] &= pass;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < N; ++i)
+            {
+                const int32_t pass = in.z[i] > stored[i] ? -1 : 0;
+                frameMask[i] &= pass;
+                depthMask[i] &= pass;
+            }
+        }
+    }
+
+    int32_t any = 0;
+    for (int i = 0; i < N; ++i)
+        any |= frameMask[i] | (storesDepth ? depthMask[i] : 0);
+    if (any == 0)
+        return;
+
+    if (abe)
+    {
+        const int alphaSource = csel == 0u ? -1 : 0;
+        const int alphaDest = csel == 1u ? -1 : 0;
+        const int alphaFixed = csel >= 2u ? fix : 0;
+        const int as = maskAS, ad = maskAD, bs = maskBS, bd = maskBD, ds = maskDS, dd = maskDD;
+        const int perPixel = pabe ? -1 : 0;
+        for (int i = 0; i < N; ++i)
+        {
+            const int dr = static_cast<int>(dest[i] & 0xFFu);
+            const int dg = static_cast<int>((dest[i] >> 8) & 0xFFu);
+            const int db = static_cast<int>((dest[i] >> 16) & 0xFFu);
+            const int da = static_cast<int>(dest[i] >> 24);
+            const int alpha = (a[i] & alphaSource) | (da & alphaDest) | alphaFixed;
+            // ((A - B) * alpha >> 7) + D with A, B, D each source, destination or zero.
+            const int br = (((((r[i] & as) | (dr & ad)) - ((r[i] & bs) | (dr & bd))) * alpha) >> 7) + ((r[i] & ds) | (dr & dd));
+            const int bg = (((((g[i] & as) | (dg & ad)) - ((g[i] & bs) | (dg & bd))) * alpha) >> 7) + ((g[i] & ds) | (dg & dd));
+            const int bb = (((((b[i] & as) | (db & ad)) - ((b[i] & bs) | (db & bd))) * alpha) >> 7) + ((b[i] & ds) | (db & dd));
+            // PABE blends only pixels whose alpha has its top bit set.
+            const int blended = ((a[i] & 0x80) != 0 ? -1 : 0) | ~perPixel;
+            r[i] = (std::min(std::max(br, 0), 255) & blended) | (r[i] & ~blended);
+            g[i] = (std::min(std::max(bg, 0), 255) & blended) | (g[i] & ~blended);
+            b[i] = (std::min(std::max(bb, 0), 255) & blended) | (b[i] & ~blended);
+        }
+    }
+
+    uint32_t pixel[N];
+    const int alphaOr = (fba && framePsm != GS_PSM_CT24) ? 0x80 : 0;
+    for (int i = 0; i < N; ++i)
+    {
+        const uint32_t packed = static_cast<uint32_t>(r[i] & 0xFF) | (static_cast<uint32_t>(g[i] & 0xFF) << 8) |
+                                (static_cast<uint32_t>(b[i] & 0xFF) << 16) | (static_cast<uint32_t>((a[i] | alphaOr) & 0xFF) << 24);
+        pixel[i] = (packed & ~keep[i]) | (dest[i] & keep[i]);
+    }
+
+    switch (frameKind)
+    {
+    case FrameKind::C32:
+        for (int i = 0; i < count; ++i)
+            if (frameMask[i])
+                write32(vram, frameUnit[i], pixel[i]);
+        break;
+    case FrameKind::C24:
+        for (int i = 0; i < count; ++i)
+            if (frameMask[i])
+                write32(vram, frameUnit[i], (read32(vram, frameUnit[i]) & 0xFF000000u) | (pixel[i] & 0x00FFFFFFu));
+        break;
+    case FrameKind::C16:
+        for (int i = 0; i < count; ++i)
+            if (frameMask[i])
+                write16(vram, frameUnit[i], rgba8888To5551(pixel[i]));
+        break;
+    }
+
+    if (storesDepth)
+    {
+        switch (depthKind)
+        {
+        case DepthKind::Z32:
+            for (int i = 0; i < count; ++i)
+                if (depthMask[i])
+                    write32(vram, depthUnit[i], in.z[i]);
+            break;
+        case DepthKind::Z24:
+            for (int i = 0; i < count; ++i)
+                if (depthMask[i])
+                    write32(vram, depthUnit[i], (read32(vram, depthUnit[i]) & 0xFF000000u) | (in.z[i] & 0x00FFFFFFu));
+            break;
+        case DepthKind::Z16:
+            for (int i = 0; i < count; ++i)
+                if (depthMask[i])
+                    write16(vram, depthUnit[i], in.z[i]);
+            break;
+        }
+    }
+}
+
 uint64_t GSCpuBackend::HashPages(const std::vector<uint32_t> &pages) const
 {
     uint64_t hash = 0xCBF29CE484222325ull;
@@ -964,6 +1407,91 @@ bool GSCpuBackend::UseReferenceRasteriser()
     return reference;
 }
 
+// PS2X_GS_STATS=2: thread time and pixels per kind of primitive (which
+// combination of pipeline features), to see which loops are worth specialising.
+namespace
+{
+    struct RasterClass
+    {
+        std::atomic<uint32_t> key{0};
+        std::atomic<uint64_t> nanoseconds{0}, pixels{0}, calls{0}, rows{0}, blocks{0};
+    };
+    constexpr size_t kRasterClassSlots = 1024u;
+    RasterClass g_rasterClasses[kRasterClassSlots];
+
+    bool rasterClassStatsWanted()
+    {
+        static const bool wanted = []
+        {
+            const char *value = std::getenv("PS2X_GS_STATS");
+            return value != nullptr && std::atoi(value) >= 2;
+        }();
+        return wanted;
+    }
+
+    void addRasterClassSample(uint32_t key, uint64_t nanoseconds, uint64_t pixels, uint64_t rows, uint64_t blocks)
+    {
+        key |= 0x80000000u; // never zero, which marks a free slot
+        for (size_t probe = 0, slot = (key * 0x9E3779B1u) >> 22; probe < kRasterClassSlots; ++probe, slot = (slot + 1u) % kRasterClassSlots)
+        {
+            RasterClass &entry = g_rasterClasses[slot];
+            uint32_t seen = entry.key.load(std::memory_order_relaxed);
+            if (seen == 0u && entry.key.compare_exchange_strong(seen, key, std::memory_order_relaxed))
+                seen = key;
+            if (seen != key)
+                continue;
+            entry.nanoseconds.fetch_add(nanoseconds, std::memory_order_relaxed);
+            entry.pixels.fetch_add(pixels, std::memory_order_relaxed);
+            entry.calls.fetch_add(1u, std::memory_order_relaxed);
+            entry.rows.fetch_add(rows, std::memory_order_relaxed);
+            entry.blocks.fetch_add(blocks, std::memory_order_relaxed);
+            return;
+        }
+    }
+
+    void printRasterClasses()
+    {
+        struct Line
+        {
+            uint32_t key;
+            uint64_t nanoseconds, pixels, calls, rows, blocks;
+        };
+        std::vector<Line> lines;
+        uint64_t total = 0;
+        for (const RasterClass &entry : g_rasterClasses)
+        {
+            const uint32_t key = entry.key.load(std::memory_order_relaxed);
+            if (key == 0u)
+                continue;
+            lines.push_back({key, entry.nanoseconds.load(), entry.pixels.load(), entry.calls.load(), entry.rows.load(), entry.blocks.load()});
+            total += lines.back().nanoseconds;
+        }
+        std::sort(lines.begin(), lines.end(), [](const Line &a, const Line &b)
+                  { return a.nanoseconds > b.nanoseconds; });
+        std::fprintf(stderr, "[gs-classes] %.2fs of thread time in %zu classes\n", static_cast<double>(total) * 1e-9, lines.size());
+        static const char *const kTexKinds[8] = {"32", "24", "16", "8", "8H", "4", "4HL", "4HH"};
+        for (size_t i = 0; i < lines.size() && i < 24u; ++i)
+        {
+            const Line &line = lines[i];
+            const uint32_t k = line.key;
+            char text[160];
+            std::snprintf(text, sizeof(text), "%s%s%s%s%s%s%s ztst=%u%s%s%s tfx=%u%s tex=%s frame=%u depth=%u%s%s",
+                          (k & 1u) ? "sprite" : "tri", (k & 2u) ? " tme" : "", (k & 4u) ? " linear" : "", (k & 8u) ? " decoded" : "",
+                          (k & 16u) ? " fge" : "", (k & 32u) ? " abe" : "", (k & 64u) ? " atest" : "", (k >> 7) & 3u,
+                          (k & 0x200u) ? " zmask" : "", (k & 0x400u) ? " fst" : "", (k & 0x800u) ? " gouraud" : "", (k >> 12) & 3u,
+                          (k & 0x4000u) ? " tcc" : "", kTexKinds[(k >> 15) & 7u], (k >> 18) & 3u, (k >> 20) & 3u,
+                          (k & 0x400000u) ? " date" : "", (k & 0x800000u) ? " fbmsk" : "");
+            std::fprintf(stderr, "[gs-classes] %5.1f%% %6.1f ns/px %8.2fM px %8llu calls %5.1f rows/call %5.1f px/row %4.1f px/block  %s\n",
+                         100.0 * static_cast<double>(line.nanoseconds) / static_cast<double>(std::max<uint64_t>(total, 1u)),
+                         static_cast<double>(line.nanoseconds) / static_cast<double>(std::max<uint64_t>(line.pixels, 1u)),
+                         static_cast<double>(line.pixels) * 1e-6, (unsigned long long)line.calls,
+                         static_cast<double>(line.rows) / static_cast<double>(std::max<uint64_t>(line.calls, 1u)),
+                         static_cast<double>(line.pixels) / static_cast<double>(std::max<uint64_t>(line.rows, 1u)),
+                         static_cast<double>(line.pixels) / static_cast<double>(std::max<uint64_t>(line.blocks, 1u)), text);
+        }
+    }
+}
+
 // A primitive ready to rasterise: its pipeline, its bounds on the target and
 // the per-primitive constants of the walk.
 struct GSCpuBackend::PreparedPrimitive
@@ -977,6 +1505,7 @@ struct GSCpuBackend::PreparedPrimitive
     // Triangle: barycentric planes measured from vertex 2.
     float fx2 = 0.0f, fy2 = 0.0f;
     float wa[3]{}, wb[3]{}, wc[3]{};
+    float invWa[3]{}; // 1 / wa, zero for an edge that does not cross rows
     bool ownsEdge[3]{};
     // Each interpolated attribute as a plane: value at vertex 2, and its
     // change per pixel in x and in y.
@@ -1124,6 +1653,8 @@ struct GSCpuBackend::RasterQueue
                 for (int i = 0; i < 6; ++i)
                     std::fprintf(stderr, " %s=%llu", kReasons[i], (unsigned long long)stats.reason[i]);
                 std::fprintf(stderr, "; drawing took %.2fs parallel, %.2fs inline\n", stats.parallelSeconds, stats.inlineSeconds);
+                if (rasterClassStatsWanted() && stats.batches % 8000u == 0u)
+                    printRasterClasses();
             }
         }
 
@@ -1272,7 +1803,10 @@ bool GSCpuBackend::PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimit
     // A centre exactly on an edge counts for left edges (inside is towards +x)
     // and top edges (horizontal, inside is towards +y) only.
     for (int i = 0; i < 3; ++i)
+    {
         primitive.ownsEdge[i] = wa[i] > 0.0f || (wa[i] == 0.0f && wb[i] > 0.0f);
+        primitive.invWa[i] = wa[i] != 0.0f ? 1.0f / wa[i] : 0.0f;
+    }
 
     // value = a0 * w0 + a1 * w1 + a2 * w2 with w2 = 1 - w0 - w1 is a plane.
     auto plane = [&](float a0, float a1, float a2)
@@ -1416,9 +1950,253 @@ bool GSCpuBackend::PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitiv
 // the targets, so different rows can be drawn on different threads.
 void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int yLast)
 {
+    if (rasterClassStatsWanted()) [[unlikely]]
+    {
+        const FastPipeline &p = primitive.pipeline;
+        const uint32_t key = (primitive.sprite ? 1u : 0u) | (p.tme ? 2u : 0u) | (p.tme && p.linear ? 4u : 0u) | (p.decoded ? 8u : 0u) |
+                             (p.fge ? 16u : 0u) | (p.abe ? 32u : 0u) | (p.alphaTest ? 64u : 0u) | (static_cast<uint32_t>(p.ztst & 3u) << 7) |
+                             (p.zmask ? 0x200u : 0u) | (p.tme && p.fst ? 0x400u : 0u) | (primitive.gouraud ? 0x800u : 0u) |
+                             (p.tme ? static_cast<uint32_t>(p.tfx & 3u) << 12 : 0u) | (p.tme && p.tcc ? 0x4000u : 0u) |
+                             (p.tme ? static_cast<uint32_t>(p.texKind) << 15 : 0u) | (static_cast<uint32_t>(p.frameKind) << 18) |
+                             (static_cast<uint32_t>(p.depthKind) << 20) | (p.date ? 0x400000u : 0u) | (p.fbmsk != 0u ? 0x800000u : 0u);
+        RasterTally tally;
+        const auto start = std::chrono::steady_clock::now();
+        RasteriseRows(primitive, yFirst, yLast, &tally);
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        addRasterClassSample(key, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                             tally.pixels, tally.rows, tally.blocks);
+        return;
+    }
+    RasteriseRows(primitive, yFirst, yLast, nullptr);
+}
+
+void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally)
+{
+    const FastPipeline &p = primitive.pipeline;
+    // A primitive that samples what it is drawing needs each pixel stored
+    // before the next is sampled. PS2X_GS_SCALAR=1 draws everything that way.
+    static const bool scalarOnly = []
+    {
+        const char *value = std::getenv("PS2X_GS_SCALAR");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (scalarOnly || (p.tme && p.textureIsTarget))
+    {
+        RasteriseRowsScalar(primitive, yFirst, yLast, tally);
+        return;
+    }
+
+    const GSVertex &v1 = primitive.v[1];
+    PixelBlock block;
+
+    if (primitive.sprite)
+    {
+        if (tally)
+        {
+            const uint64_t rows = static_cast<uint64_t>(yLast - yFirst + 1);
+            const uint64_t width = static_cast<uint64_t>(primitive.maxX - primitive.minX + 1);
+            tally->pixels += rows * width;
+            tally->rows += rows;
+            tally->blocks += rows * ((width + kLanes - 1u) / kLanes);
+        }
+        for (int i = 0; i < kLanes; ++i)
+        {
+            block.dx[i] = 0.0f;
+            block.z[i] = static_cast<uint32_t>(v1.z);
+            block.r[i] = v1.r;
+            block.g[i] = v1.g;
+            block.b[i] = v1.b;
+            block.a[i] = v1.a;
+            block.fog[i] = v1.fog;
+            block.texU[i] = 0.0f;
+            block.texV[i] = 0.0f;
+        }
+        const float stepU = p.tme ? (primitive.tu1 - primitive.tu0) / primitive.spanX : 0.0f;
+        const float stepV = p.tme ? (primitive.tv1 - primitive.tv0) / primitive.spanY : 0.0f;
+        const bool fst = p.fst;
+        // With FST the coordinates are 12.4 fixed point, as the reference rounds them.
+        auto quantise = [fst](float coordinate)
+        {
+            return fst ? static_cast<float>(clampInt(static_cast<int>((coordinate * 16.0f) + 0.5f), 0, 0xFFFF)) * 0.0625f
+                       : coordinate;
+        };
+        const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
+        for (int y = yFirst; y <= yLast; ++y)
+        {
+            const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+            const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+            if (p.tme)
+            {
+                const float texV = quantise(primitive.tv0 + (static_cast<float>(y - primitive.originY) + 0.5f) * stepV);
+                for (int i = 0; i < kLanes; ++i)
+                    block.texV[i] = texV;
+            }
+            for (int x = primitive.minX; x <= primitive.maxX; x += kLanes)
+            {
+                if (p.tme)
+                {
+                    const int column = x - primitive.minX;
+                    for (int i = 0; i < kLanes; ++i)
+                        block.texU[i] = quantise(rowU + static_cast<float>(column + i) * stepU);
+                }
+                p.shade(block, x, std::min(kLanes, primitive.maxX - x + 1), frameRow, depthRow);
+            }
+        }
+        return;
+    }
+
+    const GSVertex &v2 = primitive.v[2];
+    const float *wa = primitive.wa, *wb = primitive.wb, *wc = primitive.wc, *invWa = primitive.invWa;
+    const bool *ownsEdge = primitive.ownsEdge;
+    const float fx2 = primitive.fx2, fy2 = primitive.fy2;
+    const int minX = primitive.minX, maxX = primitive.maxX;
+
+    const bool gouraud = primitive.gouraud;
+    const bool textured = p.tme, fst = p.fst, fogged = p.fge;
+    const float texWf = static_cast<float>(p.texW);
+    const float texHf = static_cast<float>(p.texH);
+    const float stepR = primitive.red.dx, stepG = primitive.green.dx, stepB = primitive.blue.dx, stepA = primitive.alpha.dx;
+    const float stepFog = primitive.fog.dx;
+    const float stepS = primitive.texS.dx, stepT = primitive.texT.dx, stepQ = primitive.texQ.dx;
+    const double stepZ = primitive.zDx;
+    for (int i = 0; i < kLanes; ++i)
+    {
+        block.r[i] = v2.r;
+        block.g[i] = v2.g;
+        block.b[i] = v2.b;
+        block.a[i] = v2.a;
+        block.fog[i] = 0;
+        block.texU[i] = 0.0f;
+        block.texV[i] = 0.0f;
+    }
+
+    for (int y = yFirst; y <= yLast; ++y)
+    {
+        const float dy = (static_cast<float>(y) + 0.5f) - fy2;
+
+        // The pixels of this row whose centres are inside all three edges.
+        float rowW[3];
+        float lo = static_cast<float>(minX);
+        float hi = static_cast<float>(maxX);
+        bool empty = false;
+        for (int i = 0; i < 3; ++i)
+        {
+            rowW[i] = wb[i] * dy + wc[i]; // weight at px = fx2
+            // Solve w_i = 0 for the pixel index, a pixel generous either way.
+            if (wa[i] > 0.0f)
+                lo = std::max(lo, fx2 - (rowW[i] * invWa[i]) - 1.5f);
+            else if (wa[i] < 0.0f)
+                hi = std::min(hi, fx2 - (rowW[i] * invWa[i]) + 0.5f);
+            else if (rowW[i] < 0.0f || (rowW[i] == 0.0f && !ownsEdge[i]))
+                empty = true;
+        }
+        if (empty || !(lo <= hi))
+            continue;
+
+        int xStart = std::max(minX, static_cast<int>(std::floor(lo)));
+        int xEnd = std::min(maxX, static_cast<int>(std::ceil(hi)));
+        auto inside = [&](int x)
+        {
+            const float dx = (static_cast<float>(x) + 0.5f) - fx2;
+            const float w0 = wa[0] * dx + rowW[0];
+            const float w1 = wa[1] * dx + rowW[1];
+            const float w2 = 1.0f - w0 - w1;
+            return (w0 > 0.0f || (w0 == 0.0f && ownsEdge[0])) &&
+                   (w1 > 0.0f || (w1 == 0.0f && ownsEdge[1])) &&
+                   (w2 > 0.0f || (w2 == 0.0f && ownsEdge[2]));
+        };
+        // Tighten the generous bounds to the first and last covered pixel.
+        while (xStart <= xEnd && !inside(xStart))
+            ++xStart;
+        while (xEnd >= xStart && !inside(xEnd))
+            --xEnd;
+        if (xStart > xEnd)
+            continue;
+        if (tally)
+        {
+            const uint64_t width = static_cast<uint64_t>(xEnd - xStart + 1);
+            tally->pixels += width;
+            tally->rows += 1u;
+            tally->blocks += (width + kLanes - 1u) / kLanes;
+        }
+
+        const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+        const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+
+        // Attribute values on this row at dx = 0 (vertex 2's column).
+        auto onRow = [&](const PreparedPrimitive::Plane &plane)
+        {
+            return plane.base + plane.dy * dy;
+        };
+        const float rowR = onRow(primitive.red), rowG = onRow(primitive.green), rowB = onRow(primitive.blue);
+        const float rowA = onRow(primitive.alpha), rowFog = onRow(primitive.fog);
+        const float rowS = onRow(primitive.texS), rowT = onRow(primitive.texT), rowQ = onRow(primitive.texQ);
+        const double rowZ = primitive.zBase + primitive.zDy * static_cast<double>(dy);
+
+        for (int x = xStart; x <= xEnd; x += kLanes)
+        {
+            for (int i = 0; i < kLanes; ++i)
+                block.dx[i] = (static_cast<float>(x + i) + 0.5f) - fx2;
+            for (int i = 0; i < kLanes; ++i)
+                block.z[i] = static_cast<uint32_t>(rowZ + stepZ * static_cast<double>(block.dx[i]) + 0.5);
+            if (gouraud)
+            {
+                for (int i = 0; i < kLanes; ++i)
+                {
+                    block.r[i] = clampU8(static_cast<int>(rowR + stepR * block.dx[i]));
+                    block.g[i] = clampU8(static_cast<int>(rowG + stepG * block.dx[i]));
+                    block.b[i] = clampU8(static_cast<int>(rowB + stepB * block.dx[i]));
+                    block.a[i] = clampU8(static_cast<int>(rowA + stepA * block.dx[i]));
+                }
+            }
+            if (textured)
+            {
+                if (fst)
+                {
+                    for (int i = 0; i < kLanes; ++i)
+                    {
+                        block.texU[i] = static_cast<float>(static_cast<uint16_t>(rowS + stepS * block.dx[i])) * 0.0625f;
+                        block.texV[i] = static_cast<float>(static_cast<uint16_t>(rowT + stepT * block.dx[i])) * 0.0625f;
+                    }
+                }
+                else
+                {
+                    // S, T and Q are interpolated; the divide comes after.
+                    for (int i = 0; i < kLanes; ++i)
+                    {
+                        float q = rowQ + stepQ * block.dx[i];
+                        if (!(std::fabs(q) > 1.0e-8f))
+                            q = 1.0f;
+                        const float invQ = 1.0f / q;
+                        block.texU[i] = (rowS + stepS * block.dx[i]) * invQ * texWf;
+                        block.texV[i] = (rowT + stepT * block.dx[i]) * invQ * texHf;
+                    }
+                }
+            }
+            if (fogged)
+            {
+                for (int i = 0; i < kLanes; ++i)
+                    block.fog[i] = clampU8(static_cast<int>(rowFog + stepFog * block.dx[i]));
+            }
+            p.shade(block, x, std::min(kLanes, xEnd - x + 1), frameRow, depthRow);
+        }
+    }
+}
+
+// One pixel at a time, each stored before the next is sampled.
+void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally)
+{
     const FastPipeline &p = primitive.pipeline;
     const GSVertex &v0 = primitive.v[0];
     const GSVertex &v1 = primitive.v[1];
+    if (tally && primitive.sprite)
+    {
+        const uint64_t rows = static_cast<uint64_t>(yLast - yFirst + 1);
+        const uint64_t width = static_cast<uint64_t>(primitive.maxX - primitive.minX + 1);
+        tally->pixels += rows * width;
+        tally->rows += rows;
+        tally->blocks += rows * ((width + kLanes - 1u) / kLanes);
+    }
 
     if (primitive.sprite)
     {
@@ -1516,6 +2294,14 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
             --xEnd;
         if (xStart > xEnd)
             continue;
+
+        if (tally)
+        {
+            const uint64_t width = static_cast<uint64_t>(xEnd - xStart + 1);
+            tally->pixels += width;
+            tally->rows += 1u;
+            tally->blocks += (width + kLanes - 1u) / kLanes;
+        }
 
         const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
         const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);

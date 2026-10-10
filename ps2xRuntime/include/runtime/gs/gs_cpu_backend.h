@@ -63,6 +63,11 @@ private:
         std::vector<uint32_t> pixels; // RGBA, row major
     };
     struct PreparedPrimitive;
+    // What a Rasterise call covered, for PS2X_GS_STATS.
+    struct RasterTally
+    {
+        uint64_t pixels = 0, rows = 0, blocks = 0;
+    };
     struct RasterQueue;
     struct RasterQueueDeleter
     {
@@ -73,6 +78,8 @@ private:
     bool PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     static void Rasterise(const PreparedPrimitive &primitive, int yFirst, int yLast);
+    static void RasteriseRows(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally);
+    static void RasteriseRowsScalar(const PreparedPrimitive &primitive, int yFirst, int yLast, RasterTally *tally);
     // Draw what is queued: all of it, or only if it involves these pixels of
     // a surface (anything that reads or writes VRAM outside the queue asks).
     void FlushPrimitives();
