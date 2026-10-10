@@ -204,3 +204,9 @@ private:
     std::vector<uint8_t> m_localToHostBuffer;
     size_t m_localToHostReadPos = 0;
 };
+
+// A GS on its own draws each primitive before the call that sent it returns:
+// whoever holds its memory can look at it right away. The runtime, which
+// reads that memory only through Sync and Present, names its GS's memory
+// here to let the raster pool draw in the background (nullptr: no GS does).
+void ps2xSetGsBackgroundDrawing(const uint8_t *vram);

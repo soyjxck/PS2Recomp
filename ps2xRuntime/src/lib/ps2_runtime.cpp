@@ -746,6 +746,8 @@ namespace
 // Called by the EE at each vblank. A frame dump is of the picture on display
 // at its tick, whatever the host's speed: the emulation stops at a tick that
 // is to be dumped until the window thread has saved it (or stopped drawing).
+void ps2xSetGsBackgroundDrawing(const uint8_t *vram); // gs/gs_cpu_backend.cpp
+
 void ps2xHoldForFrameDump(uint64_t tick)
 {
     if (!frameDumpPlan().dueAt(tick))
@@ -916,6 +918,7 @@ PS2Runtime::~PS2Runtime()
         requestStop();
         Vu1Worker::stop();
         GsWorker::stop();
+        ps2xSetGsBackgroundDrawing(nullptr);
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -1052,6 +1055,7 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
+    ps2xSetGsBackgroundDrawing(gsVram);
     GsWorker::start(m_gs);
     Vu1Worker::start(m_memory);
     if (m_eeScheduler)

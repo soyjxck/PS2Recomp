@@ -532,6 +532,16 @@ GSCpuBackend::GSCpuBackend()
     Reset();
 }
 
+namespace
+{
+    std::atomic<const uint8_t *> g_backgroundDrawing{nullptr};
+}
+
+void ps2xSetGsBackgroundDrawing(const uint8_t *vram)
+{
+    g_backgroundDrawing.store(vram, std::memory_order_release);
+}
+
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
     if (vram && vramSize < GSMem::MEMORY_SIZE)
@@ -577,6 +587,8 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     if (!m_vram || batch.vertexCount == 0u)
         return;
     DrawPrimitive(batch);
+    if (g_backgroundDrawing.load(std::memory_order_acquire) != m_vram)
+        FlushPrimitives("direct");
 }
 
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
@@ -2046,6 +2058,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     if (whole)
     {
         QueueImage(layout, dpsm, streamBits, dsax, dsay, rrw, rrh, data, static_cast<size_t>(wholeBytes));
+        if (g_backgroundDrawing.load(std::memory_order_acquire) != m_vram)
+            FlushPrimitives("direct");
         pixel = total;
     }
     else
