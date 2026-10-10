@@ -381,6 +381,49 @@ namespace
 
 // Set while a traced VU1 run is in flight; ps2_vu1_core.cpp logs XGKICK packets.
 int g_ps2xVu1TraceKicks = 0;
+
+uint32_t g_ps2xWatchBase = 0;
+uint32_t g_ps2xWatchSize = 0;
+
+namespace
+{
+    int g_ps2xWatchReports = 0;
+
+    // Arms PS2X_WATCH before any guest code runs.
+    const bool g_ps2xWatchArmed = []
+    {
+        const char *value = std::getenv("PS2X_WATCH");
+        if (!value || !value[0])
+            return false;
+        char *end = nullptr;
+        g_ps2xWatchBase = static_cast<uint32_t>(std::strtoul(value, &end, 16)) & PS2_RAM_MASK;
+        uint32_t size = 16u;
+        g_ps2xWatchReports = 64;
+        if (end && *end == ':')
+        {
+            size = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
+            if (end && *end == ':')
+                g_ps2xWatchReports = std::atoi(end + 1);
+        }
+        g_ps2xWatchSize = size != 0u ? size : 16u;
+        return true;
+    }();
+}
+
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           const char *op, const R5900Context *ctx)
+{
+    if (g_ps2xWatchReports <= 0)
+    {
+        g_ps2xWatchSize = 0u;
+        return;
+    }
+    --g_ps2xWatchReports;
+    std::fprintf(stderr, "[watch] %s 0x%08x (%u bytes) = 0x%016llx%016llx  pc=0x%08x ra=0x%08x\n",
+                 op ? op : "write", guestAddr, size, static_cast<unsigned long long>(valueHi),
+                 static_cast<unsigned long long>(valueLo), ctx ? ctx->pc : 0u,
+                 ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u);
+}
 extern int g_ps2xGifTraceRemaining; // ps2_memory.cpp
 
 namespace

@@ -237,6 +237,14 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// PS2X_WATCH=<address>[:bytes[:reports]] (hex address): report guest stores
+// that touch the range, with the pc and return address of the code doing it.
+// "Who wrote this?" for a value found in guest memory.
+extern uint32_t g_ps2xWatchBase;
+extern uint32_t g_ps2xWatchSize; // 0 = off
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           const char *op, const R5900Context *ctx);
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -246,13 +254,12 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2xWatchSize != 0u) [[unlikely]]
+    {
+        const uint32_t physical = guestAddr & PS2_RAM_MASK;
+        if (physical < g_ps2xWatchBase + g_ps2xWatchSize && physical + size > g_ps2xWatchBase)
+            ps2ReportWatchedWrite(guestAddr, size, valueLo, valueHi, op, ctx);
+    }
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -262,11 +269,12 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2xWatchSize != 0u) [[unlikely]]
+    {
+        const uint32_t physical = guestAddr & PS2_RAM_MASK;
+        if (physical < g_ps2xWatchBase + g_ps2xWatchSize && physical + size > g_ps2xWatchBase)
+            ps2ReportWatchedWrite(guestAddr, size, 0u, 0u, op, ctx);
+    }
 }
 
 class PS2Runtime
