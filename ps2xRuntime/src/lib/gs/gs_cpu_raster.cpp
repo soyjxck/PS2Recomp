@@ -1637,6 +1637,13 @@ struct GSCpuBackend::PreparedPrimitive
     float wa[3]{}, wb[3]{}, wc[3]{};
     float invWa[3]{}; // 1 / wa, zero for an edge that does not cross rows
     bool ownsEdge[3]{};
+    // The same three edges in integers, for deciding which pixels are inside:
+    // edge i at a pixel centre (X, Y), in sixteenths of a pixel, is
+    // edgeA[i] * (X - x2) + edgeB[i] * (Y - y2) + edgeC[i], positive inside.
+    // Exact, so that two triangles sharing an edge agree about every pixel on
+    // it: floats left pinholes along the seam.
+    int64_t edgeA[3]{}, edgeB[3]{}, edgeC[3]{};
+    int32_t x2Sixteenths = 0, y2Sixteenths = 0;
     // Each interpolated attribute as a plane: value at vertex 2, and its
     // change per pixel in x and in y.
     struct Plane
@@ -2230,11 +2237,33 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     wb[2] = -wb[0] - wb[1];
     wc[2] = 1.0f;
 
+    // The edges again in integers (vertex coordinates are whole sixteenths).
+    {
+        const int64_t x0 = std::lround(fx0 * 16.0f), y0 = std::lround(fy0 * 16.0f);
+        const int64_t x1 = std::lround(fx1 * 16.0f), y1 = std::lround(fy1 * 16.0f);
+        const int64_t x2 = std::lround(fx2 * 16.0f), y2 = std::lround(fy2 * 16.0f);
+        const int64_t area = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+        if (area == 0)
+            return true;
+        const int64_t sign = area > 0 ? 1 : -1;
+        primitive.x2Sixteenths = static_cast<int32_t>(x2);
+        primitive.y2Sixteenths = static_cast<int32_t>(y2);
+        primitive.edgeA[0] = sign * (y1 - y2);
+        primitive.edgeB[0] = sign * (x2 - x1);
+        primitive.edgeC[0] = 0;
+        primitive.edgeA[1] = sign * (y2 - y0);
+        primitive.edgeB[1] = sign * (x0 - x2);
+        primitive.edgeC[1] = 0;
+        primitive.edgeA[2] = -primitive.edgeA[0] - primitive.edgeA[1];
+        primitive.edgeB[2] = -primitive.edgeB[0] - primitive.edgeB[1];
+        primitive.edgeC[2] = sign * area;
+    }
+
     // A centre exactly on an edge counts for left edges (inside is towards +x)
     // and top edges (horizontal, inside is towards +y) only.
     for (int i = 0; i < 3; ++i)
     {
-        primitive.ownsEdge[i] = wa[i] > 0.0f || (wa[i] == 0.0f && wb[i] > 0.0f);
+        primitive.ownsEdge[i] = primitive.edgeA[i] > 0 || (primitive.edgeA[i] == 0 && primitive.edgeB[i] > 0);
         primitive.invWa[i] = wa[i] != 0.0f ? 1.0f / wa[i] : 0.0f;
     }
 
@@ -2610,6 +2639,8 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
 
         // The pixels of this row whose centres are inside all three edges.
         float rowW[3];
+        int64_t rowEdge[3];
+        const int64_t edgeDy = static_cast<int64_t>(y) * 16 + 8 - primitive.y2Sixteenths;
         float lo = static_cast<float>(minX);
         float hi = static_cast<float>(maxX);
         bool empty = false;
@@ -2617,11 +2648,12 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
         {
             rowW[i] = wb[i] * dy + wc[i]; // weight at px = fx2
             // Solve w_i = 0 for the pixel index, a pixel generous either way.
-            if (wa[i] > 0.0f)
+            rowEdge[i] = primitive.edgeB[i] * edgeDy + primitive.edgeC[i];
+            if (primitive.edgeA[i] > 0)
                 lo = std::max(lo, fx2 - (rowW[i] * invWa[i]) - 1.5f);
-            else if (wa[i] < 0.0f)
+            else if (primitive.edgeA[i] < 0)
                 hi = std::min(hi, fx2 - (rowW[i] * invWa[i]) + 0.5f);
-            else if (rowW[i] < 0.0f || (rowW[i] == 0.0f && !ownsEdge[i]))
+            else if (rowEdge[i] < 0 || (rowEdge[i] == 0 && !ownsEdge[i]))
                 empty = true;
         }
         if (empty || !(lo <= hi))
@@ -2629,15 +2661,17 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
 
         int xStart = std::max(minX, static_cast<int>(std::floor(lo)));
         int xEnd = std::min(maxX, static_cast<int>(std::ceil(hi)));
+        // Exactly, in integers (see PreparedPrimitive::edgeA).
         auto inside = [&](int x)
         {
-            const float dx = (static_cast<float>(x) + 0.5f) - fx2;
-            const float w0 = wa[0] * dx + rowW[0];
-            const float w1 = wa[1] * dx + rowW[1];
-            const float w2 = 1.0f - w0 - w1;
-            return (w0 > 0.0f || (w0 == 0.0f && ownsEdge[0])) &&
-                   (w1 > 0.0f || (w1 == 0.0f && ownsEdge[1])) &&
-                   (w2 > 0.0f || (w2 == 0.0f && ownsEdge[2]));
+            const int64_t edgeDx = static_cast<int64_t>(x) * 16 + 8 - primitive.x2Sixteenths;
+            for (int i = 0; i < 3; ++i)
+            {
+                const int64_t edge = primitive.edgeA[i] * edgeDx + rowEdge[i];
+                if (edge < 0 || (edge == 0 && !ownsEdge[i]))
+                    return false;
+            }
+            return true;
         };
         // Tighten the generous bounds to the first and last covered pixel.
         while (xStart <= xEnd && !inside(xStart))
@@ -2792,6 +2826,8 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
 
         // The pixels of this row whose centres are inside all three edges.
         float rowW[3];
+        int64_t rowEdge[3];
+        const int64_t edgeDy = static_cast<int64_t>(y) * 16 + 8 - primitive.y2Sixteenths;
         float lo = static_cast<float>(minX);
         float hi = static_cast<float>(maxX);
         bool empty = false;
@@ -2799,11 +2835,12 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
         {
             rowW[i] = wb[i] * dy + wc[i]; // weight at px = fx2
             // Solve w_i = 0 for the pixel index, a pixel generous either way.
-            if (wa[i] > 0.0f)
+            rowEdge[i] = primitive.edgeB[i] * edgeDy + primitive.edgeC[i];
+            if (primitive.edgeA[i] > 0)
                 lo = std::max(lo, fx2 - (rowW[i] / wa[i]) - 1.5f);
-            else if (wa[i] < 0.0f)
+            else if (primitive.edgeA[i] < 0)
                 hi = std::min(hi, fx2 - (rowW[i] / wa[i]) + 0.5f);
-            else if (rowW[i] < 0.0f || (rowW[i] == 0.0f && !ownsEdge[i]))
+            else if (rowEdge[i] < 0 || (rowEdge[i] == 0 && !ownsEdge[i]))
                 empty = true;
         }
         if (empty || !(lo <= hi))
@@ -2811,15 +2848,17 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
 
         int xStart = std::max(minX, static_cast<int>(std::floor(lo)));
         int xEnd = std::min(maxX, static_cast<int>(std::ceil(hi)));
+        // Exactly, in integers (see PreparedPrimitive::edgeA).
         auto inside = [&](int x)
         {
-            const float dx = (static_cast<float>(x) + 0.5f) - fx2;
-            const float w0 = wa[0] * dx + rowW[0];
-            const float w1 = wa[1] * dx + rowW[1];
-            const float w2 = 1.0f - w0 - w1;
-            return (w0 > 0.0f || (w0 == 0.0f && ownsEdge[0])) &&
-                   (w1 > 0.0f || (w1 == 0.0f && ownsEdge[1])) &&
-                   (w2 > 0.0f || (w2 == 0.0f && ownsEdge[2]));
+            const int64_t edgeDx = static_cast<int64_t>(x) * 16 + 8 - primitive.x2Sixteenths;
+            for (int i = 0; i < 3; ++i)
+            {
+                const int64_t edge = primitive.edgeA[i] * edgeDx + rowEdge[i];
+                if (edge < 0 || (edge == 0 && !ownsEdge[i]))
+                    return false;
+            }
+            return true;
         };
         // Tighten the generous bounds to the first and last covered pixel.
         while (xStart <= xEnd && !inside(xStart))
