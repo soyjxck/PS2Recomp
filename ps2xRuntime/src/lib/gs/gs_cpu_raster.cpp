@@ -291,7 +291,6 @@ struct GSCpuBackend::FastPipeline
     const uint32_t *decoded = nullptr;
     // That copy is never decoded again (see DecodedTexture::immutable).
     bool decodedIsFixed = false;
-    bool isSprite = false; // TEMP
     // The pixels the primitive can touch, for telling a texture that is also
     // the render target.
     int boundsX0 = 0, boundsY0 = 0, boundsX1 = 0, boundsY1 = 0;
@@ -1425,13 +1424,7 @@ uint64_t GSCpuBackend::BorderHash(FastPipeline &p, uint64_t conversion, int imag
                     record.checkedUpload = m_lastUploadSerial;
             }
             if (!inside)
-            {
                 ++statOutside;
-                if (wantStats && statOutside % 499u == 0u) // TEMP
-                    std::fprintf(stderr, "[outside] tbp=%u tbw=%u psm=%02x tex %dx%d image %dx%d sampled u %d..%d v %d..%d wrap %u,%u linear=%d fst=%d sprite=%d\n",
-                                 p.tbp0, p.tbw, p.texPsm, p.texW, p.texH, imageW, imageH, p.sampledU0, p.sampledU1, p.sampledV0, p.sampledV1,
-                                 p.wrapU, p.wrapV, p.linear ? 1 : 0, p.fst ? 1 : 0, p.isSprite ? 1 : 0);
-            }
             else if (!intact)
                 ++statStale;
             if (intact)
@@ -2401,7 +2394,6 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
         return true;
 
     primitive.sprite = true;
-    p.isSprite = true; // TEMP
     primitive.v[0] = v0;
     primitive.v[1] = v1;
     primitive.minX = clampInt(x0, p.scissorX0, p.scissorX1);
