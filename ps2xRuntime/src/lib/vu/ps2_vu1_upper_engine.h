@@ -29,6 +29,27 @@ PS2_VU_FORCE_INLINE int32_t floatToInt(float value, float scale)
     return static_cast<int32_t>(scaled);
 }
 
+// MAX and MINI order their operands as sign-magnitude integers, whatever the
+// bits mean, and move the winner unchanged. Programs put integers through
+// them: Drakengard's clamps a vertex colour at zero with MAXx, and 0x00000027
+// has to come out as it went in, not as the zero a denormal counts for in
+// arithmetic. A NaN pattern is only a large number.
+PS2_VU_FORCE_INLINE float maxOfBits(float left, float right)
+{
+    int32_t a, b;
+    std::memcpy(&a, &left, sizeof(a));
+    std::memcpy(&b, &right, sizeof(b));
+    return ((a & b) < 0 ? a < b : a > b) ? left : right;
+}
+
+PS2_VU_FORCE_INLINE float miniOfBits(float left, float right)
+{
+    int32_t a, b;
+    std::memcpy(&a, &left, sizeof(a));
+    std::memcpy(&b, &right, sizeof(b));
+    return ((a & b) < 0 ? a > b : a < b) ? left : right;
+}
+
 PS2_VU_FORCE_INLINE float normalizeOperand(float value)
 {
     uint32_t bits = 0;
@@ -565,9 +586,9 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
     case 0x12:
     case 0x13: // MAXbc
     {
-        float bc = vt(op & 3);
+        const float bc = in.ft(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) > bc) ? vs(c) : bc;
+            result[c] = maxOfBits(in.fs(c), bc);
         sink.vf(fd, dest, result);
         return;
     }
@@ -576,9 +597,9 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
     case 0x16:
     case 0x17: // MINIbc
     {
-        float bc = vt(op & 3);
+        const float bc = in.ft(op & 3);
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) < bc) ? vs(c) : bc;
+            result[c] = miniOfBits(in.fs(c), bc);
         sink.vf(fd, dest, result);
         return;
     }
@@ -602,7 +623,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) > i()) ? vs(c) : i();
+            result[c] = maxOfBits(in.fs(c), in.i());
         sink.vf(fd, dest, result);
         return;
     case 0x1E: // MULi
@@ -613,7 +634,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) < i()) ? vs(c) : i();
+            result[c] = miniOfBits(in.fs(c), in.i());
         sink.vf(fd, dest, result);
         return;
     case 0x20: // ADDq
@@ -684,7 +705,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) > vt(c)) ? vs(c) : vt(c);
+            result[c] = maxOfBits(in.fs(c), in.ft(c));
         sink.vf(fd, dest, result);
         return;
     case 0x2C: // SUB
@@ -709,7 +730,7 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
-            result[c] = (vs(c) < vt(c)) ? vs(c) : vt(c);
+            result[c] = miniOfBits(in.fs(c), in.ft(c));
         sink.vf(fd, dest, result);
         return;
 

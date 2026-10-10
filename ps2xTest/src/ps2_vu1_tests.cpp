@@ -3820,6 +3820,64 @@ void register_ps2_vu1_tests()
         });
 #endif
 
+        tc.Run("MAX and MINI order raw bit patterns as sign-magnitude integers", [](TestCase &t)
+        {
+            // Programs clamp integers with these: a colour of 0x27 through
+            // MAXx against zero has to stay 0x27, though as a float it is a
+            // denormal that arithmetic treats as zero. Negative patterns
+            // order the other way round, and a NaN pattern is a big number.
+            const uint32_t left[4] = {0x00000027u, 0x80000027u, 0x7FC00000u, 0xC1200000u};  // 39, -39 (ints), NaN, -10.0
+            const uint32_t right[4] = {0x00000000u, 0x80000001u, 0x42C80000u, 0xC0A00000u}; // 0, -1 (int), 100.0, -5.0
+            const uint32_t wantMax[4] = {0x00000027u, 0x80000001u, 0x7FC00000u, 0xC0A00000u};
+            const uint32_t wantMini[4] = {0x00000000u, 0x80000027u, 0x42C80000u, 0xC1200000u};
+            for (bool compiled : {true, false})
+                for (auto unit : {VU1Interpreter::Unit::VU0, VU1Interpreter::Unit::VU1})
+                {
+                    Vu1Fixture fx;
+                    t.IsTrue(fx.initialize(), "MAX/MINI fixture initializes");
+                    if (unit == VU1Interpreter::Unit::VU0)
+                    {
+                        fx.code = fx.mem.getVU0Code();
+                        fx.data = fx.mem.getVU0Data();
+                    }
+                    const unsigned codeSize = unit == VU1Interpreter::Unit::VU1 ? PS2_VU1_CODE_SIZE : PS2_VU0_CODE_SIZE;
+                    const unsigned dataSize = unit == VU1Interpreter::Unit::VU1 ? PS2_VU1_DATA_SIZE : PS2_VU0_DATA_SIZE;
+                    // vf3 = MAX(vf1, vf2), vf4 = MINI(vf1, vf2), vf5 = MAXx(vf1, vf2), vf6 = MINIx(vf1, vf2),
+                    // vf7 = MAXi(vf1, I), vf8 = MINIi(vf1, I)
+                    writeVuInstructionPair(fx.code, 0u, 0x8000033cu, makeVuUpper(0x2Bu, 0xFu, 2u, 1u, 3u));
+                    writeVuInstructionPair(fx.code, 8u, 0x8000033cu, makeVuUpper(0x2Fu, 0xFu, 2u, 1u, 4u));
+                    writeVuInstructionPair(fx.code, 16u, 0x8000033cu, makeVuUpper(0x10u, 0xFu, 2u, 1u, 5u));
+                    writeVuInstructionPair(fx.code, 24u, 0x8000033cu, makeVuUpper(0x14u, 0xFu, 2u, 1u, 6u));
+                    writeVuInstructionPair(fx.code, 32u, 0x8000033cu, makeVuUpper(0x1Du, 0xFu, 0u, 1u, 7u));
+                    writeVuInstructionPair(fx.code, 40u, 0x8000033cu, makeVuUpper(0x1Fu, 0xFu, 0u, 1u, 8u) | 0x40000000u);
+                    writeVuInstructionPair(fx.code, 48u, 0x8000033cu, kVuUpperNop);
+
+                    VU1Interpreter vu(unit);
+                    vu.setCompiledExecutionEnabled(compiled);
+                    for (unsigned lane = 0; lane < 4u; ++lane)
+                    {
+                        vu.state().vf[1][lane] = std::bit_cast<float>(left[lane]);
+                        vu.state().vf[2][lane] = std::bit_cast<float>(right[lane]);
+                    }
+                    vu.state().i = std::bit_cast<float>(right[0]);
+                    vu.execute(fx.code, codeSize, fx.data, dataSize, fx.gs, &fx.mem, 0u, 0u, 0u, 64u);
+                    for (unsigned lane = 0; lane < 4u; ++lane)
+                    {
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[3][lane]), wantMax[lane], "MAX keeps the larger pattern");
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[4][lane]), wantMini[lane], "MINI keeps the smaller pattern");
+                        const uint32_t againstX = right[0]; // zero
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[5][lane]),
+                                 static_cast<int32_t>(left[lane]) > 0 ? left[lane] : againstX, "MAXx against zero");
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[6][lane]),
+                                 static_cast<int32_t>(left[lane]) > 0 ? againstX : left[lane], "MINIx against zero");
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[7][lane]),
+                                 static_cast<int32_t>(left[lane]) > 0 ? left[lane] : againstX, "MAXi against zero");
+                        t.Equals(std::bit_cast<uint32_t>(vu.state().vf[8][lane]),
+                                 static_cast<int32_t>(left[lane]) > 0 ? againstX : left[lane], "MINIi against zero");
+                    }
+                }
+        });
+
         tc.Run("reserved opcodes stop before executing or corrupting state", [](TestCase &t)
         {
             Vu1Fixture fx;
