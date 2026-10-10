@@ -10,6 +10,7 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_settings_menu.h"
+#include "runtime/gs/gs_gpu_renderer.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -755,15 +756,16 @@ namespace
     // The last tick whose frame the window thread has saved.
     std::atomic<uint64_t> g_frameDumpSavedTick{0};
 
-    void maybeDumpPresentedFrame(const uint8_t *rgba, uint32_t strideBytes, uint32_t width, uint32_t height, uint64_t tick)
+    // Whether the frame on display at this tick is one to save. Asked once
+    // a tick: ticks at or before it are done with afterwards, saved or not.
+    bool frameDumpDue(uint64_t tick)
     {
         const FrameDumpPlan &plan = frameDumpPlan();
-        // Ticks at or before this one are done with, saved or not.
         static uint64_t nextEveryTick = plan.everyTicks;
         static size_t nextAt = 0;
 
         if (plan.dir.empty())
-            return;
+            return false;
 
         bool due = false;
         if (plan.everyTicks != 0u && tick >= nextEveryTick)
@@ -777,7 +779,13 @@ namespace
             due = true;
             ++nextAt;
         }
-        if (!due)
+        return due;
+    }
+
+    void maybeDumpPresentedFrame(const uint8_t *rgba, uint32_t strideBytes, uint32_t width, uint32_t height, uint64_t tick)
+    {
+        const FrameDumpPlan &plan = frameDumpPlan();
+        if (!frameDumpDue(tick))
             return;
         if (!rgba || width == 0u || height == 0u)
         {
@@ -806,10 +814,6 @@ namespace
 // at its tick, whatever the host's speed: the emulation stops at a tick that
 // is to be dumped until the window thread has saved it (or stopped drawing).
 void ps2xSetGsBackgroundDrawing(const uint8_t *vram); // gs/gs_cpu_backend.cpp
-namespace GSGpu
-{
-    bool PrepareContext(); // gs/gs_gpu_renderer.cpp
-}
 
 void ps2xHoldForFrameDump(uint64_t tick)
 {
@@ -831,6 +835,11 @@ static void resizeFrameTexture(Texture2D &tex, int width, int height)
     UnloadImage(blank);
     SetTextureFilter(tex, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
 }
+
+// The picture when the graphics card has kept it (GSGpu::LatestShown): its
+// texture, which the window draws in place of the one frames are uploaded to.
+static Texture2D g_cardTexture{};
+static bool g_cardPicture = false;
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
@@ -858,6 +867,45 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
         return;
+    }
+
+    // Did the card show a picture for this latch? Then that is it.
+    {
+        static uint64_t s_shownSerial = 0u;
+        GSGpu::Shown shown;
+        g_cardPicture = needsLatch && GSGpu::LatestShown(shown) && shown.serial != s_shownSerial;
+        if (g_cardPicture)
+        {
+            s_shownSerial = shown.serial;
+            if (g_cardTexture.id != shown.texture || g_cardTexture.width != static_cast<int>(shown.width) ||
+                g_cardTexture.height != static_cast<int>(shown.height))
+            {
+                g_cardTexture.id = shown.texture;
+                g_cardTexture.width = static_cast<int>(shown.width);
+                g_cardTexture.height = static_cast<int>(shown.height);
+                g_cardTexture.mipmaps = 1;
+                g_cardTexture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+                SetTextureFilter(g_cardTexture, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            }
+            if (frameDumpDue(currentTick))
+            {
+                Image image = LoadImageFromTexture(g_cardTexture);
+                if (image.data)
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "/f_%07.2f.png", static_cast<double>(currentTick) / kTestVBlanksPerSecond);
+                    ExportImage(image, (frameDumpPlan().dir + name).c_str());
+                    UnloadImage(image);
+                }
+                g_frameDumpSavedTick.store(currentTick, std::memory_order_release);
+            }
+            outWidth = shown.width;
+            outHeight = shown.height;
+            s_lastWidth = outWidth;
+            s_lastHeight = outHeight;
+            s_hasUploadedFrame = true;
+            return;
+        }
     }
 
     s_scratch.clear();
@@ -1247,8 +1295,9 @@ bool PS2Runtime::initialize(const char *title)
         if (hostDisplay().fullscreen)
             ToggleBorderlessWindowed();
         // A second GL context beside the window's, for a GS drawn by the
-        // graphics card (display.renderer = gpu).
-        if (const char *renderer = ps2x::setting("PS2X_GS_RENDERER", "display.renderer"); renderer && std::strcmp(renderer, "gpu") == 0)
+        // graphics card (display.renderer = gpu or hybrid).
+        if (const char *renderer = ps2x::setting("PS2X_GS_RENDERER", "display.renderer");
+            renderer && (std::strcmp(renderer, "gpu") == 0 || std::strcmp(renderer, "hybrid") == 0))
             GSGpu::PrepareContext();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -3056,7 +3105,7 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        DrawTexturePro(g_cardPicture ? g_cardTexture : frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

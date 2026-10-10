@@ -26,11 +26,17 @@
 // - An alpha test that keeps part of a failing pixel (its colour but not
 //   its depth, say) is two passes as well: the pixels that pass, then the
 //   ones that fail with less written.
+// - The destination alpha test (draw only where the frame's alpha has, or
+//   has not, its top bit: a mask a game draws first) needs the frame's
+//   alpha in the shader, which may not read what it is drawing into: the
+//   pixels the primitive can touch are copied to a texture of their own
+//   first, and each such primitive is drawn by itself.
 
 #include "runtime/gs/gs_gpu_renderer.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdio>
@@ -72,6 +78,9 @@ namespace GSGpu
     void Renderer::Draw(const Pipeline &, const Vertex *, size_t) {}
     void Renderer::Flush() {}
     Reading Renderer::Read(uint32_t, int, int, int, int) { return {}; }
+    Reading Renderer::ReadBack(uint32_t, int, int, int, int) { return {}; }
+    Reading Renderer::Show(uint32_t, int, int, int, int) { return {}; }
+    bool LatestShown(Shown &) { return false; }
 }
 
 #else
@@ -85,6 +94,11 @@ namespace GSGpu
     namespace
     {
         std::atomic<GLFWwindow *> g_context{nullptr};
+
+        // What LatestShown gives: the renderer's thread writes one of two
+        // textures while the window may still be drawing the other.
+        std::mutex g_shownMutex;
+        Shown g_shown;
 
         const char *const kVertexShader = R"(#version 330 core
 layout(location = 0) in vec3 aPosition;
@@ -138,6 +152,8 @@ uniform int uBlendAlpha;    // 0 the pixel's alpha, 2 uFix
 uniform float uFix;
 uniform int uPabe;
 uniform int uFba;
+uniform sampler2D uFrame;   // a copy of what is being drawn into, for uDate
+uniform int uDate;          // 0 none, 1 draw where the frame's alpha is below 0x80, 2 where it is not
 
 int wrapTexel(int c, int mode, int size, int low, int high)
 {
@@ -228,6 +244,12 @@ void main()
         float f = floor(vFog + 0.02);
         rgb = floor(f * rgb / 256.0) + floor((255.0 - f) * uFogColour / 256.0);
     }
+    if (uDate != 0)
+    {
+        bool set = texelFetch(uFrame, ivec2(gl_FragCoord.xy), 0).a >= 0.5;
+        if (set != (uDate == 2))
+            discard;
+    }
     if (uAlphaTest != 0)
     {
         bool pass = uAtst == 2 ? a < uAref : uAtst == 3 ? a <= uAref : uAtst == 4 ? a == uAref
@@ -293,6 +315,8 @@ void main()
                 FillDepth,
                 Draw,
                 Read,
+                ReadBack,
+                Show,
             };
             Type type = Draw;
             SurfaceKind kind = SurfaceKind::Colour;
@@ -380,6 +404,13 @@ void main()
         return g_context.load() != nullptr;
     }
 
+    bool LatestShown(Shown &shown)
+    {
+        std::lock_guard<std::mutex> lock(g_shownMutex);
+        shown = g_shown;
+        return shown.texture != 0u;
+    }
+
     struct Renderer::Impl
     {
         // What the caller is putting together.
@@ -409,12 +440,19 @@ void main()
         GLuint program = 0, fillProgram = 0;
         GLuint vertexArray = 0, vertexBuffer = 0;
         GLuint nearest = 0, linear = 0;
-        GLuint scratchColour = 0, scratchDepth = 0;
+        GLuint scratchColour = 0, scratchDepth = 0, scratchFramebuffer = 0;
+        std::vector<float> readDepth;
+        struct
+        {
+            GLuint texture = 0, framebuffer = 0;
+            int width = 0, height = 0;
+        } shownAs[2], frameCopy;
+        int shownNext = 0;
         struct
         {
             GLint toClip, texture, textureMode, linear, tfx, tcc, wrap, region, texSize, texOrigin, texExtent, surfaceTexel,
                 texAlphaFixed, ta0, aem, fog, fogColour, alphaTest, atst, aref, output, blendSource, blendDest, blendAlpha, fix,
-                pabe, fba;
+                pabe, fba, frame, date;
         } at{};
         struct
         {
@@ -432,8 +470,10 @@ void main()
         void Allocate(Surface &surface);
         void DoResize(const Command &command);
         void DoFill(const Command &command, const Batch &batch);
-        void DoDraw(const Pipeline &pipeline, size_t first, size_t count);
+        void DoDraw(const Pipeline &pipeline, size_t first, size_t count, const Command &command);
         void DoRead(const Command &command);
+        void DoReadBack(const Command &command);
+        void DoShow(const Command &command);
 
         Command &Add(Command::Type type)
         {
@@ -542,7 +582,9 @@ void main()
         Batch &batch = impl.pending;
         // What is there times (1 + alpha) takes two passes that only come
         // out right a primitive at a time.
-        const bool alone = pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u;
+        // So does a destination alpha test, which sees the frame as it
+        // was before the primitive.
+        const bool alone = (pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u) || pipeline.date;
         if (!impl.drawing || alone || std::memcmp(&batch.pipelines.back(), &pipeline, sizeof(Pipeline)) != 0)
         {
             Command &command = impl.Add(Command::Draw);
@@ -550,6 +592,22 @@ void main()
             command.pipeline = static_cast<uint32_t>(batch.pipelines.size());
             batch.pipelines.push_back(pipeline);
             impl.drawing = true;
+            if (pipeline.date)
+            {
+                // The pixels it can touch, for the copy of the frame.
+                float x0 = vertices[0].x, y0 = vertices[0].y, x1 = x0, y1 = y0;
+                for (size_t i = 1; i < count; ++i)
+                {
+                    x0 = std::min(x0, vertices[i].x);
+                    y0 = std::min(y0, vertices[i].y);
+                    x1 = std::max(x1, vertices[i].x);
+                    y1 = std::max(y1, vertices[i].y);
+                }
+                command.x = std::max(static_cast<int>(std::floor(x0)), static_cast<int>(pipeline.scissor[0]));
+                command.y = std::max(static_cast<int>(std::floor(y0)), static_cast<int>(pipeline.scissor[1]));
+                command.width = std::min(static_cast<int>(std::ceil(x1)), pipeline.scissor[2] + 1) - command.x;
+                command.height = std::min(static_cast<int>(std::ceil(y1)), pipeline.scissor[3] + 1) - command.y;
+            }
         }
         batch.commands.back().count += count;
         batch.vertices.insert(batch.vertices.end(), vertices, vertices + count);
@@ -589,6 +647,36 @@ void main()
         Reading reading;
         reading.m_state = std::make_shared<Reading::State>();
         Command &command = m_impl->Add(Command::Read);
+        command.surface = surface;
+        command.x = x;
+        command.y = y;
+        command.width = width;
+        command.height = height;
+        command.reading = reading.m_state;
+        Flush();
+        return reading;
+    }
+
+    Reading Renderer::Show(uint32_t surface, int x, int y, int width, int height)
+    {
+        Reading reading;
+        reading.m_state = std::make_shared<Reading::State>();
+        Command &command = m_impl->Add(Command::Show);
+        command.surface = surface;
+        command.x = x;
+        command.y = y;
+        command.width = width;
+        command.height = height;
+        command.reading = reading.m_state;
+        Flush();
+        return reading;
+    }
+
+    Reading Renderer::ReadBack(uint32_t surface, int x, int y, int width, int height)
+    {
+        Reading reading;
+        reading.m_state = std::make_shared<Reading::State>();
+        Command &command = m_impl->Add(Command::ReadBack);
         command.surface = surface;
         command.x = x;
         command.y = y;
@@ -705,6 +793,8 @@ void main()
         PS2X_UNIFORM(fix, "uFix");
         PS2X_UNIFORM(pabe, "uPabe");
         PS2X_UNIFORM(fba, "uFba");
+        PS2X_UNIFORM(frame, "uFrame");
+        PS2X_UNIFORM(date, "uDate");
 #undef PS2X_UNIFORM
         fillAt.rect = glGetUniformLocation(fillProgram, "uRect");
         fillAt.size = glGetUniformLocation(fillProgram, "uSize");
@@ -745,6 +835,10 @@ void main()
         glBindTexture(GL_TEXTURE_2D, scratchDepth);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, kScratchSize, kScratchSize, 0, GL_RED, GL_FLOAT, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glGenFramebuffers(1, &scratchFramebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, scratchFramebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scratchColour, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -899,7 +993,7 @@ void main()
         }
     }
 
-    void Renderer::Impl::DoDraw(const Pipeline &p, size_t first, size_t count)
+    void Renderer::Impl::DoDraw(const Pipeline &p, size_t first, size_t count, const Command &command)
     {
         if (p.ztst == 0u)
             return;
@@ -1076,6 +1170,47 @@ void main()
         glUniform1f(at.fix, fix);
         glUniform1i(at.pabe, p.abe && p.pabe && blend == Blend::General && equation == GL_FUNC_ADD ? 1 : 0);
         glUniform1i(at.fba, p.fba && !p.frameAlphaOne ? 1 : 0);
+        if (p.date && !p.frameAlphaOne && command.width > 0 && command.height > 0)
+        {
+            const int pixelsWide = colour->width * colour->scaleX, pixelsHigh = colour->height * colour->scaleY;
+            if (frameCopy.texture == 0u || frameCopy.width < pixelsWide || frameCopy.height < pixelsHigh)
+            {
+                if (frameCopy.texture == 0u)
+                {
+                    glGenTextures(1, &frameCopy.texture);
+                    glGenFramebuffers(1, &frameCopy.framebuffer);
+                }
+                frameCopy.width = std::max(frameCopy.width, pixelsWide);
+                frameCopy.height = std::max(frameCopy.height, pixelsHigh);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, frameCopy.texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameCopy.width, frameCopy.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glBindFramebuffer(GL_FRAMEBUFFER, frameCopy.framebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frameCopy.texture, 0);
+                glActiveTexture(GL_TEXTURE0);
+            }
+            const int left = command.x * colour->scaleX, top = command.y * colour->scaleY;
+            const int right = std::min((command.x + command.width) * colour->scaleX, pixelsWide);
+            const int bottom = std::min((command.y + command.height) * colour->scaleY, pixelsHigh);
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, FramebufferFor(p.colour, 0u));
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, frameCopy.framebuffer);
+            glBlitFramebuffer(left, top, right, bottom, left, top, right, bottom, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(p.colour, depthUsed ? p.depth : 0u));
+            glEnable(GL_SCISSOR_TEST);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, frameCopy.texture);
+            glBindSampler(1, nearest);
+            glActiveTexture(GL_TEXTURE0);
+            glUniform1i(at.frame, 1);
+            glUniform1i(at.date, p.datm ? 2 : 1);
+        }
+        else
+        {
+            glUniform1i(at.date, 0);
+        }
 
         if (depthUsed)
         {
@@ -1196,13 +1331,156 @@ void main()
         state.ready.notify_all();
     }
 
+    // The game's pixels of a surface: colour scaled down into the scratch
+    // texture and read from there, depth read at full size and one in
+    // every so many kept.
+    void Renderer::Impl::DoReadBack(const Command &command)
+    {
+        Reading::State &state = *command.reading;
+        std::vector<uint8_t> pixels;
+        bool good = false;
+        const Surface *surface = failed ? nullptr : Find(command.surface);
+        const int width = command.width, height = command.height;
+        if (surface && surface->kind != SurfaceKind::Texture && width > 0 && height > 0 && command.x >= 0 && command.y >= 0 &&
+            command.x + width <= surface->width && command.y + height <= surface->height && width <= kScratchSize)
+        {
+            pixels.assign(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0u);
+            const int sx = surface->scaleX, sy = surface->scaleY;
+            glDisable(GL_SCISSOR_TEST);
+            if (surface->kind == SurfaceKind::Colour)
+            {
+                if (sx == 1 && sy == 1)
+                {
+                    glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(command.surface, 0));
+                    glReadPixels(command.x, command.y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+                }
+                else
+                {
+                    const GLuint from = FramebufferFor(command.surface, 0);
+                    for (int done = 0; done < height; done += kScratchSize)
+                    {
+                        const int rows = std::min(height - done, kScratchSize);
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, from);
+                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scratchFramebuffer);
+                        glBlitFramebuffer(command.x * sx, (command.y + done) * sy, (command.x + width) * sx, (command.y + done + rows) * sy, 0, 0,
+                                          width, rows, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                        glBindFramebuffer(GL_FRAMEBUFFER, scratchFramebuffer);
+                        glReadPixels(0, 0, width, rows, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data() + static_cast<size_t>(done) * width * 4u);
+                    }
+                }
+            }
+            else
+            {
+                readDepth.resize(static_cast<size_t>(width) * sx * static_cast<size_t>(height) * sy);
+                glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(0, command.surface));
+                glReadPixels(command.x * sx, command.y * sy, width * sx, height * sy, GL_DEPTH_COMPONENT, GL_FLOAT, readDepth.data());
+                float *out = reinterpret_cast<float *>(pixels.data());
+                for (int y = 0; y < height; ++y)
+                {
+                    const float *row = readDepth.data() + (static_cast<size_t>(y) * sy + sy / 2) * (static_cast<size_t>(width) * sx);
+                    for (int x = 0; x < width; ++x)
+                        *out++ = row[static_cast<size_t>(x) * sx + sx / 2];
+                }
+            }
+            good = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.pixels.swap(pixels);
+            state.width = static_cast<uint32_t>(width);
+            state.height = static_cast<uint32_t>(height);
+            state.good = good;
+            state.done = true;
+        }
+        state.ready.notify_all();
+    }
+
+    // Part of a surface copied to the texture the window draws next, made
+    // opaque (the frame buffer's alpha is the game's business), and handed
+    // over once the card has been told all of it.
+    void Renderer::Impl::DoShow(const Command &command)
+    {
+        Reading::State &state = *command.reading;
+        bool good = false;
+        uint32_t width = 0, height = 0;
+        const Surface *surface = failed ? nullptr : Find(command.surface);
+        if (surface && surface->kind == SurfaceKind::Colour && command.width > 0 && command.height > 0)
+        {
+            width = static_cast<uint32_t>(command.width * surface->scaleX);
+            height = static_cast<uint32_t>(command.height * surface->scaleY);
+            auto &target = shownAs[shownNext];
+            if (target.texture == 0u || target.width != static_cast<int>(width) || target.height != static_cast<int>(height))
+            {
+                if (target.texture == 0u)
+                {
+                    glGenTextures(1, &target.texture);
+                    glGenFramebuffers(1, &target.framebuffer);
+                }
+                target.width = static_cast<int>(width);
+                target.height = static_cast<int>(height);
+                glBindTexture(GL_TEXTURE_2D, target.texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, target.width, target.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.texture, 0);
+            }
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            // What of it the surface has; the rest stays black.
+            const int x = command.x * surface->scaleX, y = command.y * surface->scaleY;
+            const int across = std::min(static_cast<int>(width), surface->width * surface->scaleX - x);
+            const int down = std::min(static_cast<int>(height), surface->height * surface->scaleY - y);
+            if (across > 0 && down > 0 && x >= 0 && y >= 0)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, FramebufferFor(command.surface, 0));
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target.framebuffer);
+                glBlitFramebuffer(x, y, x + across, y + down, 0, 0, across, down, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            }
+            glFlush();
+            {
+                std::lock_guard<std::mutex> lock(g_shownMutex);
+                g_shown.texture = target.texture;
+                g_shown.width = width;
+                g_shown.height = height;
+                ++g_shown.serial;
+            }
+            shownNext ^= 1;
+            good = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            state.width = width;
+            state.height = height;
+            state.good = good;
+            state.done = true;
+        }
+        state.ready.notify_all();
+    }
+
     void Renderer::Impl::Execute(Batch &batch)
     {
         if (failed)
         {
             for (const Command &command : batch.commands)
+            {
                 if (command.type == Command::Read)
                     DoRead(command);
+                else if (command.type == Command::ReadBack)
+                    DoReadBack(command);
+                else if (command.type == Command::Show)
+                    DoShow(command);
+            }
             return;
         }
         ++batches;
@@ -1278,10 +1556,16 @@ void main()
                 DoFill(command, batch);
                 break;
             case Command::Draw:
-                DoDraw(batch.pipelines[command.pipeline], command.first, command.count);
+                DoDraw(batch.pipelines[command.pipeline], command.first, command.count, command);
                 break;
             case Command::Read:
                 DoRead(command);
+                break;
+            case Command::ReadBack:
+                DoReadBack(command);
+                break;
+            case Command::Show:
+                DoShow(command);
                 break;
             }
         }

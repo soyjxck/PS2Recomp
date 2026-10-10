@@ -3460,7 +3460,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     // By the graphics card when it keeps the copy (of anything it can: a
     // 16-bit frame stays VRAM's alone), at any size.
     const bool card = GpuReady() && p.frameKind != FrameKind::C16;
-    const bool twice = (card || scale.larger()) && !p.frame.spillsIntoNextPage && !p.depth.spillsIntoNextPage;
+    const bool twice = (card || (!m_gpu && scale.larger())) && !p.frame.spillsIntoNextPage && !p.depth.spillsIntoNextPage;
     const bool depthUsed = !p.zmask || p.ztst >= 2u;
     const uint64_t cardFrame = card ? GpuKey(p.frame, scale, -1) : 0u;
     const uint64_t cardDepth = card ? GpuKey(p.depth, scale, static_cast<int>(p.depthKind)) : 0u;
@@ -3477,6 +3477,10 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         {
             if (!PagesStale(layout, key, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY))
                 return;
+            // Pages another of the card's surfaces has, and VRAM has not.
+            GpuAdopt(layout, key, depthKind, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, overwritten);
+            if (!PagesStale(layout, key, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY))
+                return;
             if (overwritten)
             {
                 // Only the pages it covers part of need VRAM's pixels.
@@ -3490,6 +3494,16 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         fill(p.frame, cardFrame, -1, overFrame);
         if (depthUsed)
             fill(p.depth, cardDepth, static_cast<int>(p.depthKind), overDepth);
+    }
+    else if (m_gpu)
+    {
+        // Drawn into VRAM alone: VRAM has to have what the card drew there,
+        // and in the texture.
+        GpuDownload(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, 2);
+        if (depthUsed)
+            GpuDownload(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, 2);
+        if (p.tme && !p.decoded)
+            GpuDownload(p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1, 2);
     }
     else if (twice)
     {
@@ -3519,14 +3533,22 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
             FillShadow(p.depth, scale, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
         }
     }
-    MarkWritten(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+    // The card alone: VRAM is not drawn into, and is behind from here on.
+    const bool cardOnly = twice && card && m_cardOnly;
+    MarkWritten(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, !cardOnly);
     if (!p.zmask)
-        MarkWritten(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        MarkWritten(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY, !cardOnly);
     if (twice && card)
     {
         MarkPages(p.frame, cardFrame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
         if (!p.zmask)
             MarkPages(p.depth, cardDepth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        if (cardOnly)
+        {
+            SetCardAhead(p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+            if (!p.zmask)
+                SetCardAhead(p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        }
     }
     else if (twice)
     {
@@ -3544,6 +3566,8 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         queue.run("direct");
         if (twice && card)
             GpuDraw(batch, primitive, scale);
+        if (cardOnly)
+            return true;
         Rasterise(primitive, primitive.minY, primitive.maxY);
         if (twice && !card)
         {
@@ -3551,6 +3575,12 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
             PrepareBlit(primitive, ctx);
             Rasterise(primitive, primitive.minY, primitive.maxY);
         }
+        return true;
+    }
+
+    if (cardOnly)
+    {
+        GpuDraw(batch, primitive, scale);
         return true;
     }
 

@@ -1,15 +1,33 @@
-// Part of gs_cpu_raster.cpp: the larger copy of the frame and depth buffers
-// kept and drawn by the graphics card (GSGpu::Renderer) instead of in
-// m_shadow by the raster pool.
+// Part of gs_cpu_raster.cpp: the frame and depth buffers kept and drawn by
+// the graphics card (GSGpu::Renderer), at whatever size is asked for.
 //
-// VRAM itself is drawn as ever, by the pool, and stays what everything
-// else reads. What the card has is accounted for as the shadow is (see
-// GSCpuBackend::m_shadow): a page of a surface is good while the last thing
-// written to the VRAM page was a primitive drawn into both, and is filled
-// from VRAM again otherwise. Each (base, width, pixel arrangement, scale)
-// a buffer has been drawn as is a surface of its own, so two buffers that
-// share pages at different times do not write over one another; the page
-// table says whose turn it is.
+// Each (base, width, pixel arrangement, scale) a buffer has been drawn as
+// is a surface of the card's. Which surface has what is accounted for a
+// VRAM page at a time, in the table the software shadow uses
+// (m_shadowSerial, m_shadowKey: see GSCpuBackend::m_shadow): a page of a
+// surface is good while the last thing written to the page was a primitive
+// drawn into that surface.
+//
+// With display.renderer = hybrid the raster pool draws every primitive
+// into VRAM as ever, and the card draws it again into its surface. A page
+// something else wrote (an image, a clear) is filled from VRAM before the
+// card next draws there or shows it.
+//
+// With display.renderer = gpu the card draws alone. VRAM then gets the
+// images the game sends and nothing of what is drawn: a page the card
+// drew into is VRAM's to catch up on (m_cardAhead), and is brought back
+// (GpuDownload) only for something that reads those pixels there. Much of
+// what looks like such a reader is not one:
+//
+// - A game keeps textures and draws by turns in the same memory. Pages
+//   that pass between buffers whose pixels are laid out differently (a
+//   256-wide frame buffer and a 128-wide one, a frame buffer and a
+//   texture) hold nothing either can use of the other's: they change
+//   hands as they are (GpuAdopt, GpuUploading, the texture path).
+// - What the card alone drew does not count as drawn where VRAM's
+//   contents are concerned (MarkWritten's inVram): a texture sent again
+//   because the game drew over it is, in VRAM, still there, and the
+//   transfer is skipped as any repeated one is.
 //
 // A primitive's texture is, in order of preference:
 //
@@ -37,6 +55,13 @@ struct GSCpuBackend::GpuState
         double worst = 0.0; // PS2X_GPU_COMPARE: the largest share of pixels found wrong
     };
     std::unordered_map<uint64_t, Surface> surfaces; // by GpuKey
+    // The frame and the depth buffer last asked for: the next primitive's, nearly always.
+    struct
+    {
+        uint64_t key = 0;
+        Surface *surface = nullptr;
+    } recent[2];
+    Surface *last = nullptr;
 
     // Texels decoded from VRAM.
     struct Texture
@@ -59,8 +84,24 @@ struct GSCpuBackend::GpuState
     };
     std::vector<Cell> cells;
 
+    std::vector<uint32_t> pages;
+    // Why pages went back to VRAM, for PS2X_GS_STATS.
+    enum Why
+    {
+        WhyTexture,
+        WhyClut,
+        WhySoftware,
+        WhyOtherSurface,
+        WhyImage,
+        WhyDisplay,
+        WhyEverything,
+        WhyCount,
+    };
+    Why why = WhyEverything;
+    uint64_t statWhy[WhyCount]{};
+
     uint64_t statDraws = 0, statSurfaceTextures = 0, statCopyTextures = 0, statVramTextures = 0, statDecodes = 0, statUploads = 0,
-             statFills = 0, statFilledPages = 0;
+             statFills = 0, statFilledPages = 0, statDownloads = 0, statDownloadedPages = 0, statDropped = 0, statAdopted = 0;
 };
 
 void GSCpuBackend::GpuStateDeleter::operator()(GpuState *state) const
@@ -68,13 +109,24 @@ void GSCpuBackend::GpuStateDeleter::operator()(GpuState *state) const
     delete state;
 }
 
-// display.renderer = gpu | software (PS2X_GS_RENDERER).
+// display.renderer = gpu | hybrid | software (PS2X_GS_RENDERER).
 bool GSCpuBackend::GpuSetting()
 {
     static const bool wanted = []
     {
         const char *value = ps2x::setting("PS2X_GS_RENDERER", "display.renderer");
-        return value != nullptr && (std::strcmp(value, "gpu") == 0 || std::strcmp(value, "GPU") == 0);
+        return value != nullptr && (std::strcmp(value, "gpu") == 0 || std::strcmp(value, "hybrid") == 0);
+    }();
+    return wanted;
+}
+
+// The card alone: gpu, unless the two are to be compared.
+bool GSCpuBackend::GpuOnlySetting()
+{
+    static const bool wanted = []
+    {
+        const char *value = ps2x::setting("PS2X_GS_RENDERER", "display.renderer");
+        return value != nullptr && std::strcmp(value, "gpu") == 0 && std::getenv("PS2X_GPU_COMPARE") == nullptr;
     }();
     return wanted;
 }
@@ -91,6 +143,7 @@ bool GSCpuBackend::GpuReady()
             {
                 m_gpu.reset(new GpuState());
                 m_gpu->renderer = std::move(renderer);
+                m_cardOnly = GpuOnlySetting();
             }
             else
             {
@@ -152,7 +205,15 @@ uint32_t GSCpuBackend::GpuSurface(const GSMem::SurfaceLayout &layout, SurfaceSca
     const int pageRows = 1 << layout.pageHeightShift;
     rows = std::min(((std::max(rows, 1) + pageRows - 1) / pageRows) * pageRows, 2048);
     const int width = static_cast<int>(layout.pagesPerRow) << layout.pageWidthShift;
-    GpuState::Surface &surface = gpu.surfaces[GpuKey(layout, scale, depthKind)];
+    const uint64_t key = GpuKey(layout, scale, depthKind);
+    auto &recent = gpu.recent[depthKind < 0 ? 0 : 1];
+    if (recent.key != key || !recent.surface)
+    {
+        recent.key = key;
+        recent.surface = &gpu.surfaces[key];
+    }
+    GpuState::Surface &surface = *recent.surface;
+    gpu.last = &surface;
     if (surface.id == 0u)
     {
         surface.id = gpu.renderer->NewSurface(depthKind < 0 ? GSGpu::SurfaceKind::Colour : GSGpu::SurfaceKind::Depth, width, rows, scale.x, scale.y);
@@ -262,6 +323,333 @@ void GSCpuBackend::GpuFill(const GSMem::SurfaceLayout &layout, SurfaceScale scal
     gpu.statFilledPages += gpu.cells.size();
 }
 
+void GSCpuBackend::SetCardAhead(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t, uint32_t)
+                  {
+                      if (!m_cardAhead[page])
+                      {
+                          m_cardAhead[page] = 1u;
+                          ++m_cardAheadCount;
+                      }
+                  });
+}
+
+namespace
+{
+    // fn(block) for each 256-byte block of VRAM pixels (x0, y0)..(x1, y1)
+    // of a surface have a part in (gs_cpu_backend.cpp's forEachBlock).
+    template <typename Fn>
+    void forEachImageBlock(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, Fn &&fn)
+    {
+        const uint32_t tileW = layout.unitBits == 32u ? 8u : (layout.unitBits == 4u ? 32u : 16u);
+        const uint32_t tileH = layout.unitBits >= 16u ? 8u : 16u;
+        const uint32_t firstX = static_cast<uint32_t>(std::max(x0, 0)) & ~(tileW - 1u);
+        const uint32_t firstY = static_cast<uint32_t>(std::max(y0, 0)) & ~(tileH - 1u);
+        for (uint32_t y = firstY; y <= static_cast<uint32_t>(std::max(y1, 0)); y += tileH)
+            for (uint32_t x = firstX; x <= static_cast<uint32_t>(std::max(x1, 0)); x += tileW)
+                fn(((layout.unit(x, y) * layout.unitBits) >> 11) & 0x3FFFu);
+    }
+
+    // Whether two buffers lay the same kind of pixel out in rows of the same
+    // width, starting at the same column: what one holds means something to
+    // the other. (A frame buffer and a texture, a narrow buffer and a wide
+    // one, or two that start in different columns share pages at
+    // different times: each finds the other's pixels scrambled, and the
+    // game cannot be counting on them.)
+    inline bool sameShape(const GSMem::SurfaceLayout &a, bool aDepth, const GSMem::SurfaceLayout &b, bool bDepth)
+    {
+        return aDepth == bDepth && a.unitBits == b.unitBits && a.pagesPerRow == b.pagesPerRow && a.pageWidthShift == b.pageWidthShift &&
+               a.pageHeightShift == b.pageHeightShift &&
+               (a.basePage + kPageCount - b.basePage % kPageCount) % std::max<uint32_t>(a.pagesPerRow, 1u) == 0u;
+    }
+
+    // The same, as a number to keep: for telling later whether an image
+    // stored in a page was pixels of the kind a buffer there holds.
+    inline uint32_t shapeOf(const GSMem::SurfaceLayout &layout, bool depth)
+    {
+        const uint32_t columns = std::max<uint32_t>(layout.pagesPerRow, 1u);
+        return static_cast<uint32_t>(layout.unitBits) | (columns << 8) | ((layout.basePage % columns) << 16) |
+               (static_cast<uint32_t>(layout.pageWidthShift) << 24) | (depth ? 0x80000000u : 0u);
+    }
+}
+
+// Before the card draws into pages of a buffer that are not good for its
+// surface: the ones only another surface has. If the primitive writes every
+// pixel of a page, or the other buffer's pixels mean nothing to this one,
+// the page simply changes hands; otherwise VRAM is brought up to date, for
+// GpuFill to take them from.
+void GSCpuBackend::GpuAdopt(const GSMem::SurfaceLayout &layout, uint64_t key, int depthKind, int x0, int y0, int x1, int y1, bool overwritten)
+{
+    GpuState &gpu = *m_gpu;
+    const int pageWidth = 1 << layout.pageWidthShift, pageHeight = 1 << layout.pageHeightShift;
+    const uint32_t shape = shapeOf(layout, depthKind >= 0);
+    gpu.pages.clear();
+    forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t row, uint32_t column)
+                  {
+                      if (PageGood(page, key))
+                          return;
+                      if (!m_cardAhead[page])
+                      {
+                          // VRAM's, then. If the last thing stored there was
+                          // an image of another kind (a texture, where the
+                          // game keeps textures and draws by turns), its
+                          // bytes are no pixels of this buffer's: it has
+                          // what it had.
+                          if (m_pageUploadSerial[page] == m_pageSerial[page] && m_pageUploadShape[page] != shape && m_shadowKey[page] != 0u)
+                          {
+                              m_shadowSerial[page] = m_pageSerial[page];
+                              m_shadowKey[page] = key;
+                              ++gpu.statAdopted;
+                          }
+                          return;
+                      }
+                      const int left = static_cast<int>(column) * pageWidth, top = static_cast<int>(row) * pageHeight;
+                      const bool whole = overwritten && left >= x0 && top >= y0 && left + pageWidth - 1 <= x1 && top + pageHeight - 1 <= y1;
+                      const auto owner = gpu.surfaces.find(m_shadowKey[page]);
+                      if (!whole && owner != gpu.surfaces.end() &&
+                          sameShape(owner->second.layout, owner->second.depthKind >= 0, layout, depthKind >= 0))
+                      {
+                          gpu.pages.push_back(page);
+                          return;
+                      }
+                      m_shadowSerial[page] = m_pageSerial[page];
+                      m_shadowKey[page] = key;
+                      ++gpu.statAdopted;
+                  });
+    if (!gpu.pages.empty())
+    {
+        gpu.why = GpuState::WhyOtherSurface;
+        GpuDownloadPages(gpu.pages);
+    }
+}
+
+// Brings VRAM the pages of these pixels that only the card has (other than
+// those of the surface with `exceptKey`).
+void GSCpuBackend::GpuDownload(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, int why, uint64_t exceptKey,
+                               bool sameShapeOnly)
+{
+    if (!m_gpu || m_cardAheadCount == 0u || !layout.table)
+        return;
+    GpuState &gpu = *m_gpu;
+    gpu.why = static_cast<GpuState::Why>(why);
+    gpu.pages.clear();
+    // By the block: which pages the pixels are really in, wherever the
+    // surface starts.
+    uint32_t last = ~0u;
+    forEachImageBlock(layout, x0, y0, x1, y1, [&](uint32_t block)
+                      {
+                          const uint32_t page = (block >> 5) % kPageCount;
+                          if (page == last)
+                              return;
+                          last = page;
+                          if (!m_cardAhead[page] || m_shadowKey[page] == exceptKey)
+                              return;
+                          if (sameShapeOnly)
+                          {
+                              // For a texture: a buffer of another kind has
+                              // nothing in these bytes that is texels.
+                              const auto owner = gpu.surfaces.find(m_shadowKey[page]);
+                              if (owner != gpu.surfaces.end() && !sameShape(owner->second.layout, false, layout, false))
+                                  return;
+                          }
+                          gpu.pages.push_back(page);
+                      });
+    if (!gpu.pages.empty())
+        GpuDownloadPages(gpu.pages);
+}
+
+void GSCpuBackend::GpuDownloadAll()
+{
+    if (!m_gpu || m_cardAheadCount == 0u)
+        return;
+    GpuState &gpu = *m_gpu;
+    gpu.pages.clear();
+    for (uint32_t page = 0; page < kPageCount; ++page)
+        if (m_cardAhead[page])
+            gpu.pages.push_back(page);
+    gpu.why = GpuState::WhyEverything;
+    GpuDownloadPages(gpu.pages);
+}
+
+// The pages listed, each from the surface that has it: read back at the
+// game's size and stored in VRAM the way the buffer lays its pixels out.
+// Waits for the card.
+void GSCpuBackend::GpuDownloadPages(std::vector<uint32_t> &pages)
+{
+    GpuState &gpu = *m_gpu;
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    while (!pages.empty())
+    {
+        // Everything listed that the same surface has, in one piece.
+        const uint64_t key = m_shadowKey[pages.back()];
+        const auto found = gpu.surfaces.find(key);
+        std::vector<uint32_t> mine;
+        for (auto page = pages.begin(); page != pages.end();)
+        {
+            if (m_shadowKey[*page] == key)
+            {
+                mine.push_back(*page);
+                page = pages.erase(page);
+            }
+            else
+            {
+                ++page;
+            }
+        }
+        auto release = [&]
+        {
+            for (uint32_t page : mine)
+            {
+                if (m_cardAhead[page])
+                {
+                    m_cardAhead[page] = 0u;
+                    --m_cardAheadCount;
+                }
+            }
+        };
+        if (found == gpu.surfaces.end())
+        {
+            release();
+            continue;
+        }
+        const GpuState::Surface &surface = found->second;
+        const GSMem::SurfaceLayout &layout = surface.layout;
+        const int pageWidth = 1 << layout.pageWidthShift, pageHeight = 1 << layout.pageHeightShift;
+        const uint32_t columns = std::max<uint32_t>(layout.pagesPerRow, 1u);
+        uint32_t firstRow = ~0u, lastRow = 0u, firstColumn = ~0u, lastColumn = 0u;
+        auto place = [&](uint32_t page, uint32_t &row, uint32_t &column)
+        {
+            const uint32_t offset = (page + kPageCount - layout.basePage % kPageCount) % kPageCount;
+            row = offset / columns;
+            column = offset % columns;
+        };
+        for (uint32_t page : mine)
+        {
+            uint32_t row, column;
+            place(page, row, column);
+            firstRow = std::min(firstRow, row);
+            lastRow = std::max(lastRow, row);
+            firstColumn = std::min(firstColumn, column);
+            lastColumn = std::max(lastColumn, column);
+        }
+        const int left = static_cast<int>(firstColumn) * pageWidth, top = static_cast<int>(firstRow) * pageHeight;
+        const int width = static_cast<int>(lastColumn - firstColumn + 1u) * pageWidth;
+        const int height = std::min(static_cast<int>(lastRow - firstRow + 1u) * pageHeight, surface.height - top);
+        std::vector<uint8_t> got;
+        uint32_t gotWidth = 0, gotHeight = 0;
+        GSGpu::Reading reading = height > 0 ? gpu.renderer->ReadBack(surface.id, left, top, width, height) : GSGpu::Reading();
+        if (reading && reading.Wait(got, gotWidth, gotHeight) && gotWidth == static_cast<uint32_t>(width))
+        {
+            const bool depth = surface.depthKind >= 0;
+            for (uint32_t page : mine)
+            {
+                uint32_t pageRow, pageColumn;
+                place(page, pageRow, pageColumn);
+                for (int py = 0; py < pageHeight; ++py)
+                {
+                    const int y = static_cast<int>(pageRow) * pageHeight + py;
+                    if (y - top >= static_cast<int>(gotHeight))
+                        break;
+                    const FastPipeline::Row row = FastPipeline::rowOf(layout, y);
+                    const uint8_t *from = got.data() + (static_cast<size_t>(y - top) * gotWidth +
+                                                        static_cast<size_t>(static_cast<int>(pageColumn) * pageWidth - left)) * 4u;
+                    for (int px = 0; px < pageWidth; ++px, from += 4)
+                    {
+                        const uint32_t unit = FastPipeline::unitIn(layout, row, static_cast<int>(pageColumn) * pageWidth + px);
+                        if (!depth)
+                        {
+                            std::memcpy(m_vram + ((unit * 4u) & (kVramMask - 3u)), from, 4u);
+                            continue;
+                        }
+                        float fraction;
+                        std::memcpy(&fraction, from, sizeof(fraction));
+                        if (layout.unitBits == 16u)
+                        {
+                            const uint16_t z = static_cast<uint16_t>(std::min(static_cast<double>(fraction) * 65536.0 + 0.5, 65535.0));
+                            std::memcpy(m_vram + ((unit * 2u) & (kVramMask - 1u)), &z, sizeof(z));
+                        }
+                        else if (surface.depthKind == static_cast<int>(DepthKind::Z24))
+                        {
+                            const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(fraction) * 16777216.0 + 0.5, 16777215.0));
+                            uint32_t there;
+                            std::memcpy(&there, m_vram + ((unit * 4u) & (kVramMask - 3u)), sizeof(there));
+                            there = (there & 0xFF000000u) | z;
+                            std::memcpy(m_vram + ((unit * 4u) & (kVramMask - 3u)), &there, sizeof(there));
+                        }
+                        else
+                        {
+                            const uint32_t z = static_cast<uint32_t>(std::min(static_cast<double>(fraction) * 4294967296.0 + 0.5, 4294967295.0));
+                            std::memcpy(m_vram + ((unit * 4u) & (kVramMask - 3u)), &z, sizeof(z));
+                        }
+                    }
+                }
+            }
+            // VRAM has changed under whatever was read from these pages.
+            ++m_writeSerial;
+            for (uint32_t page : mine)
+                m_pageVramDrawSerial[page] = m_writeSerial;
+            ++gpu.statDownloads;
+            ++gpu.statWhy[gpu.why];
+            gpu.statDownloadedPages += mine.size();
+        }
+        release();
+    }
+}
+
+// An image is about to be stored in these pixels of VRAM. A page of them
+// that only the card has is brought to VRAM first if the image is pixels
+// of the kind its surface holds (part of a frame buffer redrawn by hand),
+// and otherwise given up: the game is using that memory for something
+// else now.
+void GSCpuBackend::GpuUploading(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    if (!m_gpu || m_cardAheadCount == 0u || !layout.table)
+        return;
+    GpuState &gpu = *m_gpu;
+    gpu.pages.clear();
+    // By the block, as MarkUploaded does: an image may be taken to reach a
+    // page it has nothing in.
+    uint32_t last = ~0u;
+    forEachImageBlock(layout, x0, y0, x1, y1, [&](uint32_t block)
+                      {
+                          const uint32_t page = (block >> 5) % kPageCount;
+                          if (page == last || !m_cardAhead[page])
+                              return;
+                          last = page;
+                          const auto owner = gpu.surfaces.find(m_shadowKey[page]);
+                          if (owner != gpu.surfaces.end() && owner->second.depthKind < 0 && layout.unitBits == 32u &&
+                              owner->second.layout.pagesPerRow == layout.pagesPerRow)
+                          {
+                              gpu.pages.push_back(page);
+                              return;
+                          }
+                          m_cardAhead[page] = 0u;
+                          --m_cardAheadCount;
+                          ++gpu.statDropped;
+                      });
+    if (!gpu.pages.empty())
+    {
+        gpu.why = GpuState::WhyImage;
+        GpuDownloadPages(gpu.pages);
+    }
+}
+
+// From MarkUploaded, for each block an image is stored in.
+void GSCpuBackend::NoteUploadShape(const GSMem::SurfaceLayout &layout, uint32_t block)
+{
+    const uint32_t page = (block >> 5) % kPageCount;
+    m_pageUploadSerial[page] = m_writeSerial;
+    m_pageUploadShape[page] = shapeOf(layout, false);
+}
+
+void GSCpuBackend::FlushForVram(const char *why)
+{
+    FlushPrimitives(why);
+    GpuDownloadAll();
+}
+
 void GSCpuBackend::GpuForgetTexture(uint32_t texture)
 {
     if (m_gpu && texture != 0u)
@@ -327,6 +715,7 @@ void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
             y1 = std::max(y1, texture.y1);
         }
         FlushPrimitivesTouching(p.texture, x0, y0, x1, y1, false, "texture");
+        GpuDownload(p.texture, x0, y0, x1, y1, GpuState::WhyTexture, 0u, true);
         const int width = x1 - x0 + 1, height = y1 - y0 + 1;
         gpu.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
         uint32_t *out = gpu.pixels.data();
@@ -399,13 +788,16 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
 
     // A frame buffer the card has, laid out as the texture is, with the
     // pages the primitive samples good.
-    if ((p.texKind == TextureKind::Direct32 || p.texKind == TextureKind::Direct24) && (ctx.tex0.tbp0 & 31u) == 0u && !p.textureIsTarget &&
+    // (Not the surface being drawn into: the card cannot read what it is
+    // writing. Sharing pages with it by the texture's nominal size, which
+    // is what textureIsTarget goes by, is nothing to the card.)
+    if ((p.texKind == TextureKind::Direct32 || p.texKind == TextureKind::Direct24) && (ctx.tex0.tbp0 & 31u) == 0u &&
         !p.texture.spillsIntoNextPage)
     {
         const SurfaceScale from = ScaleOf(ctx.tex0.tbp0 >> 5, ctx.tex0.tbw);
         const uint64_t key = GpuKey(p.texture, from, -1);
         const auto found = gpu.surfaces.find(key);
-        if (found != gpu.surfaces.end())
+        if (found != gpu.surfaces.end() && found->second.id != state.colour)
         {
             const int lastU = std::min(p.sampledU1, found->second.width - 1), lastV = std::min(p.sampledV1, found->second.height - 1);
             if (p.sampledU0 <= lastU && p.sampledV0 <= lastV &&
@@ -418,10 +810,12 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
                 state.aem = p.texa.aem ? 1u : 0u;
                 if (q.sprite)
                 {
-                    // No further than the texels the sprite names: filtering
-                    // reaches half a texel past them, and below a frame
-                    // buffer is some other surface.
-                    state.texExtent[0] = static_cast<int16_t>(std::min(p.texW, std::max(static_cast<int>(std::ceil(std::max(q.tu0, q.tu1))), 1)));
+                    // Down to the last row the sprite names and no further:
+                    // filtering reaches half a texel past it, and below a
+                    // frame buffer's picture the surface may hold anything.
+                    // (Not across: a picture copied in strips side by side
+                    // has the next strip's texels there, and stopping short
+                    // of them leaves a seam at every strip.)
                     state.texExtent[1] = static_cast<int16_t>(std::min(p.texH, std::max(static_cast<int>(std::ceil(std::max(q.tv0, q.tv1))), 1)));
                 }
                 ++gpu.statSurfaceTextures;
@@ -464,9 +858,9 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
 
     GSGpu::Pipeline state{};
     state.colour = GpuSurface(p.frame, scale, -1, rows);
+    const GpuState::Surface &target = *gpu.last;
     if (depthUsed)
         state.depth = GpuSurface(p.depth, scale, static_cast<int>(p.depthKind), rows);
-    const GpuState::Surface &target = gpu.surfaces[GpuKey(p.frame, scale, -1)];
     state.scissor[0] = static_cast<int16_t>(clampInt(p.scissorX0, 0, target.width - 1));
     state.scissor[1] = static_cast<int16_t>(clampInt(p.scissorY0, 0, target.height - 1));
     state.scissor[2] = static_cast<int16_t>(clampInt(p.scissorX1, 0, target.width - 1));
@@ -487,6 +881,8 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
     state.fix = p.fix;
     state.fba = p.fba ? 1u : 0u;
     state.frameAlphaOne = p.frameKind == FrameKind::C24 ? 1u : 0u;
+    state.date = p.date ? 1u : 0u;
+    state.datm = p.date && p.datm ? 1u : 0u;
     state.fge = p.fge ? 1u : 0u;
     state.fogR = p.fogR;
     state.fogG = p.fogG;
@@ -610,11 +1006,18 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     if (wantStats && ++gpu.statDraws % 2000000u == 0u)
-        std::fprintf(stderr, "[gs-gpu] %llu primitives: textures %llu from a surface, %llu from a decoded copy, %llu from VRAM (%llu decoded, %llu sent); %llu fills of %llu pages; %zu surfaces, %zu VRAM textures\n",
+        std::fprintf(stderr, "[gs-gpu] %llu primitives: textures %llu from a surface, %llu from a decoded copy, %llu from VRAM (%llu decoded, %llu sent); %llu fills of %llu pages; back to VRAM %llu times, %llu pages (for a texture %llu, a CLUT %llu, software drawing %llu, another surface %llu, an image %llu, the display %llu, everything %llu); %llu pages changed hands, %llu given up to images; %zu surfaces, %zu VRAM textures\n",
                      static_cast<unsigned long long>(gpu.statDraws), static_cast<unsigned long long>(gpu.statSurfaceTextures),
                      static_cast<unsigned long long>(gpu.statCopyTextures), static_cast<unsigned long long>(gpu.statVramTextures),
                      static_cast<unsigned long long>(gpu.statDecodes), static_cast<unsigned long long>(gpu.statUploads),
                      static_cast<unsigned long long>(gpu.statFills), static_cast<unsigned long long>(gpu.statFilledPages),
+                     static_cast<unsigned long long>(gpu.statDownloads), static_cast<unsigned long long>(gpu.statDownloadedPages),
+                     static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyTexture]), static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyClut]),
+                     static_cast<unsigned long long>(gpu.statWhy[GpuState::WhySoftware]),
+                     static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyOtherSurface]),
+                     static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyImage]), static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyDisplay]),
+                     static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyEverything]),
+                     static_cast<unsigned long long>(gpu.statAdopted), static_cast<unsigned long long>(gpu.statDropped),
                      gpu.surfaces.size(), gpu.textures.size());
 }
 
@@ -721,6 +1124,24 @@ void GSCpuBackend::GpuCompare()
     }
 }
 
+// Before the display is made from VRAM after all: the pages of these
+// frames that only the card has. True if there were any.
+bool GSCpuBackend::GpuDownloadFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_gpu || m_cardAheadCount == 0u)
+        return false;
+    const uint64_t before = m_gpu->statDownloads;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const uint32_t fbw = std::max<uint32_t>(frames[i].fbw, 1u);
+        const GSMem::SurfaceLayout layout = GSMem::LayoutOf(frames[i].psm, baseIsPages[i] ? framePageBaseToBlock(frames[i].fbp) : frames[i].fbp, fbw);
+        if (layout.table && heights[i] != 0u)
+            GpuDownload(layout, 0, 0, static_cast<int>(fbw * 64u) - 1, static_cast<int>(heights[i]) - 1, GpuState::WhyDisplay);
+    }
+    return m_gpu->statDownloads != before;
+}
+
 // CopyScaledFrame from the card: the pixels of the surface, when the frame has one.
 bool GSCpuBackend::GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uint32_t originX, uint32_t originY, uint32_t width,
                                 uint32_t height, std::vector<uint8_t> &outPixels)
@@ -731,6 +1152,15 @@ bool GSCpuBackend::GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uin
         return false;
     const int x0 = static_cast<int>(originX), y0 = static_cast<int>(originY);
     const int x1 = x0 + static_cast<int>(width) - 1, y1 = y0 + static_cast<int>(height) - 1;
+    // The window draws the picture from a texture the card fills
+    // (GSGpu::LatestShown) unless its pixels are asked for here
+    // (PS2X_GPU_READBACK=1): what goes back then stands for it, with its
+    // size.
+    static const bool direct = []
+    {
+        const char *value = std::getenv("PS2X_GPU_READBACK");
+        return value == nullptr || value[0] == '\0' || value[0] == '0';
+    }();
     GSGpu::Reading reading;
     for (int attempt = 0; !reading; ++attempt)
     {
@@ -754,7 +1184,10 @@ bool GSCpuBackend::GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uin
                     waitFor = 0u;
                 }
                 if (waitFor == 0u)
+                {
+                    GpuDownload(layout, x0, y0, x1, y1, GpuState::WhyDisplay, key);
                     GpuFill(layout, scale, -1, x0, y0, x1, y1, false);
+                }
             }
             if (waitFor == 0u)
             {
@@ -766,7 +1199,8 @@ bool GSCpuBackend::GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uin
                 static int shown = 0;
                 if (compareEvery != 0 && ++shown % compareEvery == 0)
                     GpuCompare();
-                reading = m_gpu->renderer->Read(found->second.id, x0, y0, static_cast<int>(width), static_cast<int>(height));
+                reading = direct ? m_gpu->renderer->Show(found->second.id, x0, y0, static_cast<int>(width), static_cast<int>(height))
+                                 : m_gpu->renderer->Read(found->second.id, x0, y0, static_cast<int>(width), static_cast<int>(height));
             }
         }
         if (waitFor != 0u)
@@ -776,6 +1210,8 @@ bool GSCpuBackend::GpuCopyFrame(const GSFrameReg &frame, SurfaceScale scale, uin
     if (!reading.Wait(outPixels, gotWidth, gotHeight) || gotWidth != width * static_cast<uint32_t>(scale.x) ||
         gotHeight != height * static_cast<uint32_t>(scale.y))
         return false;
+    if (direct)
+        outPixels.assign(4u, 255u);
     for (size_t i = 3; i < outPixels.size(); i += 4u)
         outPixels[i] = 255u;
     return true;

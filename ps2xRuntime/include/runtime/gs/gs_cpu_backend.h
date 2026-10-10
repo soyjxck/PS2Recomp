@@ -114,7 +114,8 @@ private:
 
     // Texture cache bookkeeping: every writer says which VRAM pages it touched.
     static constexpr uint32_t kVramPages = 512u;
-    void MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    // `inVram` false: drawn by the graphics card alone (see m_cardOnly).
+    void MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool inVram = true);
     void MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
     bool DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
     bool UploadedSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
@@ -173,6 +174,7 @@ private:
     uint64_t m_writeSerial = 1;
     std::array<uint64_t, kVramPages> m_pageSerial{};     // last write of any kind
     std::array<uint64_t, kVramPages> m_pageDrawSerial{}; // ...other than an image transfer
+    std::array<uint64_t, kVramPages> m_pageVramDrawSerial{}; // ...and into VRAM itself, not on the graphics card alone
     // Image transfers, by 256-byte block.
     std::array<uint64_t, 16384> m_blockUploadSerial{};
     uint64_t m_lastUploadSerial = 0;
@@ -275,7 +277,32 @@ private:
     };
     std::unique_ptr<GpuState, GpuStateDeleter> m_gpu;
     bool m_gpuAsked = false;
+    // With display.renderer = gpu the card draws alone: a primitive it
+    // draws is not drawn into VRAM at all, and the pages it wrote are VRAM's
+    // to catch up on (m_cardAhead) should anything read them there: a
+    // texture in a format the card's surface is no use for, a transfer, a
+    // primitive only the software path can draw. GpuDownload brings them.
+    // (display.renderer = hybrid keeps both drawing, as a check.)
+    bool m_cardOnly = false;
+    std::array<uint8_t, kVramPages> m_cardAhead{};
+    // The last image transfer that stored anything in each page, and what
+    // kind of pixels it was (GpuAdopt).
+    std::array<uint64_t, kVramPages> m_pageUploadSerial{};
+    std::array<uint32_t, kVramPages> m_pageUploadShape{};
+    void NoteUploadShape(const GSMem::SurfaceLayout &layout, uint32_t block);
+    uint32_t m_cardAheadCount = 0;
+    void SetCardAhead(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    void GpuAdopt(const GSMem::SurfaceLayout &layout, uint64_t key, int depthKind, int x0, int y0, int x1, int y1, bool overwritten);
+    void GpuDownload(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, int why, uint64_t exceptKey = 0,
+                     bool sameShapeOnly = false);
+    void GpuDownloadAll();
+    bool GpuDownloadFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count);
+    void GpuDownloadPages(std::vector<uint32_t> &pages);
+    void GpuUploading(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    // FlushPrimitives for whoever is about to read or write VRAM anywhere.
+    void FlushForVram(const char *why);
     static bool GpuSetting();
+    static bool GpuOnlySetting();
     bool GpuReady();
     uint64_t GpuKey(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind) const;
     uint32_t GpuSurface(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind, int rows);

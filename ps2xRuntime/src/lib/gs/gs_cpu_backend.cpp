@@ -590,6 +590,8 @@ void GSCpuBackend::ResetUnlocked()
     ++m_clutLoads;
     m_clutHeld.fill({});
     GpuForgetTextures();
+    m_cardAhead.fill(0u);
+    m_cardAheadCount = 0u;
     m_decodedTextures.clear();
     m_decodedBytes = 0;
     m_uploads.clear();
@@ -714,6 +716,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
     }
     if (!uploaded && HasQueuedPrimitives() && sourceLayout.table)
         FlushPrimitivesTouching(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, false, "clut");
+    if (!uploaded)
+        GpuDownload(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, 1);
     ++m_clutLoads;
     if (!sixteenBit && !thirtyTwoBit)
         return;
@@ -812,13 +816,13 @@ void GSCpuBackend::Sync(GSSyncReason reason)
     if (reason == GSSyncReason::Finish || reason == GSSyncReason::Presentation)
         SubmitPrimitives();
     else
-        FlushPrimitives("sync");
+        FlushForVram("sync");
 }
 
 uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const_cast<GSCpuBackend *>(this)->FlushPrimitives("vram");
+    const_cast<GSCpuBackend *>(this)->FlushForVram("vram");
     return ReadVramUnlocked(psm, base, bw, x, y);
 }
 
@@ -840,7 +844,7 @@ uint32_t GSCpuBackend::ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint
 void GSCpuBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives("vram");
+    FlushForVram("vram");
     MarkWritten(GSMem::LayoutOf(psm, base, std::max<uint32_t>(bw, 1u)), static_cast<int>(x), static_cast<int>(y),
                 static_cast<int>(x), static_cast<int>(y));
     WriteVramUnlocked(psm, base, bw, x, y, value);
@@ -856,7 +860,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    const_cast<GSCpuBackend *>(this)->FlushPrimitives("snapshot");
+    const_cast<GSCpuBackend *>(this)->FlushForVram("snapshot");
     if (!m_vram || m_vramSize == 0u)
     {
         out.clear();
@@ -995,7 +999,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_SPRITE:
         if (reference || !DrawFast(batch, FastKind::Sprite))
         {
-            FlushPrimitives("reference");
+            FlushForVram("reference");
             DrawSprite(batch);
             MarkAllWritten();
         }
@@ -1005,7 +1009,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_TRIFAN:
         if (reference || !DrawFast(batch, FastKind::Triangle))
         {
-            FlushPrimitives("reference");
+            FlushForVram("reference");
             DrawTriangle(batch);
             MarkAllWritten();
         }
@@ -1014,14 +1018,14 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     case GS_PRIM_LINESTRIP:
         if (reference || !DrawFast(batch, FastKind::Line))
         {
-            FlushPrimitives("reference");
+            FlushForVram("reference");
             DrawLine(batch);
             MarkAllWritten();
         }
         break;
     case GS_PRIM_POINT:
     {
-        FlushPrimitives("reference");
+        FlushForVram("reference");
         MarkAllWritten();
         const GSVertex &v = batch.vertices[0];
         const auto &ctx = state.context;
@@ -1661,14 +1665,14 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
     m_transferState.localToHostPendingBytes = 0u;
 
     if (command.direction == 2u || command.direction == 1u)
-        FlushPrimitives("move");
+        FlushForVram("move");
     if (command.direction == 2u)
         PerformLocalToLocalTransfer();
     else if (command.direction == 1u)
         PerformLocalToHostTransfer();
 }
 
-void GSCpuBackend::MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+void GSCpuBackend::MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool inVram)
 {
     if (!layout.table || x1 < x0 || y1 < y0)
         return;
@@ -1686,10 +1690,14 @@ void GSCpuBackend::MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y
         {
             m_pageSerial[(rowPage + column) % kVramPages] = m_writeSerial;
             m_pageDrawSerial[(rowPage + column) % kVramPages] = m_writeSerial;
+            if (inVram)
+                m_pageVramDrawSerial[(rowPage + column) % kVramPages] = m_writeSerial;
             if (layout.spillsIntoNextPage)
             {
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
                 m_pageDrawSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
+                if (inVram)
+                    m_pageVramDrawSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
             }
         }
     }
@@ -1738,12 +1746,18 @@ void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int 
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
         }
     }
-    forEachBlock(layout, x0, y0, x1, y1, [this](uint32_t block)
-                 { m_blockUploadSerial[block] = m_writeSerial; });
+    forEachBlock(layout, x0, y0, x1, y1, [this, &layout](uint32_t block)
+                 {
+                     m_blockUploadSerial[block] = m_writeSerial;
+                     NoteUploadShape(layout, block);
+                 });
 }
 
-// Whether any of those pixels may have been written since `serial` by
-// something other than an image transfer (known to the page).
+// Whether any of those pixels of VRAM may have been written since `serial`
+// by something other than an image transfer (known to the page). What the
+// graphics card drew alone never reached VRAM, and does not count: a
+// texture the game sends again because it drew over it is, here, still
+// there.
 bool GSCpuBackend::DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
 {
     const uint32_t firstColumn = static_cast<uint32_t>(std::max(x0, 0)) >> layout.pageWidthShift;
@@ -1755,9 +1769,9 @@ bool GSCpuBackend::DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0
         const uint32_t rowPage = layout.basePage + row * layout.pagesPerRow;
         for (uint32_t column = firstColumn; column <= lastColumn; ++column)
         {
-            if (m_pageDrawSerial[(rowPage + column) % kVramPages] > serial)
+            if (m_pageVramDrawSerial[(rowPage + column) % kVramPages] > serial)
                 return true;
-            if (layout.spillsIntoNextPage && m_pageDrawSerial[(rowPage + column + 1u) % kVramPages] > serial)
+            if (layout.spillsIntoNextPage && m_pageVramDrawSerial[(rowPage + column + 1u) % kVramPages] > serial)
                 return true;
         }
     }
@@ -1780,6 +1794,7 @@ void GSCpuBackend::MarkAllWritten()
     ++m_writeSerial;
     m_pageSerial.fill(m_writeSerial);
     m_pageDrawSerial.fill(m_writeSerial);
+    m_pageVramDrawSerial.fill(m_writeSerial);
 }
 
 bool GSCpuBackend::PagesWrittenSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
@@ -2075,6 +2090,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         ++statPartial;
     }
 
+    GpuUploading(layout, left, top, right, bottom);
+
     // A whole image is stored by the raster pool, in its turn among the
     // batches of primitives, while this thread carries on. Only a transfer
     // that arrives in pieces is stored here.
@@ -2258,7 +2275,7 @@ uint32_t GSCpuBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 bool GSCpuBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-    FlushPrimitives("clear");
+    FlushForVram("clear");
     if (!m_vram || context.frame.fbw == 0u)
         return false;
 
@@ -2466,11 +2483,77 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
     thread_local std::vector<uint8_t> snapshot;
     thread_local GSCpuBackend snapshotBackend;
 
+    const GSPmodeState pmode = decodePmode(request.pmode);
+
+    // The picture from a larger copy of the frame on display, when there
+    // is one: one circuit's frame (two circuits on the same frame are the
+    // game blending it with itself a line apart against flicker, which a
+    // sharper picture is better without).
+    auto fromCopy = [&](PresentationFrame &frame)
+    {
+        const GSSmode2State smode2 = decodeSMode2(request.smode2);
+        const GSFrameReg shown1 = decodeDisplayFrame(request.dispfb1), shown2 = decodeDisplayFrame(request.dispfb2);
+        const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, shown1);
+        const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, shown2);
+        const bool one = valid1 != valid2 ||
+                         (valid1 && shown1.fbp == shown2.fbp && shown1.fbw == shown2.fbw && shown1.psm == shown2.psm);
+        if (!one)
+            return false;
+        const GSFrameReg &shown = valid1 ? shown1 : shown2;
+        const GSDisplayReadOrigin origin = decodeDisplayReadOrigin(valid1 ? request.dispfb1 : request.dispfb2);
+        uint32_t width = 0u, height = 0u;
+        decodeDisplaySize(valid1 ? request.display1 : request.display2, width, height);
+        // A buffer shown a field at a time holds half the picture's
+        // lines: from now on it is drawn twice as tall as well.
+        const bool fields = smode2.interlaced && smode2.ffmd;
+        SurfaceScale scale;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (fields && WholeFramesSetting() && ps2xGsDrawsInBackground(m_vram))
+            {
+                m_fieldFbp = shown.fbp;
+                m_fieldFbw = shown.fbw;
+            }
+            else
+            {
+                m_fieldFbp = ~0u;
+            }
+            scale = ScaleOf(shown.fbp, shown.fbw);
+        }
+        const uint32_t rows = fields ? (height + 1u) >> 1u : height;
+        std::vector<uint8_t> scaled;
+        if (!(scale.larger() || GpuSetting()) || !CopyScaledFrame(shown, scale, origin.x, origin.y, width, rows, scaled))
+            return false;
+        frame.pixels.swap(scaled);
+        frame.width = width * static_cast<uint32_t>(scale.x);
+        frame.height = rows * static_cast<uint32_t>(scale.y);
+        return true;
+    };
+
+    // When the graphics card draws, its picture comes first: VRAM may not
+    // have what it drew at all, and what VRAM would show instead (nothing,
+    // which the code below takes for a display not yet set up) is not it.
+    bool card;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        card = m_gpu != nullptr;
+    }
+    if (card)
+    {
+        PresentationFrame frame{};
+        if (fromCopy(frame))
+        {
+            const GSFrameReg shown = decodeDisplayFrame(pmode.enableCrt1 ? request.dispfb1 : request.dispfb2);
+            frame.displayFbp = shown.fbp;
+            frame.sourceFbp = shown.fbp;
+            return frame;
+        }
+    }
+
     GSFrameReg frames[5];
     uint32_t heights[5];
     bool baseIsPages[5];
     size_t count = 0;
-    const GSPmodeState pmode = decodePmode(request.pmode);
     auto addDisplay = [&](bool enabled, uint64_t dispfb, uint64_t display)
     {
         if (!enabled)
@@ -2494,6 +2577,9 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
         baseIsPages[count] = false;
         ++count;
     }
+    // From VRAM, then, which has to have whatever the card drew of these.
+    if (card)
+        GpuDownloadFrames(frames, heights, baseIsPages, count);
     SnapshotFrames(frames, heights, baseIsPages, count, snapshot);
     if (snapshot.empty())
         return {};
@@ -2511,57 +2597,17 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
             heights[i] = std::max<uint32_t>(tallest, 512u);
             baseIsPages[i] = true;
         }
+        if (card)
+            GpuDownloadFrames(frames, heights, baseIsPages, 2);
         SnapshotFrames(frames, heights, baseIsPages, 2, snapshot);
         if (snapshot.empty())
             return {};
         frame = snapshotBackend.PresentFromLocalMemory(request);
     }
-    if (!snapshotBackend.m_presentWantsContextFrames && frame && !frame.usedPreferred)
-    {
-        // The same picture from the shadow, when there is a larger copy of
-        // it: one circuit's frame (two circuits on the same frame are the
-        // game blending it with itself a line apart against flicker, which
-        // a sharper picture is better without). Otherwise the picture
-        // above stands.
-        const GSSmode2State smode2 = decodeSMode2(request.smode2);
-        const GSFrameReg shown1 = decodeDisplayFrame(request.dispfb1), shown2 = decodeDisplayFrame(request.dispfb2);
-        const bool valid1 = pmode.enableCrt1 && hasDisplaySetup(request.display1, shown1);
-        const bool valid2 = pmode.enableCrt2 && hasDisplaySetup(request.display2, shown2);
-        const bool one = valid1 != valid2 ||
-                         (valid1 && shown1.fbp == shown2.fbp && shown1.fbw == shown2.fbw && shown1.psm == shown2.psm);
-        if (one)
-        {
-            const GSFrameReg &shown = valid1 ? shown1 : shown2;
-            const GSDisplayReadOrigin origin = decodeDisplayReadOrigin(valid1 ? request.dispfb1 : request.dispfb2);
-            uint32_t width = 0u, height = 0u;
-            decodeDisplaySize(valid1 ? request.display1 : request.display2, width, height);
-            // A buffer shown a field at a time holds half the picture's
-            // lines: from now on it is drawn twice as tall as well.
-            const bool fields = smode2.interlaced && smode2.ffmd;
-            SurfaceScale scale;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if (fields && WholeFramesSetting() && ps2xGsDrawsInBackground(m_vram))
-                {
-                    m_fieldFbp = shown.fbp;
-                    m_fieldFbw = shown.fbw;
-                }
-                else
-                {
-                    m_fieldFbp = ~0u;
-                }
-                scale = ScaleOf(shown.fbp, shown.fbw);
-            }
-            const uint32_t rows = fields ? (height + 1u) >> 1u : height;
-            std::vector<uint8_t> scaled;
-            if ((scale.larger() || GpuSetting()) && CopyScaledFrame(shown, scale, origin.x, origin.y, width, rows, scaled))
-            {
-                frame.pixels.swap(scaled);
-                frame.width = width * static_cast<uint32_t>(scale.x);
-                frame.height = rows * static_cast<uint32_t>(scale.y);
-            }
-        }
-    }
+    // The same picture from the shadow, when there is a larger copy of it
+    // there. Otherwise the picture above stands.
+    if (!card && !snapshotBackend.m_presentWantsContextFrames && frame && !frame.usedPreferred)
+        fromCopy(frame);
     return frame;
 }
 

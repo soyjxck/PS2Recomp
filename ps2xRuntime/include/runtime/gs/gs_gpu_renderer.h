@@ -31,6 +31,19 @@ namespace GSGpu
     bool PrepareContext();
     bool ContextReady();
 
+    // A picture the renderer has put where the window can draw it without
+    // its pixels leaving the card: a texture, shared with the window's
+    // context, with the picture's first row first (as an uploaded image
+    // has it) and opaque.
+    struct Shown
+    {
+        uint32_t texture = 0;
+        uint32_t width = 0, height = 0;
+        uint64_t serial = 0; // goes up with every picture shown
+    };
+    // The latest (for the window's thread). False if nothing has been shown.
+    bool LatestShown(Shown &shown);
+
     struct Vertex
     {
         float x, y; // pixels of the surface
@@ -87,15 +100,17 @@ namespace GSGpu
 
         uint8_t fge = 0, fogR = 0, fogG = 0, fogB = 0;
         uint8_t writeRgb = 1, writeAlpha = 1;
-        uint8_t unused[2]{};
+        uint8_t date = 0, datm = 0; // the destination alpha test, and the bit it wants
     };
 
     // Pixels asked for with Renderer::Read, when the graphics card gets to them.
     class Reading
     {
     public:
-        // Waits for them: RGBA, top row first, `width` by `height` (the
-        // surface's own pixels, so its scale times what was asked for).
+        // Waits for them: four bytes a pixel, top row first, `width` by
+        // `height`. From Read that is RGBA of the surface's own pixels (its
+        // scale times what was asked for); from ReadBack, the game's pixels:
+        // RGBA of a Colour surface, a float from 0 to 1 of a Depth surface.
         // False if the surface was not there.
         bool Wait(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height);
         explicit operator bool() const { return m_state != nullptr; }
@@ -136,6 +151,12 @@ namespace GSGpu
         void Flush();
         // The pixels of part of a Colour surface, after everything queued so far.
         Reading Read(uint32_t surface, int x, int y, int width, int height);
+        // Part of a Colour or Depth surface as the game's pixels again, each
+        // from however many of the surface's stand for it.
+        Reading ReadBack(uint32_t surface, int x, int y, int width, int height);
+        // Part of a Colour surface made the picture LatestShown gives. Wait
+        // on what is returned says when it is there; no pixels come back.
+        Reading Show(uint32_t surface, int x, int y, int width, int height);
 
         struct Impl;
 
