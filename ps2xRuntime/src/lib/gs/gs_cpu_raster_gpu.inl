@@ -611,26 +611,45 @@ void GSCpuBackend::GpuUploading(const GSMem::SurfaceLayout &layout, int x0, int 
         return;
     GpuState &gpu = *m_gpu;
     gpu.pages.clear();
-    // By the block, as MarkUploaded does: an image may be taken to reach a
-    // page it has nothing in.
-    uint32_t last = ~0u;
-    forEachImageBlock(layout, x0, y0, x1, y1, [&](uint32_t block)
+    // A page the card alone has: wanted back first only if the image is
+    // pixels of the kind the surface holds and leaves part of the page as
+    // it was. One it covers whole, or of another kind, is just given up.
+    auto settle = [&](uint32_t page, bool whole)
+    {
+        if (!m_cardAhead[page])
+            return;
+        const auto owner = gpu.surfaces.find(m_shadowKey[page]);
+        if (!whole && owner != gpu.surfaces.end() && sameShape(owner->second.layout, owner->second.depthKind >= 0, layout, false))
+        {
+            gpu.pages.push_back(page);
+            return;
+        }
+        m_cardAhead[page] = 0u;
+        --m_cardAheadCount;
+        ++gpu.statDropped;
+    };
+    if (!layout.spillsIntoNextPage)
+    {
+        const int pageWidth = 1 << layout.pageWidthShift, pageHeight = 1 << layout.pageHeightShift;
+        forEachPageOf(layout, x0, y0, x1, y1, [&](uint32_t page, uint32_t row, uint32_t column)
                       {
-                          const uint32_t page = (block >> 5) % kPageCount;
-                          if (page == last || !m_cardAhead[page])
-                              return;
-                          last = page;
-                          const auto owner = gpu.surfaces.find(m_shadowKey[page]);
-                          if (owner != gpu.surfaces.end() && owner->second.depthKind < 0 && layout.unitBits == 32u &&
-                              owner->second.layout.pagesPerRow == layout.pagesPerRow)
-                          {
-                              gpu.pages.push_back(page);
-                              return;
-                          }
-                          m_cardAhead[page] = 0u;
-                          --m_cardAheadCount;
-                          ++gpu.statDropped;
+                          const int left = static_cast<int>(column) * pageWidth, top = static_cast<int>(row) * pageHeight;
+                          settle(page, left >= x0 && top >= y0 && left + pageWidth - 1 <= x1 && top + pageHeight - 1 <= y1);
                       });
+    }
+    else
+    {
+        // By the block, as MarkUploaded does: an image that does not start
+        // with a page may be taken to reach one it has nothing in.
+        uint32_t last = ~0u;
+        forEachImageBlock(layout, x0, y0, x1, y1, [&](uint32_t block)
+                          {
+                              const uint32_t page = (block >> 5) % kPageCount;
+                              if (page != last)
+                                  settle(page, false);
+                              last = page;
+                          });
+    }
     if (!gpu.pages.empty())
     {
         gpu.why = GpuState::WhyImage;
@@ -795,23 +814,47 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
 
     // A frame buffer the card has, laid out as the texture is, with the
     // pages the primitive samples good.
-    // (Not the surface being drawn into: the card cannot read what it is
-    // writing. Sharing pages with it by the texture's nominal size, which
-    // is what textureIsTarget goes by, is nothing to the card.)
+    // The buffer itself, or a texture that starts some rows down a buffer
+    // laid out the same way (a game reads part of its frame so). The
+    // surface being drawn into as well: the renderer reads a copy of it.
     if ((p.texKind == TextureKind::Direct32 || p.texKind == TextureKind::Direct24) && (ctx.tex0.tbp0 & 31u) == 0u &&
         !p.texture.spillsIntoNextPage)
     {
         const SurfaceScale from = ScaleOf(ctx.tex0.tbp0 >> 5, ctx.tex0.tbw);
-        const uint64_t key = GpuKey(p.texture, from, -1);
-        const auto found = gpu.surfaces.find(key);
-        if (found != gpu.surfaces.end() && found->second.id != state.colour)
+        uint64_t key = GpuKey(p.texture, from, -1);
+        const GpuState::Surface *source = nullptr;
+        int rowsDown = 0;
+        if (const auto found = gpu.surfaces.find(key); found != gpu.surfaces.end())
         {
-            const int lastU = std::min(p.sampledU1, found->second.width - 1), lastV = std::min(p.sampledV1, found->second.height - 1);
-            if (p.sampledU0 <= lastU && p.sampledV0 <= lastV &&
-                !PagesStale(p.texture, key, p.sampledU0, std::max(p.sampledV0 - 2, 0), lastU, lastV))
+            source = &found->second;
+        }
+        else
+        {
+            for (const auto &entry : gpu.surfaces)
             {
-                state.texture = found->second.id;
+                const GpuState::Surface &surface = entry.second;
+                if (surface.depthKind >= 0 || !sameShape(surface.layout, false, p.texture, false))
+                    continue;
+                const uint32_t pagesDown = (p.texture.basePage + kPageCount - surface.layout.basePage % kPageCount) % kPageCount;
+                const int rows = static_cast<int>(pagesDown / std::max<uint32_t>(surface.layout.pagesPerRow, 1u)) << surface.layout.pageHeightShift;
+                if (rows > 0 && rows < surface.height)
+                {
+                    source = &surface;
+                    rowsDown = rows;
+                    key = entry.first;
+                    break;
+                }
+            }
+        }
+        if (source)
+        {
+            const int lastU = std::min(p.sampledU1, source->width - 1), lastV = std::min(p.sampledV1, source->height - 1 - rowsDown);
+            if (p.sampledU0 <= lastU && p.sampledV0 <= lastV &&
+                !PagesStale(source->layout, key, p.sampledU0, rowsDown + std::max(p.sampledV0 - 2, 0), lastU, rowsDown + lastV))
+            {
+                state.texture = source->id;
                 state.textureMode = GSGpu::TextureSurface;
+                state.texOrigin[1] = static_cast<int16_t>(rowsDown);
                 state.texAlphaFixed = p.texKind == TextureKind::Direct24 ? 1u : 0u;
                 state.ta0 = p.texa.ta0;
                 state.aem = p.texa.aem ? 1u : 0u;

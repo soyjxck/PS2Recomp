@@ -221,7 +221,7 @@ void main()
         {
             uv = vec2(surfaceCoordinate(uv.x, uWrap.x, float(uTexSize.x), float(uRegion.x), float(uRegion.y), float(uTexExtent.x)),
                       surfaceCoordinate(uv.y, uWrap.y, float(uTexSize.y), float(uRegion.z), float(uRegion.w), float(uTexExtent.y)));
-            t = floor(texture(uTexture, uv * uSurfaceTexel) * 255.0 + 0.5);
+            t = floor(texture(uTexture, (uv + vec2(uTexOrigin)) * uSurfaceTexel) * 255.0 + 0.5);
         }
         if (uTexAlphaFixed != 0)
             t.a = (uAem != 0 && t.rgb == vec3(0.0)) ? 0.0 : uTa0;
@@ -331,6 +331,8 @@ void main()
             size_t first = 0; // of its vertices, or of its bytes in the blob
             size_t count = 0;
             uint32_t pipeline = 0;
+            // A draw that samples the surface it draws into: the texels it can reach.
+            float sampled[4] = {1.0e9f, 1.0e9f, -1.0e9f, -1.0e9f};
             std::shared_ptr<Reading::State> reading;
         };
 
@@ -588,8 +590,10 @@ void main()
         // What is there times (1 + alpha) takes two passes that only come
         // out right a primitive at a time.
         // So does a destination alpha test, which sees the frame as it
-        // was before the primitive.
-        const bool alone = (pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u) || pipeline.date;
+        // was before the primitive, and a texture that is the surface
+        // drawn into, which is the surface as the primitive before left it.
+        const bool ownTexture = pipeline.textureMode == TextureSurface && pipeline.texture == pipeline.colour;
+        const bool alone = (pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u) || pipeline.date || ownTexture;
         if (!impl.drawing || alone || std::memcmp(&batch.pipelines.back(), &pipeline, sizeof(Pipeline)) != 0)
         {
             Command &command = impl.Add(Command::Draw);
@@ -614,7 +618,21 @@ void main()
                 command.height = std::min(static_cast<int>(std::ceil(y1)), pipeline.scissor[3] + 1) - command.y;
             }
         }
-        batch.commands.back().count += count;
+        Command &drawn = batch.commands.back();
+        drawn.count += count;
+        if (ownTexture)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                const float q = vertices[i].q != 0.0f ? vertices[i].q : 1.0f;
+                const float u = vertices[i].s / q + static_cast<float>(pipeline.texOrigin[0]);
+                const float v = vertices[i].t / q + static_cast<float>(pipeline.texOrigin[1]);
+                drawn.sampled[0] = std::min(drawn.sampled[0], u);
+                drawn.sampled[1] = std::min(drawn.sampled[1], v);
+                drawn.sampled[2] = std::max(drawn.sampled[2], u);
+                drawn.sampled[3] = std::max(drawn.sampled[3], v);
+            }
+        }
         batch.vertices.insert(batch.vertices.end(), vertices, vertices + count);
         if (batch.vertices.size() >= 96000u)
             Flush();
@@ -1152,11 +1170,54 @@ void main()
         glUseProgram(program);
         glUniform4f(at.toClip, 2.0f / static_cast<float>(colour->width), 2.0f / static_cast<float>(colour->height), -1.0f, -1.0f);
 
+        // Part of the surface being drawn into, copied where the shader can
+        // read it (it may not read what it writes): the same pixels at the
+        // same place in a texture at least as large.
+        const int pixelsWide = colour->width * colour->scaleX, pixelsHigh = colour->height * colour->scaleY;
+        auto copyFrame = [&](int left, int top, int right, int bottom)
+        {
+            if (frameCopy.texture == 0u || frameCopy.width < pixelsWide || frameCopy.height < pixelsHigh)
+            {
+                if (frameCopy.texture == 0u)
+                {
+                    glGenTextures(1, &frameCopy.texture);
+                    glGenFramebuffers(1, &frameCopy.framebuffer);
+                }
+                frameCopy.width = std::max(frameCopy.width, pixelsWide);
+                frameCopy.height = std::max(frameCopy.height, pixelsHigh);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, frameCopy.texture);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameCopy.width, frameCopy.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                glBindFramebuffer(GL_FRAMEBUFFER, frameCopy.framebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frameCopy.texture, 0);
+                glActiveTexture(GL_TEXTURE0);
+            }
+            left = std::max(left * colour->scaleX, 0);
+            top = std::max(top * colour->scaleY, 0);
+            right = std::min(right * colour->scaleX, pixelsWide);
+            bottom = std::min(bottom * colour->scaleY, pixelsHigh);
+            if (left < right && top < bottom)
+            {
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, FramebufferFor(p.colour, 0u));
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, frameCopy.framebuffer);
+                glBlitFramebuffer(left, top, right, bottom, left, top, right, bottom, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                glEnable(GL_SCISSOR_TEST);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(p.colour, depthUsed ? p.depth : 0u));
+        };
+
         const Surface *texture = p.textureMode != TextureNone ? Find(p.texture) : nullptr;
+        const bool ownTexture = texture && p.textureMode == TextureSurface && p.texture == p.colour;
+        if (ownTexture)
+            copyFrame(static_cast<int>(std::floor(command.sampled[0])) - 2, static_cast<int>(std::floor(command.sampled[1])) - 2,
+                      static_cast<int>(std::ceil(command.sampled[2])) + 2, static_cast<int>(std::ceil(command.sampled[3])) + 2);
         if (texture)
         {
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texture->texture);
+            glBindTexture(GL_TEXTURE_2D, ownTexture ? frameCopy.texture : texture->texture);
             glBindSampler(0, p.linear ? linear : nearest);
             glUniform1i(at.texture, 0);
             glUniform1i(at.textureMode, p.textureMode);
@@ -1168,8 +1229,12 @@ void main()
             glUniform2i(at.texSize, p.texSize[0], p.texSize[1]);
             glUniform2i(at.texOrigin, p.texOrigin[0], p.texOrigin[1]);
             glUniform2i(at.texExtent, p.texExtent[0], p.texExtent[1]);
-            glUniform2f(at.surfaceTexel, 1.0f / static_cast<float>(std::max(texture->width, 1)),
-                        1.0f / static_cast<float>(std::max(texture->height, 1)));
+            if (ownTexture)
+                glUniform2f(at.surfaceTexel, static_cast<float>(colour->scaleX) / static_cast<float>(frameCopy.width),
+                            static_cast<float>(colour->scaleY) / static_cast<float>(frameCopy.height));
+            else
+                glUniform2f(at.surfaceTexel, 1.0f / static_cast<float>(std::max(texture->width, 1)),
+                            1.0f / static_cast<float>(std::max(texture->height, 1)));
             glUniform1i(at.texAlphaFixed, p.texAlphaFixed);
             glUniform1f(at.ta0, static_cast<float>(p.ta0));
             glUniform1i(at.aem, p.aem);
@@ -1188,34 +1253,7 @@ void main()
         glUniform1i(at.fba, p.fba && !p.frameAlphaOne ? 1 : 0);
         if (p.date && !p.frameAlphaOne && command.width > 0 && command.height > 0)
         {
-            const int pixelsWide = colour->width * colour->scaleX, pixelsHigh = colour->height * colour->scaleY;
-            if (frameCopy.texture == 0u || frameCopy.width < pixelsWide || frameCopy.height < pixelsHigh)
-            {
-                if (frameCopy.texture == 0u)
-                {
-                    glGenTextures(1, &frameCopy.texture);
-                    glGenFramebuffers(1, &frameCopy.framebuffer);
-                }
-                frameCopy.width = std::max(frameCopy.width, pixelsWide);
-                frameCopy.height = std::max(frameCopy.height, pixelsHigh);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, frameCopy.texture);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, frameCopy.width, frameCopy.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-                glBindFramebuffer(GL_FRAMEBUFFER, frameCopy.framebuffer);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frameCopy.texture, 0);
-                glActiveTexture(GL_TEXTURE0);
-            }
-            const int left = command.x * colour->scaleX, top = command.y * colour->scaleY;
-            const int right = std::min((command.x + command.width) * colour->scaleX, pixelsWide);
-            const int bottom = std::min((command.y + command.height) * colour->scaleY, pixelsHigh);
-            glDisable(GL_SCISSOR_TEST);
-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, FramebufferFor(p.colour, 0u));
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, frameCopy.framebuffer);
-            glBlitFramebuffer(left, top, right, bottom, left, top, right, bottom, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-            glBindFramebuffer(GL_FRAMEBUFFER, FramebufferFor(p.colour, depthUsed ? p.depth : 0u));
-            glEnable(GL_SCISSOR_TEST);
+            copyFrame(command.x, command.y, command.x + command.width, command.y + command.height);
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, frameCopy.texture);
             glBindSampler(1, nearest);

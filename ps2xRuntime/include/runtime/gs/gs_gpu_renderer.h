@@ -65,7 +65,8 @@ namespace GSGpu
     {
         TextureNone = 0,
         TextureTexels = 1,  // an image of texels, read exactly as the GS reads them
-        TextureSurface = 2, // a Colour surface, filtered at whatever size it is
+        TextureSurface = 2, // a Colour surface, filtered at whatever size it is (the one drawn
+                            // into as well: a copy of it, as it was before the primitive)
     };
 
     // Everything a primitive is drawn with. Primitives are drawn together
@@ -80,6 +81,7 @@ namespace GSGpu
 
         int16_t texSize[2]{};   // what TEX0 says the texture's size is
         int16_t texOrigin[2]{}; // TextureTexels: the texel the image starts at
+                                // TextureSurface: where in the surface the texture starts
         int16_t texExtent[2]{}; // TextureTexels: how many texels it holds each way
                                 // TextureSurface: texels past these are not read (0: no limit)
         int16_t region[4]{};    // CLAMP's MINU, MAXU, MINV, MAXV
