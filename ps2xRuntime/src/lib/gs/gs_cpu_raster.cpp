@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1866,7 +1867,7 @@ struct GSCpuBackend::RasterQueue
         for (size_t word = 0; word < pages.size(); ++word)
         {
             for (uint64_t bits = pages[word]; bits != 0u; bits &= bits - 1u)
-                last = std::max(last, lastUse[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))]);
+                last = std::max(last, lastUse[word * 64u + static_cast<size_t>(std::countr_zero(bits))]);
         }
         return last;
     }
@@ -1965,9 +1966,9 @@ struct GSCpuBackend::RasterQueue
         for (size_t word = 0; word < written.size(); ++word)
         {
             for (uint64_t bits = written[word]; bits != 0u; bits &= bits - 1u)
-                pageWriter[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))] = submitted;
+                pageWriter[word * 64u + static_cast<size_t>(std::countr_zero(bits))] = submitted;
             for (uint64_t bits = read[word]; bits != 0u; bits &= bits - 1u)
-                pageReader[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))] = submitted;
+                pageReader[word * 64u + static_cast<size_t>(std::countr_zero(bits))] = submitted;
         }
         pendingPixels = 0;
         written.fill(0u);
@@ -2024,7 +2025,7 @@ struct GSCpuBackend::RasterQueue
         for (size_t word = 0; word < pages.size(); ++word)
         {
             for (uint64_t bits = pages[word]; bits != 0u; bits &= bits - 1u)
-                pageWriter[word * 64u + static_cast<size_t>(__builtin_ctzll(bits))] = submitted;
+                pageWriter[word * 64u + static_cast<size_t>(std::countr_zero(bits))] = submitted;
         }
         if (wantStats())
         {
