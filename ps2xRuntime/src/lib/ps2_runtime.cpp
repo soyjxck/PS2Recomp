@@ -1462,6 +1462,12 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     {
         normalized.mcRoot = normalized.elfDirectory / "mc0";
     }
+    // PS2X_MC_ROOT=<dir>: keep the memory card somewhere else, so that test
+    // runs leave the player's saves alone. Slot 2 is "<dir>_slot1".
+    if (const char *mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot != nullptr && mcRoot[0] != '\0')
+    {
+        normalized.mcRoot = normalizeAbsolutePath(std::filesystem::path(mcRoot));
+    }
 
     runtimeIoPaths() = normalized;
 }
