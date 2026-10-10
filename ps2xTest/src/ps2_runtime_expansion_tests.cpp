@@ -746,6 +746,53 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        tc.Run("sceMpegIsEnd follows the video's sequence end code, not the end of the CD stream", [](TestCase &t)
+        {
+            // A movie is often one of many in a file the game streams from:
+            // its own end code is what ends it, with the CD stream still
+            // running. (Waiting for the stream's end had Drakengard read the
+            // rest of a 1.3 GB file after every movie.)
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            ps2_stubs::notifyMpegCdStreamStart();
+
+            constexpr uint32_t kMpeg = 0x00120000u;
+            constexpr uint32_t kWork = 0x00130000u;
+            constexpr uint32_t kData = 0x00140000u;
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kMpeg);
+            setRegU32(ctx, 5, kWork);
+            setRegU32(ctx, 6, 0x2000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &ctx, &runtime);
+
+            auto isEnd = [&]
+            {
+                R5900Context query{};
+                setRegU32(query, 4, kMpeg);
+                ps2_stubs::sceMpegIsEnd(rdram.data(), &query, &runtime);
+                return getRegS32(query, 2);
+            };
+            auto addBs = [&](const std::vector<uint8_t> &bytes)
+            {
+                std::memcpy(rdram.data() + kData, bytes.data(), bytes.size());
+                R5900Context add{};
+                setRegU32(add, 4, kMpeg);
+                setRegU32(add, 5, kData);
+                setRegU32(add, 6, static_cast<uint32_t>(bytes.size()));
+                ps2_stubs::sceMpegAddBs(rdram.data(), &add, &runtime);
+            };
+
+            t.Equals(isEnd(), 0, "a movie that has not started has not ended");
+            // A sequence header (16x16, 29.97 fps) and nothing after it.
+            addBs({0x00, 0x00, 0x01, 0xB3, 0x01, 0x00, 0x10, 0x14, 0xFF, 0xFF, 0xE0, 0x18});
+            t.Equals(isEnd(), 0, "a sequence that is still open has not ended");
+            addBs({0x00, 0x00, 0x01, 0xB7});
+            t.Equals(isEnd(), 1, "the sequence end code ends the movie while the CD stream goes on");
+
+            runtime.requestStop();
+        });
+
         tc.Run("sceMpegGetPicture blocks as a typed scheduler wait and resumes on EOF", [](TestCase &t)
         {
             PS2Runtime runtime;

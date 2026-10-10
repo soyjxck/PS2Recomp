@@ -1006,7 +1006,9 @@ namespace ps2_stubs
 
         void flushDecoderIfEnded(MpegPlaybackState &playback)
         {
-            if (playback.streamEnded && playback.decoder)
+            // The pictures the decoder still holds back for reordering are
+            // the sequence's last: out with them once it is over.
+            if ((playback.streamEnded || playback.sawSequenceEnd) && playback.decoder)
             {
                 playback.decoder->flush(playback.decodedFrames);
             }
@@ -2455,14 +2457,19 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         MpegPlaybackState &playback = getPlaybackState(mpegAddr);
-        // Only the producer/demux EOF is authoritative. A sequence_end_code can
-        // be observed while more PSS data is still buffered, and a decoder
-        // failure before producer EOF may still recover on a later sequence.
-        const bool producerEnded =
-            g_mpeg_stub_state.currentCdStreamEofSeen &&
-            playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
-        const bool ended = producerEnded &&
-                           (playback.streamEnded || (playback.decoderFailed && playback.sawInput));
+        // The movie is over when its own stream says so: the video's
+        // sequence_end_code or the program stream's end code, once every
+        // picture before it has been handed out (the checks below). The
+        // library knows nothing of where the data comes from, and a movie is
+        // often one of many in a file: waiting for the CD stream to reach the
+        // end of the file kept Drakengard reading the rest of its 1.3 GB movie
+        // file, three minutes of black screen, after each movie. Only a
+        // decoder that failed needs the producer's end to give up, since a
+        // later sequence may still get it going again.
+        const bool sameStream = playback.cdStreamGeneration == g_mpeg_stub_state.cdStreamGeneration;
+        const bool producerEnded = g_mpeg_stub_state.currentCdStreamEofSeen && sameStream;
+        const bool ended = (sameStream && (playback.sawSequenceEnd || playback.streamEnded)) ||
+                           (producerEnded && playback.decoderFailed && playback.sawInput);
         const uint64_t presentationEnd = playback.presentationEndTickQ32;
         const uint64_t currentTickQ32 = runtime != nullptr
                                             ? (runtime->eeScheduler().currentVSyncTick() << 32u)
