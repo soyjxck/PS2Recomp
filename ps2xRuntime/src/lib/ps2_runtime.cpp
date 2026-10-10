@@ -8,6 +8,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_settings.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -55,6 +56,56 @@ static constexpr int HOST_WINDOW_HEIGHT = 544;
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 #endif
+// How the game's picture is put on the host's screen, from the settings
+// file's [display] section or the environment:
+//   aspect     (PS2X_ASPECT)      4:3 as on a television (the default), 16:9
+//                                 and so on, or "native": one host pixel
+//                                 for each of the game's, which is 640:448.
+//   window     (PS2X_WINDOW)      the window's size, as 1280x720.
+//   fullscreen (PS2X_FULLSCREEN)  on: the whole screen, borderless. F11
+//                                 switches while the game runs.
+//   filter     (PS2X_FILTER)      linear (smooth, the default) or nearest.
+struct HostDisplay
+{
+    float aspect = 4.0f / 3.0f; // width over height as shown; 0 for the picture's own
+    int windowWidth = 0;
+    int windowHeight = 0;
+    bool fullscreen = false;
+    bool smooth = true;
+};
+
+static const HostDisplay &hostDisplay()
+{
+    static const HostDisplay display = []
+    {
+        HostDisplay d;
+        float first = 0.0f, second = 0.0f;
+        if (const char *aspect = ps2x::setting("PS2X_ASPECT", "display.aspect"))
+        {
+            if (std::strcmp(aspect, "native") == 0)
+                d.aspect = 0.0f;
+            else if (ps2x::settingPair("PS2X_ASPECT", "display.aspect", first, second))
+                d.aspect = first / second;
+        }
+        if (ps2x::settingPair("PS2X_WINDOW", "display.window", first, second) && first >= 64.0f && second >= 64.0f)
+        {
+            d.windowWidth = static_cast<int>(first);
+            d.windowHeight = static_cast<int>(second);
+        }
+        else
+        {
+            // Twice the game's height or so, and as wide as the picture is.
+            d.windowHeight = d.aspect > 0.0f ? 720 : HOST_WINDOW_HEIGHT;
+            d.windowWidth = d.aspect > 0.0f ? static_cast<int>(720.0f * d.aspect + 0.5f) : HOST_WINDOW_WIDTH;
+        }
+        d.fullscreen = ps2x::settingOn("PS2X_FULLSCREEN", "display.fullscreen", false);
+        if (const char *filter = ps2x::setting("PS2X_FILTER", "display.filter"))
+            d.smooth = std::strcmp(filter, "nearest") != 0;
+        return d;
+    }();
+    return display;
+}
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -1153,7 +1204,9 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        InitWindow(hostDisplay().windowWidth, hostDisplay().windowHeight, title);
+        if (hostDisplay().fullscreen)
+            ToggleBorderlessWindowed();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -2827,6 +2880,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    SetTextureFilter(frameTex, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2931,15 +2985,22 @@ void PS2Runtime::run()
             }
         }
 
+#if !defined(PLATFORM_VITA)
+        if (IsKeyPressed(KEY_F11))
+            ToggleBorderlessWindowed();
+#endif
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // As large as fits, in the shape asked for: the game's pixels are
+        // not square on a television, and a widescreen picture is drawn
+        // squeezed into the same 640.
+        const float shape = hostDisplay().aspect > 0.0f ? hostDisplay().aspect : srcWidth / srcHeight;
+        const float dstHeight = std::min(screenHeight, screenWidth / shape);
+        const float dstWidth = dstHeight * shape;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
