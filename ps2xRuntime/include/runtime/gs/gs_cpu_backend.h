@@ -4,8 +4,15 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
+
+namespace GSMem
+{
+    struct SurfaceLayout;
+}
 
 class GSCpuBackend final : public GSRasterBackend
 {
@@ -40,6 +47,46 @@ private:
     uint32_t ReadTextureVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
+    // gs_cpu_raster.cpp: the same pixels as DrawTriangle/DrawSprite from a
+    // pipeline resolved once per primitive. Return false to fall back.
+    struct FastPipeline;
+    struct DecodedTexture
+    {
+        uint64_t contentHash = 0;   // of the VRAM pages it was decoded from
+        uint64_t checkedSerial = 0; // m_writeSerial when it was last known current
+        uint64_t lastUsed = 0;
+        uint64_t lastDecoded = 0;   // lookup clock at the last content change
+        uint64_t directUntil = 0;   // sample VRAM directly until this lookup
+        int width = 0;
+        int height = 0;
+        std::vector<uint32_t> pages;
+        std::vector<uint32_t> pixels; // RGBA, row major
+    };
+    struct PreparedPrimitive;
+    struct RasterQueue;
+    struct RasterQueueDeleter
+    {
+        void operator()(RasterQueue *queue) const;
+    };
+    static bool UseReferenceRasteriser();
+    bool DrawFast(const GSPrimitiveBatch &batch, bool sprite);
+    bool PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
+    bool PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
+    static void Rasterise(const PreparedPrimitive &primitive, int yFirst, int yLast);
+    // Draw what is queued: all of it, or only if it involves these pixels of
+    // a surface (anything that reads or writes VRAM outside the queue asks).
+    void FlushPrimitives();
+    void FlushPrimitivesTouching(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool writes,
+                                 const char *why = "upload");
+    bool HasQueuedPrimitives() const;
+    const DecodedTexture *DecodedTextureFor(FastPipeline &pipeline);
+    uint64_t HashPages(const std::vector<uint32_t> &pages) const;
+
+    // Texture cache bookkeeping: every writer says which VRAM pages it touched.
+    static constexpr uint32_t kVramPages = 512u;
+    void MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    void MarkAllWritten();
+
     void DrawPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
     void DrawTriangle(const GSPrimitiveBatch &batch);
@@ -72,6 +119,19 @@ private:
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
+    // CLUT entries converted to RGBA for the fast paths, filled on first use.
+    // A stamp other than m_fastClutKey marks an entry stale.
+    uint64_t m_clutLoads = 0;
+    uint64_t m_fastClutLoad = ~0ull;
+    uint64_t m_fastClutConversion = ~0ull;
+    uint32_t m_fastClutKey = 1;
+    std::array<uint32_t, 256> m_fastClut{};
+    std::array<uint32_t, 256> m_fastClutStamp{};
+    uint64_t m_writeSerial = 1;
+    std::array<uint64_t, kVramPages> m_pageSerial{};
+    std::unordered_map<uint64_t, DecodedTexture> m_decodedTextures;
+    uint64_t m_decodedUseClock = 0;
+    std::unique_ptr<RasterQueue, RasterQueueDeleter> m_rasterQueue;
     GSMem::TexturePageCache m_texturePageCache;
 
     GSTransferCommand m_transfer{};

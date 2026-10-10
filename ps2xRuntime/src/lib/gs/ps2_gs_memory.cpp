@@ -201,6 +201,69 @@ namespace GSMem
     static P8PageLookupTable   PageTableP8{ };
     static P4PageLookupTable   PageTableP4{ };
 
+    namespace
+    {
+        template <PixelStorageMode psm, typename Table>
+        SurfaceLayout makeLayout(const Table &table, u32 bp, u32 bw)
+        {
+            using Traits = PixelStorageTraits<psm>;
+            constexpr auto page = Traits::PageExtent();
+            auto log2 = [](usz value)
+            {
+                u8 bits = 0;
+                while ((usz{1} << bits) < value)
+                    ++bits;
+                return bits;
+            };
+
+            SurfaceLayout layout;
+            layout.table = &table[bp % Traits::BlocksPerPage()][0][0];
+            layout.basePage = bp / static_cast<u32>(Traits::BlocksPerPage());
+            layout.pagesPerRow = (bw * 64u) / page.x;
+            layout.pageWidthShift = log2(page.x);
+            layout.pageHeightShift = log2(page.y);
+            layout.unitsPerPageShift = log2(Traits::PixelsPerPage());
+            layout.unitBits = static_cast<u8>(UnpackedBitWidth(psm));
+            layout.spillsIntoNextPage = (bp % Traits::BlocksPerPage()) != 0u;
+            return layout;
+        }
+    }
+
+    SurfaceLayout LayoutOf(u32 psm, u32 bp, u32 bw)
+    {
+        switch (static_cast<PixelStorageMode>(psm))
+        {
+        case C32:
+            return makeLayout<C32>(PageTableC32, bp, bw);
+        case C24:
+            return makeLayout<C24>(PageTableC32, bp, bw);
+        case C16:
+            return makeLayout<C16>(PageTableC16, bp, bw);
+        case C16S:
+            return makeLayout<C16S>(PageTableC16S, bp, bw);
+        case P8:
+            return makeLayout<P8>(PageTableP8, bp, bw);
+        case P4:
+            return makeLayout<P4>(PageTableP4, bp, bw);
+        case P8H:
+            return makeLayout<P8H>(PageTableC32, bp, bw);
+        case P4HL:
+            return makeLayout<P4HL>(PageTableC32, bp, bw);
+        case P4HH:
+            return makeLayout<P4HH>(PageTableC32, bp, bw);
+        case Z32:
+            return makeLayout<Z32>(PageTableZ32, bp, bw);
+        case Z24:
+            return makeLayout<Z24>(PageTableZ32, bp, bw);
+        case Z16:
+            return makeLayout<Z16>(PageTableZ16, bp, bw);
+        case Z16S:
+            return makeLayout<Z16S>(PageTableZ16S, bp, bw);
+        default:
+            return {};
+        }
+    }
+
     void InitLookupTables()
     {
         // 32 bit

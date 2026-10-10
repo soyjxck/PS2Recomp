@@ -540,6 +540,40 @@ namespace GSMem
 
 	void InitLookupTables();
 
+	// Where a surface's pixels live in VRAM, cheap enough to evaluate per
+	// pixel. unit(x, y) is the pixel's index in units of the format's unpacked
+	// size (32, 16, 8 or 4 bits), the same value Address() computes.
+	struct SurfaceLayout
+	{
+		const u16* table = nullptr; // [page height][page width], for the base block
+		u32 basePage = 0;
+		u32 pagesPerRow = 1;
+		u8 pageWidthShift = 6;
+		u8 pageHeightShift = 5;
+		u8 unitsPerPageShift = 11;
+		u8 unitBits = 32;
+		// A base pointer that is not page aligned pushes the last blocks of
+		// each page into the one after it.
+		bool spillsIntoNextPage = false;
+
+		// The 8 KiB VRAM page pixel (x, y) starts in (not wrapped to VRAM).
+		u32 page(u32 x, u32 y) const
+		{
+			return basePage + (y >> pageHeightShift) * pagesPerRow + (x >> pageWidthShift);
+		}
+
+		u32 unit(u32 x, u32 y) const
+		{
+			const u32 pageWidthMask = (1u << pageWidthShift) - 1u;
+			const u32 pageHeightMask = (1u << pageHeightShift) - 1u;
+			const u32 page = basePage + (y >> pageHeightShift) * pagesPerRow + (x >> pageWidthShift);
+			return (page << unitsPerPageShift) + table[((y & pageHeightMask) << pageWidthShift) + (x & pageWidthMask)];
+		}
+	};
+
+	// Returns a layout with a null table for a storage mode that does not exist.
+	SurfaceLayout LayoutOf(u32 psm, u32 bp, u32 bw);
+
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 
