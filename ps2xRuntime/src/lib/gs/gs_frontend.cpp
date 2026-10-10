@@ -2,6 +2,9 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include <cstdlib>
+#include <vector>
+#include <string>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -501,6 +504,81 @@ uint32_t GS::getLastDisplayBaseBytes() const
 void GS::refreshDisplaySnapshot()
 {
     snapshotVRAM();
+}
+
+// Fast-forward aids for unattended test runs (emulated seconds since boot):
+//   PS2X_SKIP_DRAW_UNTIL=<secs>   do not rasterise before that time
+//   PS2X_DRAW_NEAR_DUMPS=1        only rasterise around the frames that
+//                                 PS2X_FRAME_DUMP_EVERY/_AT and PS2X_EXIT_AT save
+// While skipping, register writes, image transfers and SIGNAL/FINISH still
+// happen, so the guest runs normally; only the software renderer's cost (most
+// of the EE thread's time) is avoided.
+bool GS::skipDrawForFastForward() const
+{
+    struct Plan
+    {
+        uint64_t untilTick = 0;
+        bool nearDumpsOnly = false;
+        uint64_t everyTicks = 0;
+        std::vector<uint64_t> atTicks;
+    };
+    static const Plan plan = []
+    {
+        constexpr double kVBlanksPerSecond = 59.94;
+        auto ticks = [](const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value ? static_cast<uint64_t>(std::atof(value) * kVBlanksPerSecond) : 0ull;
+        };
+        Plan p;
+        p.untilTick = ticks("PS2X_SKIP_DRAW_UNTIL");
+        const char *near = std::getenv("PS2X_DRAW_NEAR_DUMPS");
+        p.nearDumpsOnly = near != nullptr && near[0] != '\0' && near[0] != '0';
+        p.everyTicks = ticks("PS2X_FRAME_DUMP_EVERY");
+        if (const char *list = std::getenv("PS2X_FRAME_DUMP_AT"))
+        {
+            std::string text = list;
+            size_t pos = 0;
+            while (pos < text.size())
+            {
+                size_t end = text.find(',', pos);
+                if (end == std::string::npos)
+                    end = text.size();
+                if (end > pos)
+                    p.atTicks.push_back(static_cast<uint64_t>(std::atof(text.substr(pos, end - pos).c_str()) * kVBlanksPerSecond));
+                pos = end + 1;
+            }
+        }
+        if (const uint64_t exitTick = ticks("PS2X_EXIT_AT"))
+            p.atTicks.push_back(exitTick);
+        return p;
+    }();
+
+    if (m_privRegs == nullptr || (plan.untilTick == 0u && !plan.nearDumpsOnly))
+        return false;
+    const uint64_t tick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
+    if (tick < plan.untilTick)
+        return true;
+    if (!plan.nearDumpsOnly)
+        return false;
+
+    // Draw from a little before each saved frame (enough for the game to fill
+    // both display buffers) until a little after it (the dump is taken by the
+    // presentation thread, which can lag the emulated clock in turbo mode).
+    constexpr uint64_t kLeadTicks = 20u;
+    constexpr uint64_t kTailTicks = 12u;
+    if (plan.everyTicks != 0u)
+    {
+        const uint64_t phase = tick % plan.everyTicks;
+        if (phase + kLeadTicks >= plan.everyTicks || phase <= kTailTicks)
+            return false;
+    }
+    for (const uint64_t at : plan.atTicks)
+    {
+        if (tick + kLeadTicks >= at && tick <= at + kTailTicks)
+            return false;
+    }
+    return true;
 }
 
 GSPresentationRequest GS::buildPresentationRequestUnlocked() const
@@ -1572,7 +1650,7 @@ void GS::vertexKick(bool drawing)
     if (m_vtxCount < needed)
         return;
 
-    if (drawing && m_backend)
+    if (drawing && m_backend && !skipDrawForFastForward())
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
         updatePreferredDisplaySourceForDraw(batch);

@@ -1,5 +1,10 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ee_scheduler.h"
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -33,6 +38,8 @@ namespace ps2_stubs
         constexpr uint16_t kPadBtnCircle = 1u << 13;
         constexpr uint16_t kPadBtnCross = 1u << 14;
         constexpr uint16_t kPadBtnSquare = 1u << 15;
+        constexpr double kScriptTicksPerSecond = 59.94; // NTSC vblanks
+        constexpr uint64_t kScriptHoldTicks = 9u;
 
         struct PadInputState
         {
@@ -269,6 +276,74 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        // PS2X_PAD_SCRIPT="cross@3.5,start@21,down@40.25" taps buttons at the given
+        // emulated time (seconds since boot, counted in vblanks), each held for
+        // 0.15 s. Emulated time makes a script reproducible whatever speed the
+        // host runs at, so unattended test runs can drive menus.
+        uint16_t scriptedPadButtons(uint64_t vsyncTick)
+        {
+            struct Press
+            {
+                uint64_t startTick;
+                uint16_t mask;
+                const char *name;
+                bool logged;
+            };
+            static std::vector<Press> script = []
+            {
+                static const struct { const char *name; uint16_t mask; } kButtons[] = {
+                    {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                    {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                    {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                    {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+                    {"square", kPadBtnSquare},
+                };
+                std::vector<Press> presses;
+                const char *env = std::getenv("PS2X_PAD_SCRIPT");
+                const std::string text = env ? env : "";
+                size_t pos = 0;
+                while (pos < text.size())
+                {
+                    size_t end = text.find(',', pos);
+                    if (end == std::string::npos)
+                        end = text.size();
+                    const std::string item = text.substr(pos, end - pos);
+                    const size_t at = item.find('@');
+                    if (at != std::string::npos)
+                    {
+                        for (const auto &button : kButtons)
+                        {
+                            if (item.compare(0, at, button.name) == 0)
+                            {
+                                const double seconds = std::atof(item.c_str() + at + 1);
+                                presses.push_back({static_cast<uint64_t>(seconds * kScriptTicksPerSecond),
+                                                   button.mask, button.name, false});
+                                break;
+                            }
+                        }
+                    }
+                    pos = end + 1;
+                }
+                return presses;
+            }();
+
+            uint16_t held = 0u;
+            for (Press &press : script)
+            {
+                if (vsyncTick >= press.startTick && vsyncTick < press.startTick + kScriptHoldTicks)
+                {
+                    held |= press.mask;
+                    if (!press.logged)
+                    {
+                        press.logged = true;
+                        std::fprintf(stderr, "[pad-script] t=%.2fs %s\n",
+                                     static_cast<double>(vsyncTick) / kScriptTicksPerSecond, press.name);
+                    }
+                }
+            }
+            return held;
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -316,6 +391,12 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+            }
+
+            if (runtime && port == 0)
+            {
+                // Buttons are active low.
+                state.buttons &= static_cast<uint16_t>(~scriptedPadButtons(runtime->eeScheduler().currentVSyncTick()));
             }
 
             fillPadStatus(outData, state, portState);

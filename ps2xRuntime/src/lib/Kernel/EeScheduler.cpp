@@ -3,6 +3,7 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -1793,6 +1794,16 @@ void EeScheduler::processDueDeadlines()
 {
     for (;;)
     {
+        // This runs on every scheduler iteration; when no deadline has been
+        // reached there is nothing to pace or deliver, so skip the lock and
+        // the host clock read (m_nextDeadlineCycle is kept current by
+        // updateNextDeadline()).
+        const uint64_t nextDeadline = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextDeadline == 0u || m_eeCycle < nextDeadline)
+        {
+            return;
+        }
+
         std::vector<ScheduledEvent> due;
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
@@ -2010,6 +2021,13 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
     std::memcpy(m_rdram + physical, &value, sizeof(value));
 }
 
+namespace
+{
+    // Any time safely in the past, and distinct from the default-constructed
+    // "no deadline" sentinel used by processDueDeadlines().
+    constexpr std::chrono::steady_clock::time_point kTurboAlreadyDue{std::chrono::nanoseconds(1)};
+}
+
 void EeScheduler::waitForEvent()
 {
     std::unique_lock lock(m_eventMutex);
@@ -2052,6 +2070,16 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    if (turboEnabled())
+    {
+        // Idle with no pacing: jump to whichever emulated deadline is first.
+        if (hasTimerDeadline && (m_deadlines.empty() || m_eeCycle + timerCycles < deadlineCycle))
+        {
+            deadlineCycle = m_eeCycle + timerCycles;
+        }
+        hostDeadline = kTurboAlreadyDue;
+    }
+
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2070,10 +2098,26 @@ void EeScheduler::waitForEvent()
     }
 }
 
+bool EeScheduler::turboEnabled() noexcept
+{
+    // PS2X_TURBO=1 drops real-time pacing: events fire as soon as their
+    // emulated deadline is reached, so the guest runs as fast as the host can.
+    static const bool enabled = []
+    {
+        const char *value = std::getenv("PS2X_TURBO");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
                                 std::chrono::steady_clock::time_point hostDeadline,
                                 EeEvent event)
 {
+    if (turboEnabled())
+    {
+        hostDeadline = kTurboAlreadyDue;
+    }
     {
         std::lock_guard lock(m_eventMutex);
         m_deadlines.push_back(ScheduledEvent{deadlineCycle, hostDeadline, event, ++m_eventSequence});

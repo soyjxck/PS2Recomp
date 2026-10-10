@@ -26,6 +26,10 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace ps2_stubs
 {
@@ -373,6 +377,88 @@ namespace
     }
 }
 
+namespace
+{
+    constexpr double kTestVBlanksPerSecond = 59.94; // NTSC
+
+    uint64_t envEmulatedTicks(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return value ? static_cast<uint64_t>(std::atof(value) * kTestVBlanksPerSecond) : 0ull;
+    }
+
+    // Unattended test runs, all in emulated time (seconds since boot, counted
+    // in vblanks) so they do not depend on how fast the host runs:
+    //   PS2X_FRAME_DUMP_DIR=<dir>     write presented frames as PNGs there
+    //   PS2X_FRAME_DUMP_EVERY=<secs>  ...periodically
+    //   PS2X_FRAME_DUMP_AT=<t1,t2>    ...and/or at specific times
+    //   PS2X_EXIT_AT=<secs>           dump a last frame and exit
+    //   PS2X_PERF_LOG=<secs>          print emulated-vs-wall speed periodically
+    void maybeDumpPresentedFrame(const uint8_t *rgba, uint32_t strideBytes, uint32_t width, uint32_t height, uint64_t tick)
+    {
+        struct DumpPlan
+        {
+            std::string dir;
+            uint64_t everyTicks = 0;
+            uint64_t nextEveryTick = 0;
+            std::vector<uint64_t> atTicks;
+            size_t nextAt = 0;
+        };
+        static DumpPlan plan = []
+        {
+            DumpPlan p;
+            if (const char *dir = std::getenv("PS2X_FRAME_DUMP_DIR"))
+                p.dir = dir;
+            p.everyTicks = envEmulatedTicks("PS2X_FRAME_DUMP_EVERY");
+            p.nextEveryTick = p.everyTicks;
+            if (const char *list = std::getenv("PS2X_FRAME_DUMP_AT"))
+            {
+                std::stringstream stream(list);
+                std::string item;
+                while (std::getline(stream, item, ','))
+                    if (!item.empty())
+                        p.atTicks.push_back(static_cast<uint64_t>(std::atof(item.c_str()) * kTestVBlanksPerSecond));
+            }
+            if (const uint64_t exitTick = envEmulatedTicks("PS2X_EXIT_AT"))
+                p.atTicks.push_back(exitTick);
+            std::sort(p.atTicks.begin(), p.atTicks.end());
+            return p;
+        }();
+
+        if (plan.dir.empty() || !rgba || width == 0u || height == 0u)
+            return;
+
+        bool due = false;
+        if (plan.everyTicks != 0u && tick >= plan.nextEveryTick)
+        {
+            due = true;
+            while (plan.nextEveryTick <= tick)
+                plan.nextEveryTick += plan.everyTicks;
+        }
+        while (plan.nextAt < plan.atTicks.size() && tick >= plan.atTicks[plan.nextAt])
+        {
+            due = true;
+            ++plan.nextAt;
+        }
+        if (!due)
+            return;
+
+        std::vector<uint8_t> packed(static_cast<size_t>(width) * height * 4u);
+        for (uint32_t y = 0; y < height; ++y)
+            std::memcpy(packed.data() + static_cast<size_t>(y) * width * 4u,
+                        rgba + static_cast<size_t>(y) * strideBytes, static_cast<size_t>(width) * 4u);
+        Image image{};
+        image.data = packed.data();
+        image.width = static_cast<int>(width);
+        image.height = static_cast<int>(height);
+        image.mipmaps = 1;
+        image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        char name[64];
+        std::snprintf(name, sizeof(name), "/f_%07.2f.png", static_cast<double>(tick) / kTestVBlanksPerSecond);
+        ExportImage(image, (plan.dir + name).c_str());
+    }
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -472,6 +558,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
 
     UpdateTexture(tex, s_uploadBuffer.data());
+    maybeDumpPresentedFrame(s_uploadBuffer.data(), FB_WIDTH * 4u,
+                            std::min<uint32_t>(width, FB_WIDTH), std::min<uint32_t>(height, FB_HEIGHT), currentTick);
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -2423,6 +2511,38 @@ void PS2Runtime::run()
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+        {
+            static const uint64_t exitTick = envEmulatedTicks("PS2X_EXIT_AT");
+            static const uint64_t perfTicks = envEmulatedTicks("PS2X_PERF_LOG");
+            static const auto wallStart = std::chrono::steady_clock::now();
+            static uint64_t nextPerfTick = perfTicks;
+            static double lastWall = 0.0;
+            static uint64_t lastTick = 0u;
+            const uint64_t emulatedTick = m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u;
+            if (perfTicks != 0u && emulatedTick >= nextPerfTick)
+            {
+                const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - wallStart).count();
+                const double emulated = static_cast<double>(emulatedTick) / kTestVBlanksPerSecond;
+                const double recent = (wall > lastWall)
+                                          ? (static_cast<double>(emulatedTick - lastTick) / kTestVBlanksPerSecond) / (wall - lastWall)
+                                          : 0.0;
+                std::fprintf(stderr, "[perf] emu=%.1fs wall=%.1fs speed=%.2fx (recent %.2fx)\n",
+                             emulated, wall, wall > 0.0 ? emulated / wall : 0.0, recent);
+                lastWall = wall;
+                lastTick = emulatedTick;
+                while (nextPerfTick <= emulatedTick)
+                    nextPerfTick += perfTicks;
+            }
+            if (exitTick != 0u && emulatedTick >= exitTick)
+            {
+                std::fprintf(stderr, "[run] PS2X_EXIT_AT reached at emu=%.2fs\n",
+                             static_cast<double>(emulatedTick) / kTestVBlanksPerSecond);
+                std::fflush(stdout);
+                std::fflush(stderr);
+                std::_Exit(0);
+            }
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
