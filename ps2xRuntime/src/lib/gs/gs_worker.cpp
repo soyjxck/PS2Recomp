@@ -3,7 +3,9 @@
 #include "runtime/vu1_worker.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -47,7 +49,34 @@ namespace
                 queuedBytes -= packet.size();
                 lock.unlock();
 
+                // PS2X_GS_STATS=1: how much of its time the worker spends drawing.
+                static const bool wantStats = []
+                {
+                    const char *value = std::getenv("PS2X_GS_STATS");
+                    return value != nullptr && value[0] != '\0' && value[0] != '0';
+                }();
+                const auto started = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
                 gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+
+                if (wantStats)
+                {
+                    static double busySeconds = 0.0;
+                    static uint64_t packets = 0;
+                    static auto windowStart = started;
+                    const auto finished = std::chrono::steady_clock::now();
+                    busySeconds += std::chrono::duration<double>(finished - started).count();
+                    ++packets;
+                    const double window = std::chrono::duration<double>(finished - windowStart).count();
+                    if (window >= 2.0)
+                    {
+                        std::fprintf(stderr, "[gs-worker] busy %.0f%% of the time, %.0f packets/s\n",
+                                     100.0 * busySeconds / window, static_cast<double>(packets) / window);
+                        busySeconds = 0.0;
+                        packets = 0;
+                        windowStart = finished;
+                    }
+                }
 
                 lock.lock();
                 ++completed;
