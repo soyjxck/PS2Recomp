@@ -611,8 +611,11 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 7, 448u);
             setRegU32(ctx, 29, kStackAddr);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
-            std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
+            // The EE's calling convention passes arguments five to eight in
+            // $t0-$t3; nothing of them is on the stack.
+            setRegU32(ctx, 8, kZTest);
+            setRegU32(ctx, 9, 0u);
+            setRegU32(ctx, 10, kEnableClear);
             std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
 
@@ -643,6 +646,8 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 4, kEnvAddr);
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            // A runtime's GS draws in the background: wait for it.
+            runtime.gs().refreshDisplaySnapshot();
 
             uint32_t clearedPixel = 0u;
             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
@@ -698,6 +703,7 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 4, kEnvAddr);
             setRegU32(ctx, 5, 0u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
+            runtime.gs().refreshDisplaySnapshot();
 
             uint32_t clearedPixel = 0u;
             std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
@@ -1681,7 +1687,7 @@ void register_ps2_gs_tests()
                      "single-circuit presentation should normalize the last row alpha");
         });
 
-        tc.Run("latched host presentation line-doubles interlaced field output", [](TestCase &t)
+        tc.Run("latched host presentation shows every line of a field-mode buffer", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GSRegisters regs{};
@@ -1732,12 +1738,14 @@ void register_ps2_gs_tests()
             const uint32_t row2 = pixelAtRow(2u);
             const uint32_t row3 = pixelAtRow(3u);
 
-            t.Equals(row0, row1,
-                     "field presentation should duplicate the active field into the next scanline");
-            t.Equals(row2, row3,
-                     "field presentation should duplicate later field scanlines as well");
-            t.IsTrue(row0 != row2,
-                     "field presentation should still preserve different source content across field rows");
+            // In field mode the GS reads the odd lines of the buffer in one
+            // field and the even lines in the next, and a television keeps
+            // both on screen: the picture is the whole buffer. (PS2X_GS_BOB=1
+            // shows one field with its lines doubled instead.)
+            t.Equals(row0, kLine0, "field presentation should show the buffer's first line");
+            t.Equals(row1, kLine1, "field presentation should show the line between, not the first again");
+            t.Equals(row2, kLine2, "field presentation should show the third line");
+            t.Equals(row3, kLine3, "field presentation should show the fourth line");
         });
 
         tc.Run("GIF PACKED A+D writes DISPFB1 and DISPLAY1 privileged registers", [](TestCase &t)
@@ -2661,7 +2669,7 @@ void register_ps2_gs_tests()
                      "T4 CSM1 lookup should keep the cached palette after its source VRAM is reused");
         });
 
-        tc.Run("GS texture page buffer hides local-memory writes until TEXFLUSH", [](TestCase &t)
+        tc.Run("GS texture reads see local-memory writes with or without TEXFLUSH", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
             GS gs;
@@ -2709,7 +2717,13 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_XYZ2, xy1);
             };
 
-            drawPixel(0u); // Fills the hardware texture page buffer.
+            // The hardware keeps the texture page it last sampled in a buffer
+            // and shows a write to that page only after TEXFLUSH. The fast
+            // rasteriser does not model the buffer (nor do other emulators:
+            // a program that skipped TEXFLUSH would be relying on stale
+            // texels): a texture is read as local memory has it. Only the
+            // reference rasteriser (PS2X_GS_REFERENCE=1) keeps the buffer.
+            drawPixel(0u);
             gs.WriteVram(GS_PSM_CT32, kTextureTbp, 1u, 0u, 0u, kUpdatedColor);
             drawPixel(1u);
             gs.writeRegister(GS_REG_TEXFLUSH, 0ull);
@@ -2717,10 +2731,10 @@ void register_ps2_gs_tests()
 
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 0u, 0u), kInitialColor,
                      "the first sample should read the original texture page");
-            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kInitialColor,
-                     "writes to local memory must remain hidden by the cached texture page");
+            t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 1u, 0u), kUpdatedColor,
+                     "a write to local memory is what the next texture read sees");
             t.Equals(gs.ReadVram(GS_PSM_CT32, 0u, 1u, 2u, 0u), kUpdatedColor,
-                     "TEXFLUSH must make the updated local-memory page visible to texture reads");
+                     "and TEXFLUSH changes nothing about it");
         });
 
         tc.Run("GS T8 CT32-uploaded CSM1 CLUT follows swizzled palette layout", [](TestCase &t)

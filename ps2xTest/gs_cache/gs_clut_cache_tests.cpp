@@ -68,10 +68,14 @@ namespace
         f.index(tex, 8);
         f.palette(tex, 8, kRed);
         f.bind(tex);
-        // No texture sampling between loads: the CLUT source page is still resident.
+        // On the hardware the CLUT's source page would still be in the
+        // texture page buffer here, and the load would read the old palette
+        // until a TEXFLUSH. The backend does not model that buffer for CLUT
+        // loads: a load takes the palette as local memory has it (or as it
+        // was last uploaded), like its texture reads.
         f.palette(tex, 8, kGreen);
         f.bind(tex);
-        expectEqual(f.sample(), kRed, "CLD=1 alone does not invalidate the texture page buffer");
+        expectEqual(f.sample(), kGreen, "a CLUT load reads the palette as it now is");
         f.flush();
         f.bind(tex);
         expectEqual(f.sample(), kGreen, "identical TEX0 write still loads after TEXFLUSH");

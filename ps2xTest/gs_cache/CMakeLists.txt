@@ -13,6 +13,7 @@ option(PS2_GS_CACHE_BUILD_MEMORY_TESTS "Build tests for the new shared cached-re
 find_package(Threads REQUIRED)
 add_library(ps2_gs_cache_backend_under_test STATIC
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_backend.cpp"
+    "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_cpu_raster.cpp"
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/gs_frontend.cpp"
     "${PS2_GS_RUNTIME_DIR}/src/lib/gs/ps2_gs_memory.cpp"
 )
