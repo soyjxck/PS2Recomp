@@ -242,6 +242,7 @@ struct GSCpuBackend::FastPipeline
     bool abe = false;
     bool pabe = false;
     uint8_t asel = 0, bsel = 0, csel = 0, dsel = 0, fix = 0;
+    int maskAS = 0, maskAD = 0, maskBS = 0, maskBD = 0, maskDS = 0, maskDD = 0;
     bool fba = false;
 
     // Fog.
@@ -263,6 +264,10 @@ struct GSCpuBackend::FastPipeline
     int minU = 0, maxU = 0, minV = 0, maxV = 0;
     uint8_t cpsm = 0, csm = 0, csa = 0;
     uint32_t tbp0 = 0, tbw = 0;
+    // Wrapping as mask then clamp (see texel()).
+    bool regionRepeat = false;
+    int maskU = -1, maskV = -1;
+    int lowU = 0, highU = 0, lowV = 0, highV = 0;
     // The decoded copy, when the texture can use one.
     const uint32_t *decoded = nullptr;
     // The pixels the primitive can touch, for telling a texture that is also
@@ -355,8 +360,19 @@ struct GSCpuBackend::FastPipeline
 
     [[gnu::always_inline]] inline uint32_t texel(int u, int v) const
     {
-        u = wrapCoordinate(u, texW, wrapU, minU, maxU);
-        v = wrapCoordinate(v, texH, wrapV, minV, maxV);
+        // REPEAT is a mask, both clamps are bounds; REGION_REPEAT is rare.
+        if (regionRepeat) [[unlikely]]
+        {
+            u = wrapCoordinate(u, texW, wrapU, minU, maxU);
+            v = wrapCoordinate(v, texH, wrapV, minV, maxV);
+        }
+        else
+        {
+            u &= maskU;
+            v &= maskV;
+            u = u < lowU ? lowU : (u > highU ? highU : u);
+            v = v < lowV ? lowV : (v > highV ? highV : v);
+        }
         if (decoded)
             return decoded[v * texW + u];
         return fetch(u, v);
@@ -422,7 +438,29 @@ struct GSCpuBackend::FastPipeline
 
     // Fog, the tests, blending and the stores: GSCpuBackend::WritePixel for a
     // pixel already known to be inside the scissor rectangle.
-    [[gnu::always_inline]] inline void write(int x, int y, uint32_t z, int r, int g, int b, int a, int fog) const
+    // One scanline of a surface: the page its first column is in and the
+    // row of the page table that applies.
+    struct Row
+    {
+        const uint16_t *table;
+        uint32_t page;
+    };
+
+    [[gnu::always_inline]] inline static Row rowOf(const GSMem::SurfaceLayout &layout, int y)
+    {
+        const uint32_t uy = static_cast<uint32_t>(y);
+        return {layout.table + ((uy & ((1u << layout.pageHeightShift) - 1u)) << layout.pageWidthShift),
+                layout.basePage + (uy >> layout.pageHeightShift) * layout.pagesPerRow};
+    }
+
+    [[gnu::always_inline]] inline static uint32_t unitIn(const GSMem::SurfaceLayout &layout, const Row &row, int x)
+    {
+        const uint32_t ux = static_cast<uint32_t>(x);
+        return ((row.page + (ux >> layout.pageWidthShift)) << layout.unitsPerPageShift) +
+               row.table[ux & ((1u << layout.pageWidthShift) - 1u)];
+    }
+
+    [[gnu::always_inline]] inline void write(int x, const Row &frameRow, const Row &depthRow, uint32_t z, int r, int g, int b, int a, int fog) const
     {
         if (fge)
         {
@@ -469,7 +507,7 @@ struct GSCpuBackend::FastPipeline
 
         const bool writesFrame = writeRgb || writeAlpha;
         const bool preserveAlpha = writeRgb && !writeAlpha && framePsm == GS_PSM_CT32;
-        const uint32_t frameUnit = frame.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+        const uint32_t frameUnit = unitIn(frame, frameRow, x);
 
         uint32_t rawFrame = 0u;
         uint32_t frameRgba = 0u;
@@ -511,7 +549,7 @@ struct GSCpuBackend::FastPipeline
 
         uint32_t depthUnit = 0u;
         if (ztst >= 2u || (writeDepth && !zmask))
-            depthUnit = depth.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+            depthUnit = unitIn(depth, depthRow, x);
 
         if (ztst == 0u)
             return;
@@ -543,13 +581,16 @@ struct GSCpuBackend::FastPipeline
                 const int db = static_cast<int>((frameRgba >> 16) & 0xFFu);
                 const int da = static_cast<int>(frameRgba >> 24);
                 const int alpha = csel == 0 ? a : (csel == 1 ? da : fix);
-                auto pick = [](uint8_t sel, int source, int dest)
+                // ((A - B) * alpha >> 7) + D with A, B, D each source, destination
+                // or zero: the selectors are masks, set up once.
+                auto blend = [&](int source, int dest)
                 {
-                    return sel == 0 ? source : (sel == 1 ? dest : 0);
+                    const int difference = ((source & maskAS) | (dest & maskAD)) - ((source & maskBS) | (dest & maskBD));
+                    return clampU8(((difference * alpha) >> 7) + ((source & maskDS) | (dest & maskDD)));
                 };
-                r = clampU8((((pick(asel, r, dr) - pick(bsel, r, dr)) * alpha) >> 7) + pick(dsel, r, dr));
-                g = clampU8((((pick(asel, g, dg) - pick(bsel, g, dg)) * alpha) >> 7) + pick(dsel, g, dg));
-                b = clampU8((((pick(asel, b, db) - pick(bsel, b, db)) * alpha) >> 7) + pick(dsel, b, db));
+                r = blend(r, dr);
+                g = blend(g, dg);
+                b = blend(b, db);
             }
 
             if (writeAlpha && fba && framePsm != GS_PSM_CT24)
@@ -663,6 +704,12 @@ bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &s
     csel = static_cast<uint8_t>((ctx.alpha >> 4) & 3u);
     dsel = static_cast<uint8_t>((ctx.alpha >> 6) & 3u);
     fix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFFu);
+    maskAS = asel == 0u ? -1 : 0;
+    maskAD = asel == 1u ? -1 : 0;
+    maskBS = bsel == 0u ? -1 : 0;
+    maskBD = bsel == 1u ? -1 : 0;
+    maskDS = dsel == 0u ? -1 : 0;
+    maskDD = dsel == 1u ? -1 : 0;
     fba = (ctx.fba & 0x1ull) != 0ull;
 
     fge = state.prim.fge;
@@ -732,6 +779,16 @@ bool GSCpuBackend::FastPipeline::setup(GSCpuBackend &owner, const GSDrawState &s
     csa = tex.csa;
     tbp0 = tex.tbp0;
     tbw = tex.tbw;
+
+    regionRepeat = wrapU == 3u || wrapV == 3u;
+    auto wrapAs = [](uint8_t mode, int size, int regionMin, int regionMax, int &mask, int &low, int &high)
+    {
+        mask = mode == 0u ? size - 1 : -1;
+        low = mode == 2u ? regionMin : 0;
+        high = mode == 2u ? regionMax : size - 1;
+    };
+    wrapAs(wrapU, texW, minU, maxU, maskU, lowU, highU);
+    wrapAs(wrapV, texH, minV, maxV, maskV, lowV, highV);
 
     if (texKind >= TextureKind::Index8)
     {
@@ -921,6 +978,14 @@ struct GSCpuBackend::PreparedPrimitive
     float fx2 = 0.0f, fy2 = 0.0f;
     float wa[3]{}, wb[3]{}, wc[3]{};
     bool ownsEdge[3]{};
+    // Each interpolated attribute as a plane: value at vertex 2, and its
+    // change per pixel in x and in y.
+    struct Plane
+    {
+        float base = 0.0f, dx = 0.0f, dy = 0.0f;
+    };
+    Plane red, green, blue, alpha, fog, texS, texT, texQ;
+    double zBase = 0.0, zDx = 0.0, zDy = 0.0;
 
     // Sprite: its unclipped origin and size, and texel coordinates at the
     // corners.
@@ -1209,6 +1274,35 @@ bool GSCpuBackend::PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimit
     for (int i = 0; i < 3; ++i)
         primitive.ownsEdge[i] = wa[i] > 0.0f || (wa[i] == 0.0f && wb[i] > 0.0f);
 
+    // value = a0 * w0 + a1 * w1 + a2 * w2 with w2 = 1 - w0 - w1 is a plane.
+    auto plane = [&](float a0, float a1, float a2)
+    {
+        PreparedPrimitive::Plane result;
+        result.base = a2;
+        result.dx = (a0 - a2) * wa[0] + (a1 - a2) * wa[1];
+        result.dy = (a0 - a2) * wb[0] + (a1 - a2) * wb[1];
+        return result;
+    };
+    primitive.red = plane(v0.r, v1.r, v2.r);
+    primitive.green = plane(v0.g, v1.g, v2.g);
+    primitive.blue = plane(v0.b, v1.b, v2.b);
+    primitive.alpha = plane(v0.a, v1.a, v2.a);
+    primitive.fog = plane(v0.fog, v1.fog, v2.fog);
+    if (state.prim.fst)
+    {
+        primitive.texS = plane(v0.u, v1.u, v2.u);
+        primitive.texT = plane(v0.v, v1.v, v2.v);
+    }
+    else
+    {
+        primitive.texS = plane(v0.s, v1.s, v2.s);
+        primitive.texT = plane(v0.t, v1.t, v2.t);
+        primitive.texQ = plane(v0.q, v1.q, v2.q);
+    }
+    primitive.zBase = v2.z;
+    primitive.zDx = (v0.z - v2.z) * static_cast<double>(wa[0]) + (v1.z - v2.z) * static_cast<double>(wa[1]);
+    primitive.zDy = (v0.z - v2.z) * static_cast<double>(wb[0]) + (v1.z - v2.z) * static_cast<double>(wb[1]);
+
     if (p.tme)
     {
         float lowU = 1.0e30f, lowV = 1.0e30f, highU = -1.0e30f, highV = -1.0e30f;
@@ -1334,28 +1428,36 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
         if (!p.tme)
         {
             for (int y = yFirst; y <= yLast; ++y)
+            {
+                const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+                const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
                 for (int x = primitive.minX; x <= primitive.maxX; ++x)
-                    p.write(x, y, z, r, g, b, a, fog);
+                    p.write(x, frameRow, depthRow, z, r, g, b, a, fog);
+            }
             return;
         }
 
+        // Texel coordinates step evenly across the sprite; with FST they are
+        // 12.4 fixed point, as the reference rounds them.
+        const float stepU = (primitive.tu1 - primitive.tu0) / primitive.spanX;
+        const float stepV = (primitive.tv1 - primitive.tv0) / primitive.spanY;
+        auto quantise = [&](float coordinate)
+        {
+            return p.fst ? static_cast<float>(clampInt(static_cast<int>((coordinate * 16.0f) + 0.5f), 0, 0xFFFF)) * 0.0625f
+                         : coordinate;
+        };
         for (int y = yFirst; y <= yLast; ++y)
         {
-            const float ty = (static_cast<float>(y - primitive.originY) + 0.5f) / primitive.spanY;
-            float texV = primitive.tv0 + (primitive.tv1 - primitive.tv0) * ty;
-            if (p.fst)
-                texV = static_cast<float>(clampInt(static_cast<int>((texV * 16.0f) + 0.5f), 0, 0xFFFF)) / 16.0f;
-
+            const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+            const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+            const float texV = quantise(primitive.tv0 + (static_cast<float>(y - primitive.originY) + 0.5f) * stepV);
+            const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
             for (int x = primitive.minX; x <= primitive.maxX; ++x)
             {
-                const float tx = (static_cast<float>(x - primitive.originX) + 0.5f) / primitive.spanX;
-                float texU = primitive.tu0 + (primitive.tu1 - primitive.tu0) * tx;
-                if (p.fst)
-                    texU = static_cast<float>(clampInt(static_cast<int>((texU * 16.0f) + 0.5f), 0, 0xFFFF)) / 16.0f;
-
+                const float texU = quantise(rowU + static_cast<float>(x - primitive.minX) * stepU);
                 int pr = r, pg = g, pb = b, pa = a;
                 p.combine(p.sample(texU, texV), pr, pg, pb, pa);
-                p.write(x, y, z, pr, pg, pb, pa, fog);
+                p.write(x, frameRow, depthRow, z, pr, pg, pb, pa, fog);
             }
         }
         return;
@@ -1368,15 +1470,9 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
     const int minX = primitive.minX, maxX = primitive.maxX;
 
     const bool gouraud = primitive.gouraud;
-    const float r0 = v0.r, r1 = v1.r, r2 = v2.r;
-    const float g0 = v0.g, g1 = v1.g, g2 = v2.g;
-    const float b0 = v0.b, b1 = v1.b, b2 = v2.b;
-    const float a0 = v0.a, a1 = v1.a, a2 = v2.a;
-    const float f0 = v0.fog, f1 = v1.fog, f2 = v2.fog;
     const float texWf = static_cast<float>(p.texW);
     const float texHf = static_cast<float>(p.texH);
-    const float u0 = v0.u, u1 = v1.u, u2 = v2.u;
-    const float vv0 = v0.v, vv1 = v1.v, vv2 = v2.v;
+    const int flatR = v2.r, flatG = v2.g, flatB = v2.b, flatA = v2.a;
 
     for (int y = yFirst; y <= yLast; ++y)
     {
@@ -1418,30 +1514,41 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
             ++xStart;
         while (xEnd >= xStart && !inside(xEnd))
             --xEnd;
+        if (xStart > xEnd)
+            continue;
+
+        const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+        const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+
+        // Attribute values on this row at dx = 0 (vertex 2's column).
+        auto onRow = [&](const PreparedPrimitive::Plane &plane)
+        {
+            return plane.base + plane.dy * dy;
+        };
+        const float rowR = onRow(primitive.red), rowG = onRow(primitive.green), rowB = onRow(primitive.blue);
+        const float rowA = onRow(primitive.alpha), rowFog = onRow(primitive.fog);
+        const float rowS = onRow(primitive.texS), rowT = onRow(primitive.texT), rowQ = onRow(primitive.texQ);
+        const double rowZ = primitive.zBase + primitive.zDy * static_cast<double>(dy);
 
         for (int x = xStart; x <= xEnd; ++x)
         {
             const float dx = (static_cast<float>(x) + 0.5f) - fx2;
-            const float w0 = wa[0] * dx + rowW[0];
-            const float w1 = wa[1] * dx + rowW[1];
-            const float w2 = 1.0f - w0 - w1;
-
-            const double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            const double z = rowZ + primitive.zDx * static_cast<double>(dx);
 
             int r, g, b, a;
             if (gouraud)
             {
-                r = clampU8(static_cast<int>(r0 * w0 + r1 * w1 + r2 * w2));
-                g = clampU8(static_cast<int>(g0 * w0 + g1 * w1 + g2 * w2));
-                b = clampU8(static_cast<int>(b0 * w0 + b1 * w1 + b2 * w2));
-                a = clampU8(static_cast<int>(a0 * w0 + a1 * w1 + a2 * w2));
+                r = clampU8(static_cast<int>(rowR + primitive.red.dx * dx));
+                g = clampU8(static_cast<int>(rowG + primitive.green.dx * dx));
+                b = clampU8(static_cast<int>(rowB + primitive.blue.dx * dx));
+                a = clampU8(static_cast<int>(rowA + primitive.alpha.dx * dx));
             }
             else
             {
-                r = v2.r;
-                g = v2.g;
-                b = v2.b;
-                a = v2.a;
+                r = flatR;
+                g = flatG;
+                b = flatB;
+                a = flatA;
             }
 
             if (p.tme)
@@ -1449,26 +1556,24 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
                 float texU, texV;
                 if (p.fst)
                 {
-                    texU = static_cast<float>(static_cast<uint16_t>(u0 * w0 + u1 * w1 + u2 * w2)) / 16.0f;
-                    texV = static_cast<float>(static_cast<uint16_t>(vv0 * w0 + vv1 * w1 + vv2 * w2)) / 16.0f;
+                    texU = static_cast<float>(static_cast<uint16_t>(rowS + primitive.texS.dx * dx)) * 0.0625f;
+                    texV = static_cast<float>(static_cast<uint16_t>(rowT + primitive.texT.dx * dx)) * 0.0625f;
                 }
                 else
                 {
                     // S, T and Q are interpolated; the divide comes after.
-                    const float s = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                    const float t = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                    float q = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                    float q = rowQ + primitive.texQ.dx * dx;
                     if (!(std::fabs(q) > 1.0e-8f))
                         q = 1.0f;
                     const float invQ = 1.0f / q;
-                    texU = s * invQ * texWf;
-                    texV = t * invQ * texHf;
+                    texU = (rowS + primitive.texS.dx * dx) * invQ * texWf;
+                    texV = (rowT + primitive.texT.dx * dx) * invQ * texHf;
                 }
                 p.combine(p.sample(texU, texV), r, g, b, a);
             }
 
-            const int fog = clampU8(static_cast<int>(f0 * w0 + f1 * w1 + f2 * w2));
-            p.write(x, y, static_cast<uint32_t>(z + 0.5), r, g, b, a, fog);
+            const int fog = p.fge ? clampU8(static_cast<int>(rowFog + primitive.fog.dx * dx)) : 0;
+            p.write(x, frameRow, depthRow, static_cast<uint32_t>(z + 0.5), r, g, b, a, fog);
         }
     }
 }
