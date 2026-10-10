@@ -402,16 +402,43 @@ bool PS2Memory::initialize(size_t ramSize)
     }
 }
 
+namespace
+{
+    // advanceEeTimers is called at every EE checkpoint (each loop back-edge of
+    // the recompiled code). The timers are only brought up to date when an
+    // interrupt could be due, when the guest looks at them, or after this many
+    // cycles; in between the cycles just accumulate. (File statics rather than
+    // members: there is one EE, and ps2_memory.h is included by all generated
+    // code.)
+    constexpr uint64_t kEeTimerBatchCycles = 4096u;
+    uint64_t s_eeTimerBacklog = 0u;
+    uint64_t s_eeTimerBatch = 0u;       // backlog that forces an update; 0 = work it out
+    uint32_t s_eeTimerLateInterrupts = 0u; // raised while catching up for a register access
+}
+
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    s_eeTimerBacklog = 0u;
+    s_eeTimerBatch = 0u;
+    s_eeTimerLateInterrupts = 0u;
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
 {
-    if (eeCycles == 0u)
+    s_eeTimerBacklog += eeCycles;
+    if (s_eeTimerBacklog < s_eeTimerBatch && s_eeTimerLateInterrupts == 0u)
     {
         return 0u;
+    }
+
+    eeCycles = s_eeTimerBacklog;
+    s_eeTimerBacklog = 0u;
+    uint32_t interruptMask = s_eeTimerLateInterrupts;
+    s_eeTimerLateInterrupts = 0u;
+    if (eeCycles == 0u)
+    {
+        return interruptMask;
     }
 
     constexpr uint32_t kGifStat = 0x10003020u;
@@ -420,7 +447,6 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
     if (gifStatIt != m_ioRegisters.end())
         gifStatIt->second &= ~kGifFqcMask;
 
-    uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
     {
         EeTimer &timer = m_eeTimers[index];
@@ -480,6 +506,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             interruptMask |= 1u << index;
         }
     }
+    s_eeTimerBatch = std::min<uint64_t>(kEeTimerBatchCycles, cyclesUntilNextEeTimerInterrupt());
     return interruptMask;
 }
 
@@ -521,6 +548,10 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
         const uint64_t numerator = eventTicks * kEeClockHz - timer.clockRemainder;
         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
+    }
+    if (nearest != std::numeric_limits<uint64_t>::max() && s_eeTimerBacklog != 0u)
+    {
+        nearest = nearest > s_eeTimerBacklog ? nearest - s_eeTimerBacklog : 1u;
     }
     return nearest;
 }
@@ -1137,6 +1168,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        // Bring the timers up to date first, and work the batch out again
+        // after the write.
+        s_eeTimerBatch = 0u;
+        s_eeTimerLateInterrupts |= advanceEeTimers(0u);
+        s_eeTimerBatch = 0u;
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2423,6 +2459,11 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        if (s_eeTimerBacklog != 0u)
+        {
+            s_eeTimerBatch = 0u;
+            s_eeTimerLateInterrupts |= advanceEeTimers(0u);
+        }
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
