@@ -2,8 +2,11 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vu1.h"
+#include "runtime/gs/gs_frontend.h"
 #include "Kernel/Stubs/VU.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -296,7 +299,7 @@ void register_ps2_vu_tests()
             t.IsTrue(allMatch, "MulMatrix(dst, I, A) should equal A");
         });
 
-        tc.Run("MulMatrix_equals_arg1_times_arg2", [](TestCase &t)
+        tc.Run("MulMatrix_equals_arg2_times_arg1", [](TestCase &t)
         {
             VuEnv env;
             float m0[16] = {
@@ -317,9 +320,8 @@ void register_ps2_vu_tests()
                     float sum = 0.0f;
                     for (int k = 0; k < 4; ++k)
                     {
-                        // expected = mulVuMatrix(m0, m1) = m0 * m1 (arg1 * arg2);
-                        // mulVuMatrix is file-local to VU.cpp, so mirror its formula here.
-                        sum += m1[4 * k + j] * m0[4 * i + k];
+                        // libvu0 walks the rows of the third argument over the second's.
+                        sum += m1[4 * i + k] * m0[4 * k + j];
                     }
                     expected[4 * i + j] = sum;
                 }
@@ -340,7 +342,7 @@ void register_ps2_vu_tests()
                     allMatch = false;
                 }
             }
-            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m0*m1 (mulVuMatrix(m0,m1), arg1*arg2)");
+            t.IsTrue(allMatch, "MulMatrix(dst, m0, m1) should equal m1*m0, as libvu0 computes it");
         });
 
         tc.Run("RotMatrix_Z_matches_RotMatrixZ", [](TestCase &t)
@@ -739,6 +741,77 @@ void register_ps2_vu_tests()
                      "LightColorMatrix should copy the 4 color vectors verbatim into the 4 rows");
         });
 
+        tc.Run("Normalize_xyz_length_w_zero", [](TestCase &t)
+        {
+            // libvu0 squares with vmul.xyz and scales with vmulq.xyz into a zeroed vf6.
+            VuEnv env;
+            writeVec4(env, kA, 3.0f, 0.0f, 4.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[4]{};
+            readVec4f(env, kDst, out);
+            t.IsTrue(nearlyEqual(out[0], 0.6f) && nearlyEqual(out[1], 0.0f) && nearlyEqual(out[2], 0.8f) &&
+                         out[3] == 0.0f,
+                     "Normalize should measure x, y and z only and write w as 0");
+        });
+
+        tc.Run("Normalize_small_nonzero_and_zero", [](TestCase &t)
+        {
+            // The VU normalizes any nonzero length; only a zero length is left at zero.
+            VuEnv env;
+            writeVec4(env, kA, 1.0e-7f, 0.0f, 0.0f, 1.0f);
+            writeVec4(env, kB, 0.0f, 0.0f, 0.0f, 1.0f);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            SET_GPR_U32(&env.ctx, 4, kDst2);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0Normalize(env.rdram.data(), &env.ctx, &env.runtime);
+            float small[4]{}, zero[4]{};
+            readVec4f(env, kDst, small);
+            readVec4f(env, kDst2, zero);
+            t.IsTrue(nearlyEqual(small[0], 1.0f) && small[1] == 0.0f && small[2] == 0.0f && small[3] == 0.0f,
+                     "Normalize should scale a tiny nonzero vector to unit length");
+            t.IsTrue(zero[0] == 0.0f && zero[1] == 0.0f && zero[2] == 0.0f && zero[3] == 0.0f,
+                     "Normalize should leave the zero vector at zero rather than divide by zero");
+        });
+
+        tc.Run("ScaleVector_scale_from_f12_only", [](TestCase &t)
+        {
+            // libvu0 moves f12 into vf5 and runs vmulx.xyzw; $a2 plays no part.
+            VuEnv env;
+            writeVec4(env, kA, 2.0f, 3.0f, 4.0f, 5.0f);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            SET_GPR_U32(&env.ctx, 6, 0x3F800000u); // 1.0f as a stray $a2
+            env.ctx.f[12] = 0.0f;
+            ps2_stubs::sceVu0ScaleVector(env.rdram.data(), &env.ctx, &env.runtime);
+            float zeroed[4]{};
+            readVec4f(env, kDst, zeroed);
+            t.IsTrue(zeroed[0] == 0.0f && zeroed[1] == 0.0f && zeroed[2] == 0.0f && zeroed[3] == 0.0f,
+                     "ScaleVector by an f12 of 0 should zero all four lanes, whatever $a2 holds");
+
+            env.ctx.f[12] = 2.0f;
+            ps2_stubs::sceVu0ScaleVector(env.rdram.data(), &env.ctx, &env.runtime);
+            float scaled[4]{};
+            readVec4f(env, kDst, scaled);
+            t.IsTrue(nearlyEqual(scaled[0], 4.0f) && nearlyEqual(scaled[1], 6.0f) &&
+                         nearlyEqual(scaled[2], 8.0f) && nearlyEqual(scaled[3], 10.0f),
+                     "ScaleVector should scale all four lanes by f12");
+        });
+
+        tc.Run("InnerProduct_xyz_only", [](TestCase &t)
+        {
+            VuEnv env;
+            writeVec4(env, kA, 1.0f, 2.0f, 3.0f, 10.0f);
+            writeVec4(env, kB, 4.0f, 5.0f, 6.0f, 10.0f);
+            SET_GPR_U32(&env.ctx, 4, kA);
+            SET_GPR_U32(&env.ctx, 5, kB);
+            ps2_stubs::sceVu0InnerProduct(env.rdram.data(), &env.ctx, &env.runtime);
+            t.IsTrue(nearlyEqual(env.ctx.f[0], 32.0f), "InnerProduct should sum x, y and z, leaving w out");
+        });
+
         tc.Run("RotTransPers_apply_persp_ftoi4", [](TestCase &t)
         {
             VuEnv env;
@@ -749,7 +822,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 1u); // fullFtoi4 = true
+            SET_GPR_U32(&env.ctx, 7, 0u); // a zero flag keeps the full FTOI4
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
@@ -757,7 +830,7 @@ void register_ps2_vu_tests()
                      "RotTransPers should perspective-divide x/y/z then FTOI4, with w taking the un-divided FTOI4 value");
         });
 
-        tc.Run("RotTransPers_ftoi0_z_when_flag0", [](TestCase &t)
+        tc.Run("RotTransPers_ftoi0_zw_when_flag_set", [](TestCase &t)
         {
             VuEnv env;
             float ident[16]{};
@@ -767,12 +840,12 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 0u); // fullFtoi4 = false
+            SET_GPR_U32(&env.ctx, 7, 1u); // a non-zero flag runs the vftoi0.zw
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
-            t.IsTrue(out[2] == 8 && out[3] == 2,
-                     "RotTransPers should FTOI0-truncate z/w instead of FTOI4 when fullFtoi4 is clear");
+            t.IsTrue(out[0] == 256 && out[1] == 512 && out[2] == 8 && out[3] == 2,
+                     "RotTransPers should FTOI0-truncate z/w, and only z/w, when the flag is set");
         });
 
         tc.Run("RotTransPers_persp_wzero_zero", [](TestCase &t)
@@ -805,7 +878,7 @@ void register_ps2_vu_tests()
             //   t1 = m1*1 + m5*2 + m9*3  + m13*1 = 3 + 2  + 0  + 20 = 25
             //   t2 = m2*1 + m6*2 + m10*3 + m14*1 = 0 + 8  + 3  + 30 = 41
             //   t3 = m3*1 + m7*2 + m11*3 + m15*1 = 1
-            // fullFtoi4=true => every lane x16: (432, 400, 656, 16).
+            // A zero flag keeps FTOI4 on every lane, x16: (432, 400, 656, 16).
             VuEnv env;
             float m[16] = {
                 2.0f, 3.0f, 0.0f, 0.0f,
@@ -818,7 +891,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 4, kDst);
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kB);
-            SET_GPR_U32(&env.ctx, 7, 1u); // fullFtoi4 = true
+            SET_GPR_U32(&env.ctx, 7, 0u); // a zero flag keeps the full FTOI4
             ps2_stubs::sceVu0RotTransPers(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out[4]{};
             readVec4i(env, kDst, out);
@@ -838,7 +911,7 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 5, kA);
             SET_GPR_U32(&env.ctx, 6, kArr);
             SET_GPR_U32(&env.ctx, 7, 2u);
-            SET_GPR_U32(&env.ctx, 8, 1u);
+            SET_GPR_U32(&env.ctx, 8, 0u);
             ps2_stubs::sceVu0RotTransPersN(env.rdram.data(), &env.ctx, &env.runtime);
             int32_t out0[4]{}, out1[4]{};
             readVec4i(env, kDst, out0);
@@ -864,7 +937,7 @@ void register_ps2_vu_tests()
         tc.Run("ClipScreen_inside_zero", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 100.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 100.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
             t.Equals(getRegU32(&env.ctx, 2), 0u, "ClipScreen should return 0 for an in-bounds vertex");
@@ -873,28 +946,23 @@ void register_ps2_vu_tests()
         tc.Run("ClipScreen_offscreen_nonzero", [](TestCase &t)
         {
             VuEnv env;
-            writeVec4(env, kA, 5000.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, 5000.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
-            t.IsTrue(getRegU32(&env.ctx, 2) != 0u, "ClipScreen should return nonzero when x exceeds the guard band");
+            t.Equals(getRegU32(&env.ctx, 2), 0x80u, "ClipScreen should return sticky sign when x exceeds 4096");
         });
 
         tc.Run("ClipScreen_negx_nonzero", [](TestCase &t)
         {
-            // Pins the negative-x guard-band clause (v[0] < -kScreenClipGuard => 0x2),
-            // the mirror of ClipScreen_offscreen_nonzero's +x clause. Without this
-            // case, deleting the negative-x clause leaves the suite green.
             VuEnv env;
-            writeVec4(env, kA, -5000.0f, 100.0f, 0.0f, 0.0f);
+            writeVec4(env, kA, -1.0f, 100.0f, 0.0f, 1.0f);
             SET_GPR_U32(&env.ctx, 4, kA);
             ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
-            t.IsTrue(getRegU32(&env.ctx, 2) != 0u, "ClipScreen should return nonzero when x is below the negative guard band");
+            t.Equals(getRegU32(&env.ctx, 2), 0x80u, "ClipScreen should reject every negative x");
         });
 
         tc.Run("ClipScreen3_ors_three", [](TestCase &t)
         {
-            // Both offscreen vertices trip the y-guard clauses (not x) so this
-            // test does not overlap ClipScreen_offscreen_nonzero's x-guard mutation.
             VuEnv env;
             writeVec4(env, kA, 0.0f, 5000.0f, 0.0f, 0.0f);
             writeVec4(env, kB, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -903,7 +971,52 @@ void register_ps2_vu_tests()
             SET_GPR_U32(&env.ctx, 5, kB);
             SET_GPR_U32(&env.ctx, 6, kC);
             ps2_stubs::sceVu0ClipScreen3(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegU32(&env.ctx, 2), 0xCu, "ClipScreen3 should OR the guard-band codes across all 3 vertices");
+            t.Equals(getRegU32(&env.ctx, 2), 0xC0u, "ClipScreen3 should accumulate sticky zero and sign across all 3 vertices");
+        });
+
+        tc.Run("ClipScreen_matches_VU_sticky_subtraction_flags", [](TestCase &t)
+        {
+            VuEnv env;
+            auto vu = std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU0);
+            auto gs = std::make_unique<GS>();
+            uint32_t code[16]{};
+            uint8_t data[16]{};
+            for (unsigned pair = 0; pair < 8; ++pair)
+                code[pair * 2 + 1] = 0x800002ffu; // I-bit NOP ignores the lower word.
+            const auto sub = [](unsigned mask, unsigned fs, unsigned ft) {
+                return 0x8000002cu | (mask << 21) | (ft << 16) | (fs << 11) | (4u << 6);
+            };
+            code[1] = sub(0xdu, 1u, 2u); // x, y, w minus zero
+            code[3] = sub(0xcu, 3u, 1u); // 4096 minus x, y
+            code[13] |= 0x40000000u;
+            const uint32_t values[] = {
+                0u, 0x80000000u, 1u, 0x80000001u, 0x007fffffu, 0x807fffffu,
+                0x00800000u, 0x80800000u, 0x3f800000u, 0xbf800000u,
+                0x457fffffu, 0x45800000u, 0x45800001u, 0xc5800000u,
+                0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+                0x7fc00001u, 0xffc00001u
+            };
+            for (unsigned lane = 0; lane < 4; ++lane)
+            {
+                for (uint32_t bits : values)
+                {
+                    float v[4] = {100.0f, 200.0f, 300.0f, 1.0f};
+                    v[lane] = std::bit_cast<float>(bits);
+                    writeVec4(env, kA, v[0], v[1], v[2], v[3]);
+                    SET_GPR_U32(&env.ctx, 4, kA);
+                    ps2_stubs::sceVu0ClipScreen(env.rdram.data(), &env.ctx, &env.runtime);
+                    vu->reset();
+                    std::memcpy(vu->state().vf[1], v, sizeof(v));
+                    vu->state().vf[3][0] = vu->state().vf[3][1] = 4096.0f;
+                    vu->execute(reinterpret_cast<uint8_t *>(code), sizeof(code),
+                                data, sizeof(data), *gs, nullptr, 0, 0, 0, 64);
+                    t.Equals(getRegU32(&env.ctx, 2), vu->state().status & 0xc0u,
+                             "screen clipping lane " + std::to_string(lane) +
+                             " bits " + std::to_string(bits) + " HLE " +
+                             std::to_string(getRegU32(&env.ctx, 2)) + " VU " +
+                             std::to_string(vu->state().status & 0xc0u));
+                }
+            }
         });
 
         tc.Run("ClipAll_all_out_returns_1", [](TestCase &t)

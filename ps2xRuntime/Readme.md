@@ -47,6 +47,59 @@ The runtime handles PS2's memory addressing, including:
 ## Vector Unit Support
 PS2-specific 128-bit MMI instructions and VU0 macro mode instructions are supported via SSE/AVX intrinsics.
 
+### Compiled VU1 programs
+
+VU1 microprograms normally run on the interpreter. A build can instead compile
+the programs a game actually runs into C++ ahead of time, whole, from the entry
+point to the E bit: every pair still issues in order with the interpreter's
+stall rules, but the per-pair bookkeeping is decided at compile time and the
+hot state stays in registers. Anything the compiled code cannot express, or
+microcode that changed since it was recorded, falls back to the interpreter.
+
+The input is recorded, not guessed, because the microcode is game data:
+
+1. Run the game with `PS2_VU_PROGRAM_PROFILE=some/directory`. Each entry point
+   reached without a compiled routine is saved there as a 16 KiB code image
+   plus a line in `entries.txt`, and so is every place a register jump lands,
+   so one run covers the code it went through. Recording keeps adding to the
+   directory.
+2. Configure with `-DPS2X_VU_PROGRAM_PROFILES=dir1;dir2` and rebuild. The
+   build runs `tools/compile_vu_programs.py` over the recordings and compiles
+   the result in `PS2X_VU_PROGRAM_SHARDS` units (8 by default). Routines
+   longer than `PS2X_VU_PROGRAM_MAX_PAIRS` pairs (256 by default) are
+   compiled as chained chunks, as optimizers slow down sharply on long
+   functions.
+
+Recordings and the generated sources contain game code; keep them local.
+
+A project can still ship what it recorded without shipping the code.
+`tools/vu_program_manifest.py make --output <manifest> --game-root <disc>
+--game <file> <recordings>` writes a manifest: for each recorded image, the
+runs of instruction pairs its routines read, as offsets into the game's files,
+and one checksum over them all. Files are named by their path below `<disc>`,
+or by their bare name without `--game-root`. On a
+player's machine, `vu_program_manifest.py expand --manifest <file> --game-root
+<disc> --output <dir>` rebuilds those images from their own copy of the game,
+and `<dir>` goes into `PS2X_VU_PROGRAM_PROFILES` like any recording. The
+compiled routines come out the same as from the recordings; images whose code
+differs in the given files, such as another region's, are skipped. An expanded
+directory goes back into `make` like a recording, so a manifest can grow from
+new recordings without the ones it was made from.
+
+A recording only covers the programs that ran while it was made. `make
+--uploads` also finds the DMA packets in the game's files that load microcode
+with VIF `MPG`, and describes each program no recording holds as if it had
+been loaded in place of a recorded one at the same address, entered at the
+same points. Programs the game builds at run time, or loads at an address
+nothing was recorded at, still need a recording.
+
+The FMAC arithmetic has fast paths with exact fallbacks, NEON on AArch64 and
+SSE2 on x86. Other hosts get a plain C++ path. All three can be tested on an ARM
+machine: `PS2X_VU_PROGRAM_SSE` builds the SSE2 one through sse2neon, and
+`PS2X_VU_PROGRAM_PORTABLE` the plain one. `ps2xTest/data/vu_programs.py` writes
+synthetic programs for the differential test in
+`ps2xTest/src/ps2_vu1_program_tests.cpp`.
+
 ## Instruction Patching
 You can patch specific instructions in the recompiled code to fix game issues or implement custom behavior.
 
