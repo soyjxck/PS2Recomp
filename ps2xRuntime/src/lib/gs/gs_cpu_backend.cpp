@@ -1962,6 +1962,31 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     static uint64_t statUploads = 0, statSkipped = 0, statPartial = 0, statBytes = 0, statSkippedBytes = 0;
     static uint64_t statWrittenByBits[33] = {};
 
+    // PS2X_GS_UPLOAD_TRACE=<first>[:<count>]: list transfers by ordinal.
+    {
+        static const struct Trace
+        {
+            long first = -1, count = 0;
+            Trace()
+            {
+                if (const char *value = std::getenv("PS2X_GS_UPLOAD_TRACE"))
+                {
+                    char *end = nullptr;
+                    first = std::strtol(value, &end, 10);
+                    count = (end && *end == ':') ? std::strtol(end + 1, nullptr, 10) : 200;
+                }
+            }
+        } trace;
+        static long ordinal = 0;
+        if (firstPixel == 0u)
+        {
+            if (trace.first >= 0 && ordinal >= trace.first && ordinal < trace.first + trace.count)
+                std::fprintf(stderr, "[upload] #%ld dbp=%u dbw=%u psm=%02x at (%u,%u) %ux%u, %u bytes in this piece\n", ordinal, dbp, dbw,
+                             static_cast<unsigned>(dpsm), dsax, dsay, rrw, rrh, sizeBytes);
+            ++ordinal;
+        }
+    }
+
     // A game that streams its textures sends the same images to the same
     // places every frame. While VRAM still holds exactly what a transfer
     // would write there is nothing to do: no pixels to store, no queued
@@ -2461,7 +2486,16 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
     PresentationFrame result{};
     const GSPmodeState pmode = decodePmode(request.pmode);
     const GSSmode2State smode2 = decodeSMode2(request.smode2);
-    const bool fieldMode = smode2.interlaced && !smode2.ffmd;
+    // In field mode each field shows every other line of a full-height buffer.
+    // The buffer holds one picture (a movie frame, or a frame the game drew
+    // whole), so all of it is shown; PS2X_GS_BOB=1 shows only the lines of
+    // the current field, doubled, as a television would.
+    static const bool bobFields = []
+    {
+        const char *value = std::getenv("PS2X_GS_BOB");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    const bool fieldMode = smode2.interlaced && !smode2.ffmd && bobFields;
     const bool halfHeightField = smode2.interlaced && smode2.ffmd;
     const bool oddField = (request.vsyncTick & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(request.dispfb1);

@@ -787,6 +787,16 @@ namespace ps2_stubs
             writeGsGParamToScratch(runtime);
             uint64_t pmode = makePmode(1, 0, 0, 0, 0, 0x80);
             uint64_t smode2 = (interlace & 0x1) | ((ffmode & 0x1) << 1);
+            // The library sets the display mode with SetGsCrt. PMODE and
+            // SMODE2 are privileged registers: they have no address a GIF
+            // packet can reach (0x41 and 0x42, where the packet below used to
+            // send them, are SCISSOR_2 and ALPHA_1), so a game that switched
+            // between frame and field mode, as for a movie, stayed in the
+            // mode it booted in.
+            if (runtime)
+            {
+                runtime->memory().gs().smode2 = smode2;
+            }
             uint64_t dispfb = makeDispFb(0, 10, 0, 0, 0);
             uint64_t display = makeDisplay(0, 0, 0, 0, 639, 447);
             uint64_t bgcolor = 0ULL;
@@ -803,9 +813,9 @@ namespace ps2_stubs
                         q[0] = makeGiftagAplusD(7u);
                         q[1] = 0xEULL;
                         q[2] = pmode;
-                        q[3] = 0x41ULL;
+                        q[3] = 0x7fULL; // NOP
                         q[4] = smode2;
-                        q[5] = 0x42ULL;
+                        q[5] = 0x7fULL; // NOP
                         q[6] = dispfb;
                         q[7] = 0x59ULL;
                         q[8] = display;

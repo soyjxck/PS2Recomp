@@ -9,11 +9,14 @@
 //   - surfaces (frame, depth, texture) become a SurfaceLayout, so a pixel
 //     address is two shifts and a table read;
 //   - tests, blending, fog and the texture function are decoded up front;
-//   - a triangle is walked span by span instead of over its bounding box;
-//   - CLUT entries are converted to RGBA once per CLUT load, on first use;
-//   - textures are sampled from a decoded RGBA copy, kept while the VRAM pages
-//     it came from are unchanged (or are rewritten with the same contents,
-//     which is what a game that streams its textures does every frame).
+//   - a triangle is walked span by span instead of over its bounding box,
+//     and pixels are shaded a block of eight at a time;
+//   - a texture that is exactly an image the game uploaded is sampled from a
+//     decoded RGBA copy of that image, found by the image's hash wherever in
+//     VRAM it was put this time; any other is sampled from VRAM, an indexed
+//     one through a snapshot of the CLUT;
+//   - primitives are queued and drawn by a pool of threads in the background,
+//     as are the images the game uploads (see RasterQueue).
 //
 // One deliberate difference: a pixel centre exactly on an edge belongs to the
 // triangle only for top and left edges, so two triangles that share an edge do
@@ -1628,9 +1631,8 @@ struct GSCpuBackend::RasterQueue
     // --- GS thread only -----------------------------------------------------
     std::vector<PreparedPrimitive> pending;
     uint64_t pendingPixels = 0;
-    PageSet written{};  // pages pending primitives write
-    PageSet read{};     // pages of textures they sample that could change under them
-    PageSet readLive{}; // ...of those, pages sampled from VRAM while drawing
+    PageSet written{}; // pages pending primitives write
+    PageSet read{};    // pages of textures they sample from VRAM as they are drawn
     // Batches are numbered as they are handed over. For every page, the last
     // batch that writes it and the last that reads it: once that one has been
     // retired, nothing outstanding touches the page.
@@ -1874,7 +1876,6 @@ struct GSCpuBackend::RasterQueue
         pendingPixels = 0;
         written.fill(0u);
         read.fill(0u);
-        readLive.fill(0u);
 
         size_t outstanding = 0;
         {
@@ -2901,7 +2902,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     addPages(writes, p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
     if (!p.zmask)
         addPages(writes, p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
-    if (!queue.pending.empty() && intersects(writes, queue.readLive))
+    if (!queue.pending.empty() && intersects(writes, queue.read))
         queue.submit("texture");
 
     if (queue.pending.empty())
@@ -2916,11 +2917,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         queue.written[i] |= writes[i];
     // A decoded copy is no reason for a transfer to its pages to wait.
     if (live)
-    {
         addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
-        if (live)
-            addPages(queue.readLive, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
-    }
     queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
                            static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
     // The queued copy must not point at this call's draw state.
