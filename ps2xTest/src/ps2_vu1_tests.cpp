@@ -6,6 +6,7 @@
 #include "runtime/ps2_vu1.h"
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_fmac.h"
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_fmac_neon.h"
+#include "../../ps2xRuntime/src/lib/vu/ps2_vu1_fmac_sse.h"
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_region.h"
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_loop_plan.h"
 
@@ -3694,7 +3695,7 @@ void register_ps2_vu1_tests()
             t.IsTrue(accepted > 100000u, "the randomized test must exercise the certified path");
         });
 
-#if defined(__aarch64__)
+#if PS2_VU_FMAC_VECTOR
         tc.Run("SIMD product-sum values and flags match independent scalar arithmetic", [](TestCase &t)
         {
             struct RestoreRounding {

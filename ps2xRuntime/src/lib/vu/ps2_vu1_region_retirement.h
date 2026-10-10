@@ -5,6 +5,8 @@
 #include <cstring>
 #if defined(__aarch64__)
 #include <arm_neon.h>
+#elif !defined(__aarch64__) && (defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__)))
+#include <immintrin.h>
 #endif
 
 namespace ps2_vu_detail {
@@ -26,6 +28,21 @@ inline void retireRegionVector(float *destination, const float *value,
     const auto lanes = vtstq_u32(vdupq_n_u32(laneMask), laneBits);
     const auto mask = vandq_u32(vandq_u32(matches, visible), lanes);
     vst1q_f32(destination, vbslq_f32(mask, vld1q_f32(value), vld1q_f32(destination)));
+#elif !defined(__aarch64__) && (defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__)))
+    const __m128i expected = _mm_set1_epi64x(static_cast<long long>(sequence));
+    const __m128i low = _mm_cmpeq_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(latest)), expected);
+    const __m128i high = _mm_cmpeq_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(latest + 2)), expected);
+    const __m128i matches = _mm_castps_si128(
+        _mm_shuffle_ps(_mm_castsi128_ps(low), _mm_castsi128_ps(high), _MM_SHUFFLE(2, 0, 2, 0)));
+    uint32_t offsets;
+    std::memcpy(&offsets, firstWrite, sizeof(offsets));
+    const __m128i expanded = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(static_cast<int>(offsets)));
+    const __m128i ready = _mm_set1_epi32(static_cast<int>(readyOffset));
+    const __m128i visible = _mm_or_si128(_mm_cmpgt_epi32(expanded, ready), _mm_cmpeq_epi32(expanded, ready));
+    const __m128i laneBits = _mm_setr_epi32(8, 4, 2, 1);
+    const __m128i lanes = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(laneMask), laneBits), laneBits);
+    const __m128i mask = _mm_and_si128(_mm_and_si128(matches, visible), lanes);
+    _mm_storeu_ps(destination, _mm_blendv_ps(_mm_loadu_ps(destination), _mm_loadu_ps(value), _mm_castsi128_ps(mask)));
 #else
     for (unsigned lane = 0; lane < 4; ++lane)
         if ((laneMask & (8u >> lane)) != 0u && latest[lane] == sequence &&

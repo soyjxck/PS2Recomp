@@ -162,7 +162,7 @@ void register_ps2_vu1_upper_engine_tests() {
                 }
             t.Equals(comparisons, 1310720u, "all independent flag cases executed");
         });
-#if defined(__aarch64__)
+#if PS2_VU_FMAC_VECTOR
         tc.Run("simple SIMD forces safe results and rejects exact-result boundaries", [](TestCase &t) {
             const int oldRounding = std::fegetround();
             struct Restore { int mode; ~Restore() { std::fesetround(mode); } } restore{oldRounding};

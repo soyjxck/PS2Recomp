@@ -1,6 +1,7 @@
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
 #include "ps2_vu1_fmac_neon.h"
+#include "ps2_vu1_fmac_sse.h"
 
 #include <cmath>
 #include <cstring>
@@ -44,7 +45,7 @@ PS2_VU_FORCE_INLINE void VU1Interpreter::execUpperInline(uint32_t instr)
 
     float *vd = m_state.vf[fd];
     float result[4];
-#if defined(__aarch64__)
+#if PS2_VU_FMAC_VECTOR
     const uint8_t arithmeticOp = op < 0x3cu ? op : (instr & 3u) | ((instr >> 4u) & 0x7cu);
     const bool simpleAdd = arithmeticOp <= 3u || arithmeticOp == 0x20u || arithmeticOp == 0x22u || arithmeticOp == 0x28u;
     const bool simpleSub = (arithmeticOp >= 4u && arithmeticOp <= 7u) || arithmeticOp == 0x24u || arithmeticOp == 0x26u || arithmeticOp == 0x2cu;

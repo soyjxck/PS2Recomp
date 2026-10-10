@@ -7,6 +7,8 @@
 #include <arm_neon.h>
 #include <cstring>
 
+#define PS2_VU_FMAC_VECTOR 1
+
 namespace ps2_vu_detail {
 
 PS2_VU_FORCE_INLINE float32x4_t normalizeFmacOperands(float32x4_t value)

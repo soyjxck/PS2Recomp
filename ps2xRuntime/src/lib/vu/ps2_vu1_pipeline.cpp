@@ -4,6 +4,8 @@
 #include <cstring>
 #if defined(__aarch64__)
 #include <arm_neon.h>
+#elif !defined(__aarch64__) && (defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__)))
+#include <immintrin.h>
 #endif
 
 namespace {
@@ -98,6 +100,19 @@ void VU1Interpreter::commitReadyPipelines()
         const auto mask = vandq_u32(matches, lanes);
         vst1q_f32(m_state.vf[write.reg], vbslq_f32(mask, vld1q_f32(write.value.data()),
                                                 vld1q_f32(m_state.vf[write.reg])));
+#elif !defined(__aarch64__) && (defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__)))
+        const __m128i sequence = _mm_set1_epi64x(static_cast<long long>(write.sequence));
+        const auto *latest = m_vfLatestWrite[write.reg].data();
+        const __m128i low = _mm_cmpeq_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(latest)), sequence);
+        const __m128i high = _mm_cmpeq_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i *>(latest + 2)), sequence);
+        const __m128i matches = _mm_castps_si128(
+            _mm_shuffle_ps(_mm_castsi128_ps(low), _mm_castsi128_ps(high), _MM_SHUFFLE(2, 0, 2, 0)));
+        const __m128i laneBits = _mm_setr_epi32(8, 4, 2, 1);
+        const __m128i lanes = _mm_cmpeq_epi32(_mm_and_si128(_mm_set1_epi32(write.laneMask), laneBits), laneBits);
+        const __m128i mask = _mm_and_si128(matches, lanes);
+        _mm_storeu_ps(m_state.vf[write.reg],
+                      _mm_blendv_ps(_mm_loadu_ps(m_state.vf[write.reg]), _mm_loadu_ps(write.value.data()),
+                                    _mm_castsi128_ps(mask)));
 #else
         for (uint32_t component = 0; component < 4u; ++component)
         {
