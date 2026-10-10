@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "ps2_host_cpu.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
 #endif
@@ -169,6 +170,11 @@ int main(int argc, char *argv[])
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
 #endif
+    if (const char *problem = ps2xHostCpuProblem())
+    {
+        std::cerr << problem << std::endl;
+        return 1;
+    }
     setupTerminateLogger();
 
     try

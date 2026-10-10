@@ -48,7 +48,10 @@ The translated code is very literal, with each MIPS instruction mapping to a C++
 
 * CMake 3.20+
 * C++20 compiler (currently tested mainly with MSVC)
-* SSE4/AVX host support for some vector paths
+* x86-64: a CPU with AVX2 and FMA (Intel Haswell, AMD Zen or later); the
+  runtime is compiled for them by default and says so at start-up on an
+  older processor. `-DPS2X_X86_AVX2=OFF` builds for those without the
+  vector paths, much slower.
 
 ### Build
 

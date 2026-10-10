@@ -17,9 +17,10 @@
 #include <string>
 #include <utility>
 
-// FMAC fast paths: NEON on AArch64, SSE2 on x86. So that all three can be tested
-// on an ARM machine, PS2X_VU_PROGRAM_SSE runs the SSE2 one there through
-// sse2neon, and PS2X_VU_PROGRAM_PORTABLE runs neither.
+// FMAC fast paths: NEON on AArch64, SSE with FMA on x86 (a build without FMA
+// keeps the portable path, which the interpreter's fused product sums need).
+// So that all three can be tested on an ARM machine, PS2X_VU_PROGRAM_SSE runs
+// the SSE one there through sse2neon, and PS2X_VU_PROGRAM_PORTABLE runs neither.
 #if defined(PS2X_VU_PROGRAM_PORTABLE)
 #define PS2_VU_PROGRAM_NEON 0
 #define PS2_VU_PROGRAM_SSE 0
@@ -27,7 +28,7 @@
 #define PS2_VU_PROGRAM_NEON 1
 #define PS2_VU_PROGRAM_SSE 0
 #include <arm_neon.h>
-#elif defined(__aarch64__) || defined(__SSE2__) || defined(_M_X64)
+#elif defined(__aarch64__) || defined(__FMA__) || (defined(_MSC_VER) && defined(__AVX2__))
 #define PS2_VU_PROGRAM_NEON 0
 #define PS2_VU_PROGRAM_SSE 1
 #if defined(__aarch64__)
@@ -374,18 +375,15 @@ PS2_VU_FORCE_INLINE __m128 flushDenormals(__m128 value)
     return _mm_andnot_ps(_mm_and_ps(tiny, magnitude), value);
 }
 
-// Rounds like the interpreter's acc + fs * ft, which GCC and Clang fuse by
-// default wherever FMA is available. AArch64 only gets here in tests.
+// Rounds once, like the interpreter's std::fma(fs, ft, acc). AArch64 only
+// gets here in tests.
 template <bool Subtract>
 PS2_VU_FORCE_INLINE __m128 productSum(__m128 acc, __m128 left, __m128 right)
 {
 #if defined(__aarch64__)
     return Subtract ? vfmsq_f32(acc, left, right) : vfmaq_f32(acc, left, right);
-#elif defined(__FMA__)
-    return Subtract ? _mm_fnmadd_ps(left, right, acc) : _mm_fmadd_ps(left, right, acc);
 #else
-    const __m128 product = _mm_mul_ps(left, right);
-    return Subtract ? _mm_sub_ps(acc, product) : _mm_add_ps(acc, product);
+    return Subtract ? _mm_fnmadd_ps(left, right, acc) : _mm_fmadd_ps(left, right, acc);
 #endif
 }
 }

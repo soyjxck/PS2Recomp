@@ -79,6 +79,18 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
+# The VU fast paths need FMA on x86-64: the interpreter rounds every product
+# sum once, so without it they stay scalar and call the library fma.
+option(PS2X_X86_AVX2 "Compile x86-64 targets for AVX2 and FMA" ON)
+if(PS2X_X86_AVX2 AND NOT PS2X_IS_ARM_TARGET AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    if(MSVC)
+        add_compile_options(/arch:AVX2)
+    else()
+        add_compile_options(-mavx2 -mfma)
+    endif()
+    message(STATUS "x86-64 target - compiling for AVX2 and FMA")
+endif()
+
 if(PS2X_BUILD_RECOMP)
     add_subdirectory("ps2xRecomp")
 endif()
