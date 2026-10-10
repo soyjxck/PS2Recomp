@@ -131,6 +131,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            flushingEeCycles = false;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -553,6 +554,27 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // The EE scheduler reports elapsed cycles at every checkpoint, usually
+        // a few dozen at a time. Stepping the IOP on each report costs a
+        // ready-queue and timer scan even when it is idle (about a quarter of
+        // the EE thread's time), so runEeCycles() accumulates them and steps
+        // in batches. Anything that interacts with the IOP directly flushes
+        // first, which keeps EE and IOP events in order.
+        static constexpr uint64_t kEeCycleBatch = 8u * 512u;
+
+        void flushEeCycles() noexcept
+        {
+            if (flushingEeCycles)
+                return;
+            const uint64_t iopCycles = eeCycleCarry / 8u;
+            eeCycleCarry %= 8u;
+            if (iopCycles == 0u)
+                return;
+            flushingEeCycles = true;
+            runCycles(iopCycles);
+            flushingEeCycles = false;
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -702,6 +724,7 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        bool flushingEeCycles = false;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -726,30 +749,32 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushEeCycles();
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushEeCycles();
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->flushEeCycles();
         return m_impl->stopModule(moduleId, result);
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->eeCycleCarry += eeCycles;
+        if (m_impl->eeCycleCarry >= Impl::kEeCycleBatch)
+            m_impl->flushEeCycles();
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->flushEeCycles();
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,6 +785,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->flushEeCycles();
         m_impl->rpc.onSifTransfer(transfer);
     }
 
