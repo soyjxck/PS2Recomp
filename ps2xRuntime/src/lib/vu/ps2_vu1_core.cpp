@@ -971,15 +971,19 @@ void VU1Interpreter::finishXgkick()
     {
         std::fprintf(stderr, "[vu1] xgkick addr=%u bytes=%u cycle=%llu\n", m_xgkick.sourceAddress / 16u,
                      m_xgkick.totalBytes, static_cast<unsigned long long>(m_cycle));
-        const uint32_t qwords = std::min<uint32_t>(m_xgkick.totalBytes / 16u, 40u);
+        const bool full = g_ps2xVu1TraceKicks == 2;
+        const uint32_t qwords = full ? m_xgkick.totalBytes / 16u : std::min<uint32_t>(m_xgkick.totalBytes / 16u, 40u);
         for (uint32_t q = 0; q < qwords; ++q)
         {
             uint32_t w[4];
             float f[4];
             std::memcpy(w, m_xgkick.packet.data() + q * 16u, sizeof(w));
             std::memcpy(f, w, sizeof(f));
-            std::fprintf(stderr, "[vu1]   out %3u: %08x %08x %08x %08x  % .5g % .5g % .5g % .5g\n",
-                         q, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+            if (full)
+                std::fprintf(stderr, "[vu1] o %08x %08x %08x %08x\n", w[0], w[1], w[2], w[3]);
+            else
+                std::fprintf(stderr, "[vu1]   out %3u: %08x %08x %08x %08x  % .5g % .5g % .5g % .5g\n",
+                             q, w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
         }
     }
 

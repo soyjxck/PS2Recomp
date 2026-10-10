@@ -379,6 +379,7 @@ namespace
 
 // Set while a traced VU1 run is in flight; ps2_vu1_core.cpp logs XGKICK packets.
 int g_ps2xVu1TraceKicks = 0;
+extern int g_ps2xGifTraceRemaining; // ps2_memory.cpp
 
 namespace
 {
@@ -387,11 +388,14 @@ namespace
     // PS2X_VU1_TRACE=<secs>[:count[:skip]]  log VU1 runs starting at that
     // emulated time: the data memory the game uploaded, the registers after
     // the run and every packet it kicked. `skip` runs are passed over first.
+    // PS2X_VU1_TRACE_KICKS=1 logs only the kicked packets, in full, as hex
+    // (one frame's worth of geometry for offline analysis).
     struct Vu1TracePlan
     {
         uint64_t fromTick = 0;
         uint32_t remaining = 0;
         uint32_t skip = 0;
+        bool kicksOnly = false;
     };
 
     Vu1TracePlan &vu1TracePlan()
@@ -403,6 +407,8 @@ namespace
             {
                 p.fromTick = static_cast<uint64_t>(std::atof(value) * kTestVBlanksPerSecond);
                 p.remaining = 4u;
+                if (const char *kicks = std::getenv("PS2X_VU1_TRACE_KICKS"))
+                    p.kicksOnly = kicks[0] != '\0' && kicks[0] != '0';
                 if (const char *colon = std::strchr(value, ':'))
                 {
                     p.remaining = static_cast<uint32_t>(std::atoi(colon + 1));
@@ -415,19 +421,67 @@ namespace
         return plan;
     }
 
-    bool vu1TraceBegin(uint64_t tick, const char *kind, uint32_t startPC, uint32_t top, uint32_t itop, const uint8_t *data)
+    // While a test run fast-forwards (see GS::skipDrawForFastForward) nothing
+    // is rasterised, so the geometry VU1 would produce is not needed either,
+    // and interpreting it is most of the cost of a 3D scene. Drawing resumes
+    // some frames before each dump, which gives VU1 time to pick its state
+    // back up. PS2X_FF_KEEP_VU1=1 runs it regardless.
+    bool skipVu1ForFastForward(const GS &gs)
+    {
+        static const bool keep = []
+        {
+            const char *value = std::getenv("PS2X_FF_KEEP_VU1");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return !keep && gs.skipDrawForFastForward();
+    }
+
+    bool vu1TraceBegin(uint64_t tick, const char *kind, uint32_t startPC, uint32_t top, uint32_t itop,
+                       const uint8_t *data, const uint8_t *code)
     {
         Vu1TracePlan &plan = vu1TracePlan();
         if (plan.remaining == 0u || plan.fromTick == 0u || tick < plan.fromTick)
             return false;
+
+        // PS2X_VU1_DUMP_CODE=<prefix>: the microcode in VU1 memory, written to
+        // <prefix>.<n>.bin each time a traced run finds it changed (games
+        // upload different programs to the same addresses).
+        static uint64_t lastCodeHash = 0;
+        static uint32_t codeImages = 0;
+        if (code)
+        {
+            if (const char *prefix = std::getenv("PS2X_VU1_DUMP_CODE"))
+            {
+                uint64_t hash = 1469598103934665603ull;
+                for (uint32_t i = 0; i < PS2_VU1_CODE_SIZE; ++i)
+                    hash = (hash ^ code[i]) * 1099511628211ull;
+                if (hash != lastCodeHash)
+                {
+                    lastCodeHash = hash;
+                    const std::string path = std::string(prefix) + "." + std::to_string(codeImages) + ".bin";
+                    if (FILE *file = std::fopen(path.c_str(), "wb"))
+                    {
+                        std::fwrite(code, 1, PS2_VU1_CODE_SIZE, file);
+                        std::fclose(file);
+                    }
+                    std::fprintf(stderr, "[vu1] code image %u -> %s\n", codeImages, path.c_str());
+                    ++codeImages;
+                }
+            }
+        }
         if (plan.skip != 0u)
         {
             --plan.skip;
             return false;
         }
         --plan.remaining;
-        std::fprintf(stderr, "[vu1] %s t=%.2fs pc=0x%x top=%u itop=%u\n", kind,
-                     static_cast<double>(tick) / kTestVBlanksPerSecond, startPC, top, itop);
+        std::fprintf(stderr, "[vu1] %s t=%.2fs tick=%llu pc=0x%x top=%u itop=%u\n", kind,
+                     static_cast<double>(tick) / kTestVBlanksPerSecond, static_cast<unsigned long long>(tick), startPC, top, itop);
+        if (plan.kicksOnly)
+        {
+            g_ps2xVu1TraceKicks = 2;
+            return true;
+        }
         if (data)
         {
             bool gap = false;
@@ -455,7 +509,10 @@ namespace
 
     void vu1TraceEnd(const VU1State &state)
     {
+        const bool kicksOnly = g_ps2xVu1TraceKicks == 2;
         g_ps2xVu1TraceKicks = 0;
+        if (kicksOnly)
+            return;
         std::fprintf(stderr, "[vu1] done pc=0x%x cycles=%llu ebit=%d q=%g p=%g\n", state.pc,
                      static_cast<unsigned long long>(state.cycles), state.ebit ? 1 : 0, state.q, state.p);
         for (uint32_t r = 0; r < 32u; ++r)
@@ -844,6 +901,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
+                                     if (skipVu1ForFastForward(m_gs))
+                                         return;
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -854,7 +913,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
-                                                                       "MSCAL", startPC, top, itop, m_memory.getVU1Data());
+                                                                       "MSCAL", startPC, top, itop, m_memory.getVU1Data(), m_memory.getVU1Code());
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
@@ -866,6 +925,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
+                                     if (skipVu1ForFastForward(m_gs))
+                                         return;
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
@@ -876,7 +937,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
                                      const bool traced = vu1TraceBegin(m_eeScheduler ? m_eeScheduler->currentVSyncTick() : 0u,
-                                                                       "MSCNT", m_vu1.state().pc, top, itop, m_memory.getVU1Data());
+                                                                       "MSCNT", m_vu1.state().pc, top, itop, m_memory.getVU1Data(), m_memory.getVU1Code());
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
@@ -2610,6 +2671,15 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         {
+            // PS2X_GIF_TRACE=<secs>[:count]: see traceWildGifPrimitives.
+            static const uint64_t gifTraceTick = envEmulatedTicks("PS2X_GIF_TRACE");
+            static bool gifTraceArmed = false;
+            if (gifTraceTick != 0u && !gifTraceArmed && m_eeScheduler && m_eeScheduler->currentVSyncTick() >= gifTraceTick)
+            {
+                gifTraceArmed = true;
+                const char *colon = std::strchr(std::getenv("PS2X_GIF_TRACE"), ':');
+                g_ps2xGifTraceRemaining = colon ? std::atoi(colon + 1) : 16;
+            }
             static const uint64_t exitTick = envEmulatedTicks("PS2X_EXIT_AT");
             static const uint64_t perfTicks = envEmulatedTicks("PS2X_PERF_LOG");
             static const auto wallStart = std::chrono::steady_clock::now();

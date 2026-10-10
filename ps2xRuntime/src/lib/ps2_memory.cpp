@@ -1966,10 +1966,108 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// Set by the runtime while PS2X_GIF_TRACE is active: how many more wild
+// primitives to report.
+int g_ps2xGifTraceRemaining = 0;
+
+namespace
+{
+    // PS2X_GIF_TRACE: report PATH2/PATH3 primitives whose vertices span most of
+    // the GS coordinate space or sit on its edge -- what a transform gone wrong
+    // on the EE side looks like -- with the guest address of the packet, so the
+    // code that built it can be found (PS2X_WATCH).
+    void traceWildGifPrimitives(const uint8_t *rdram, GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
+    {
+        const uint32_t qwords = sizeBytes / 16u;
+        auto word = [&](uint32_t q, uint32_t i)
+        {
+            uint32_t value;
+            std::memcpy(&value, data + q * 16u + i * 4u, sizeof(value));
+            return value;
+        };
+
+        uint32_t q = 0;
+        while (q < qwords && g_ps2xGifTraceRemaining > 0)
+        {
+            const uint32_t tagQword = q;
+            const uint32_t w0 = word(q, 0), w1 = word(q, 1), w2 = word(q, 2), w3 = word(q, 3);
+            ++q;
+            const uint32_t nloop = w0 & 0x7FFFu;
+            const bool eop = ((w0 >> 15) & 1u) != 0u;
+            const uint32_t flg = (w1 >> 26) & 3u;
+            uint32_t nreg = (w1 >> 28) & 0xFu;
+            if (nreg == 0u)
+                nreg = 16u;
+            const uint64_t regs = static_cast<uint64_t>(w2) | (static_cast<uint64_t>(w3) << 32);
+            if (flg == 1u)
+            {
+                q += (nloop * nreg + 1u) / 2u;
+            }
+            else if (flg >= 2u)
+            {
+                q += nloop;
+            }
+            else
+            {
+                uint32_t xMin = 0xFFFFu, xMax = 0u, yMin = 0xFFFFu, yMax = 0u, vertices = 0u;
+                const uint32_t first = q;
+                for (uint32_t loop = 0; loop < nloop && q < qwords; ++loop)
+                {
+                    for (uint32_t r = 0; r < nreg && q < qwords; ++r, ++q)
+                    {
+                        const uint32_t reg = static_cast<uint32_t>((regs >> (4u * r)) & 0xFu);
+                        if (reg == 0x4u || reg == 0x5u)
+                        {
+                            const uint32_t x = word(q, 0) & 0xFFFFu, y = word(q, 1) & 0xFFFFu;
+                            xMin = std::min(xMin, x); xMax = std::max(xMax, x);
+                            yMin = std::min(yMin, y); yMax = std::max(yMax, y);
+                            ++vertices;
+                        }
+                    }
+                }
+                const bool wild = vertices >= 3u &&
+                                  ((xMax - xMin) > 1500u * 16u || (yMax - yMin) > 1500u * 16u || xMin == 0u || yMin == 0u);
+                if (wild)
+                {
+                    --g_ps2xGifTraceRemaining;
+                    // DMA chains are gathered into a buffer first: find the tag in guest RAM.
+                    long long guest = -1;
+                    if (rdram)
+                    {
+                        if (data >= rdram && data < rdram + PS2_RAM_SIZE)
+                            guest = (data - rdram) + tagQword * 16u;
+                        else
+                        {
+                            const uint32_t probe = std::min<uint32_t>((qwords - tagQword) * 16u, 64u);
+                            const uint8_t *found = std::search(rdram, rdram + PS2_RAM_SIZE, data + tagQword * 16u, data + tagQword * 16u + probe);
+                            if (found != rdram + PS2_RAM_SIZE)
+                                guest = found - rdram;
+                        }
+                    }
+                    std::fprintf(stderr, "[gif] wild primitive path=%d guest=0x%llx nloop=%u nreg=%u regs=0x%llx prim=0x%x x=[%.1f,%.1f] y=[%.1f,%.1f]\n",
+                                 static_cast<int>(pathId), guest, nloop, nreg, static_cast<unsigned long long>(regs & ((nreg >= 16u) ? ~0ull : ((1ull << (4u * nreg)) - 1ull))),
+                                 (w1 >> 15) & 0x7FFu, xMin / 16.0, xMax / 16.0, yMin / 16.0, yMax / 16.0);
+                    for (uint32_t i = first; i < q && i < first + 3u * nreg + nreg; ++i)
+                    {
+                        float f[4];
+                        const uint32_t w[4] = {word(i, 0), word(i, 1), word(i, 2), word(i, 3)};
+                        std::memcpy(f, w, sizeof(f));
+                        std::fprintf(stderr, "[gif]   %08x %08x %08x %08x  % .5g % .5g % .5g % .5g\n", w[0], w[1], w[2], w[3], f[0], f[1], f[2], f[3]);
+                    }
+                }
+            }
+            (void)eop; // a transfer carries many packets back to back
+        }
+    }
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)
         return;
+
+    if (g_ps2xGifTraceRemaining > 0 && pathId != GifPathId::Path1)
+        traceWildGifPrimitives(m_rdram, pathId, data, sizeBytes);
 
     if (pathId == GifPathId::Path3)
     {
