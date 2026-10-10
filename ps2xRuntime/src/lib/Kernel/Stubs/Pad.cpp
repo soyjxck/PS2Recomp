@@ -279,8 +279,17 @@ namespace ps2_stubs
         // PS2X_PAD_SCRIPT="cross@3.5,start@21,down@40.25" taps buttons at the given
         // emulated time (seconds since boot, counted in vblanks), each held for
         // 0.15 s. Emulated time makes a script reproducible whatever speed the
-        // host runs at, so unattended test runs can drive menus.
-        uint16_t scriptedPadButtons(uint64_t vsyncTick)
+        // host runs at, so unattended test runs can drive menus. The sticks
+        // are pushed all the way the same way: lup, ldown, lleft, lright and
+        // rup, rdown, rleft, rright. Taps of one name 0.15 s apart are a hold.
+        struct ScriptedPad
+        {
+            uint16_t buttons = 0;
+            // 0x80 is centred; -1 leaves the axis to the real pad.
+            int lx = -1, ly = -1, rx = -1, ry = -1;
+        };
+
+        ScriptedPad scriptedPad(uint64_t vsyncTick)
         {
             struct Press
             {
@@ -288,6 +297,8 @@ namespace ps2_stubs
                 uint16_t mask;
                 const char *name;
                 bool logged;
+                int axis = 0; // 1 lx, 2 ly, 3 rx, 4 ry
+                int value = 0;
             };
             static std::vector<Press> script = []
             {
@@ -297,6 +308,10 @@ namespace ps2_stubs
                     {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
                     {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
                     {"square", kPadBtnSquare},
+                };
+                static const struct { const char *name; int axis; int value; } kSticks[] = {
+                    {"lleft", 1, 0x00}, {"lright", 1, 0xFF}, {"lup", 2, 0x00}, {"ldown", 2, 0xFF},
+                    {"rleft", 3, 0x00}, {"rright", 3, 0xFF}, {"rup", 4, 0x00}, {"rdown", 4, 0xFF},
                 };
                 std::vector<Press> presses;
                 const char *env = std::getenv("PS2X_PAD_SCRIPT");
@@ -311,13 +326,21 @@ namespace ps2_stubs
                     const size_t at = item.find('@');
                     if (at != std::string::npos)
                     {
+                        const double seconds = std::atof(item.c_str() + at + 1);
+                        const uint64_t tick = static_cast<uint64_t>(seconds * kScriptTicksPerSecond);
                         for (const auto &button : kButtons)
                         {
                             if (item.compare(0, at, button.name) == 0)
                             {
-                                const double seconds = std::atof(item.c_str() + at + 1);
-                                presses.push_back({static_cast<uint64_t>(seconds * kScriptTicksPerSecond),
-                                                   button.mask, button.name, false});
+                                presses.push_back({tick, button.mask, button.name, false});
+                                break;
+                            }
+                        }
+                        for (const auto &stick : kSticks)
+                        {
+                            if (item.compare(0, at, stick.name) == 0)
+                            {
+                                presses.push_back({tick, 0u, stick.name, true, stick.axis, stick.value});
                                 break;
                             }
                         }
@@ -327,12 +350,20 @@ namespace ps2_stubs
                 return presses;
             }();
 
-            uint16_t held = 0u;
+            ScriptedPad held;
             for (Press &press : script)
             {
                 if (vsyncTick >= press.startTick && vsyncTick < press.startTick + kScriptHoldTicks)
                 {
-                    held |= press.mask;
+                    held.buttons |= press.mask;
+                    switch (press.axis)
+                    {
+                    case 1: held.lx = press.value; break;
+                    case 2: held.ly = press.value; break;
+                    case 3: held.rx = press.value; break;
+                    case 4: held.ry = press.value; break;
+                    default: break;
+                    }
                     if (!press.logged)
                     {
                         press.logged = true;
@@ -396,7 +427,16 @@ namespace ps2_stubs
             if (runtime && port == 0)
             {
                 // Buttons are active low.
-                state.buttons &= static_cast<uint16_t>(~scriptedPadButtons(runtime->eeScheduler().currentVSyncTick()));
+                const ScriptedPad scripted = scriptedPad(runtime->eeScheduler().currentVSyncTick());
+                state.buttons &= static_cast<uint16_t>(~scripted.buttons);
+                if (scripted.lx >= 0)
+                    state.lx = static_cast<uint8_t>(scripted.lx);
+                if (scripted.ly >= 0)
+                    state.ly = static_cast<uint8_t>(scripted.ly);
+                if (scripted.rx >= 0)
+                    state.rx = static_cast<uint8_t>(scripted.rx);
+                if (scripted.ry >= 0)
+                    state.ry = static_cast<uint8_t>(scripted.ry);
             }
 
             fillPadStatus(outData, state, portState);
