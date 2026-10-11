@@ -13,6 +13,7 @@
 #include "runtime/ps2_settings_menu.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "ThreadNaming.h"
+#include "LargeStackThread.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
@@ -3157,7 +3158,13 @@ void PS2Runtime::run()
 
     std::atomic<bool> gameThreadFinished{false};
 
-    std::thread gameThread([&]()
+    // Guest calls nest on this thread's stack: see LargeStackThread.h.
+#if defined(PLATFORM_VITA)
+    constexpr size_t kGameThreadStackBytes = 1024u * 1024u; // no address space to spare there
+#else
+    constexpr size_t kGameThreadStackBytes = 256u * 1024u * 1024u;
+#endif
+    LargeStackThread gameThread(kGameThreadStackBytes, [&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
         try
