@@ -848,6 +848,63 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        tc.Run("a movie's ADPCM sound goes to the callback registered for sceMpegStrADPCM", [](TestCase &t)
+        {
+            // sceMpegStrType is M2V 0, IPU 1, PCM 2, ADPCM 3. Drakengard 2's
+            // movies carry SPU ADPCM, and the game registers a callback for
+            // the picture and one for type 3.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+            constexpr uint32_t kSoundUserData = 0x0BADC0DEu;
+            runtime.registerFunction(kCallbackEntry, &testAnswerMpegStreamCallback);
+            runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
+            R5900Context idleContext{};
+            idleContext.pc = kMpegCallbackStopPc;
+            runtime.eeScheduler().reset(rdram.data(), idleContext);
+
+            for (const uint32_t type : {0u, 3u})
+            {
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, kMpegAddr);
+                setRegU32(addCtx, 5, type);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(addCtx, 7, kCallbackEntry);
+                setRegU32(addCtx, 8, type == 3u ? kSoundUserData : 0x11111111u);
+                ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+            }
+
+            // One packet of private stream 1: its sub-stream header and two bytes.
+            const std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu, 0x00u, 0x09u, 0x80u, 0x00u, 0x00u,
+                0xFFu, 0xA1u, 0x00u, 0x00u, 0x34u, 0x12u};
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackAnswer.store(1u, std::memory_order_release);
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPss(rdram.data(), &demuxCtx, &runtime);
+            runtime.eeScheduler().run();
+
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "the sound should be offered to the callback registered for ADPCM");
+            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 3u,
+                     "as the type it was registered for");
+            t.Equals(gMpegStreamCallbackUserData.load(std::memory_order_acquire), kSoundUserData,
+                     "with that callback's own data, not the picture's");
+            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire), 6u,
+                     "and the packet's payload");
+
+            runtime.requestStop();
+        });
+
         tc.Run("sceMpegIsEnd follows the video's sequence end code, not the end of the CD stream", [](TestCase &t)
         {
             // A movie is often one of many in a file the game streams from:

@@ -566,9 +566,11 @@ namespace ps2_stubs
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
         constexpr uint32_t kStubMovieHeight = 240u;
+        // sceMpegStrType, by the library's numbers.
         constexpr uint32_t kMpegStrM2V = 0u;
-        constexpr uint32_t kMpegStrPCM = 1u;
-        constexpr uint32_t kMpegStrADPCM = 2u;
+        constexpr uint32_t kMpegStrIPU = 1u;
+        constexpr uint32_t kMpegStrPCM = 2u;
+        constexpr uint32_t kMpegStrADPCM = 3u;
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1173,7 +1175,10 @@ namespace ps2_stubs
         }
 
         // The callback a game's sound goes to: the one it registered for
-        // PCM, else the others these packets have been given to.
+        // PCM or for ADPCM, whichever its movies carry (Drakengard's have
+        // PCM, Drakengard 2's SPU ADPCM, registered as 3 and nothing else),
+        // else the one these packets were given to before the types had
+        // their own numbers here.
         std::optional<MpegRegisteredCallback> audioCallback(uint32_t mpegAddr)
         {
             const auto registered = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
@@ -1181,7 +1186,7 @@ namespace ps2_stubs
             {
                 return std::nullopt;
             }
-            for (const uint32_t type : {kMpegStrADPCM, kMpegStrPCM})
+            for (const uint32_t type : {kMpegStrPCM, kMpegStrADPCM, kMpegStrIPU})
             {
                 for (const MpegRegisteredCallback &callback : registered->second)
                 {
