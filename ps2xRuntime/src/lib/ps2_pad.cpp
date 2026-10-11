@@ -1,4 +1,5 @@
 #include "runtime/ps2_pad.h"
+#include "runtime/ps2_input.h"
 #include "runtime/ps2_settings.h"
 #include "ps2_host_backend.h"
 
@@ -134,6 +135,49 @@ namespace
         return false;
     }
 
+    // A key as a prompt can show it: see runtime/ps2_input.h.
+    std::string keyLabel(int key)
+    {
+        if (key >= KEY_A && key <= KEY_Z)
+            return std::string(1, static_cast<char>('A' + (key - KEY_A)));
+        if (key >= KEY_ZERO && key <= KEY_NINE)
+            return std::string(1, static_cast<char>('0' + (key - KEY_ZERO)));
+        if (key >= KEY_F1 && key <= KEY_F12)
+            return "F" + std::to_string(key - KEY_F1 + 1);
+        if (key >= KEY_KP_0 && key <= KEY_KP_9)
+            return "K" + std::to_string(key - KEY_KP_0);
+        switch (key)
+        {
+        case kMouseBase + MOUSE_BUTTON_LEFT: return "LMB";
+        case kMouseBase + MOUSE_BUTTON_RIGHT: return "RMB";
+        case kMouseBase + MOUSE_BUTTON_MIDDLE: return "MMB";
+        case kMouseBase + MOUSE_BUTTON_SIDE: return "M4";
+        case kMouseBase + MOUSE_BUTTON_EXTRA: return "M5";
+        case KEY_SPACE: return "SPC";
+        case KEY_ENTER: return "ENT";
+        case KEY_TAB: return "TAB";
+        case KEY_ESCAPE: return "ESC";
+        case KEY_BACKSPACE: return "BKS";
+        case KEY_UP: return "UP";
+        case KEY_DOWN: return "DN";
+        case KEY_LEFT: return "LT";
+        case KEY_RIGHT: return "RT";
+        case KEY_LEFT_SHIFT:
+        case KEY_RIGHT_SHIFT: return "SHF";
+        case KEY_LEFT_CONTROL:
+        case KEY_RIGHT_CONTROL: return "CTL";
+        case KEY_LEFT_ALT:
+        case KEY_RIGHT_ALT: return "ALT";
+        case KEY_INSERT: return "INS";
+        case KEY_DELETE: return "DEL";
+        case KEY_HOME: return "HOM";
+        case KEY_END: return "END";
+        case KEY_PAGE_UP: return "PGU";
+        case KEY_PAGE_DOWN: return "PGD";
+        default: return "KEY";
+        }
+    }
+
     // The keys of [input] <name>, or of `otherwise` where the file has none.
     Keys bound(const char *name, const char *otherwise)
     {
@@ -158,6 +202,7 @@ namespace
         {
             uint16_t mask;
             Keys keys;
+            std::string label; // of the first key, for a prompt
         };
         std::vector<Button> buttons;
         Keys stick[4]; // up, down, left, right
@@ -185,6 +230,9 @@ namespace
                 {PAD_LEFT, bound("left", "left")},
                 {PAD_RIGHT, bound("right", "right")},
             };
+            for (Button &button : buttons)
+                if (!button.keys.empty())
+                    button.label = keyLabel(button.keys.front());
             stick[0] = bound("stick_up", "w");
             stick[1] = bound("stick_down", "s");
             stick[2] = bound("stick_left", "a");
@@ -382,6 +430,26 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         }
     }
     return true;
+}
+
+int ps2xInputDevice()
+{
+    return g_device.load(std::memory_order_relaxed);
+}
+
+const char *ps2xInputDeviceName()
+{
+    const int device = g_device.load(std::memory_order_relaxed);
+    const char *name = device >= 0 ? GetGamepadName(device) : nullptr;
+    return name ? name : "";
+}
+
+const char *ps2xInputKeyLabel(uint16_t button)
+{
+    for (const Bindings::Button &bound : bindings().buttons)
+        if (bound.mask == button)
+            return bound.label.c_str();
+    return "";
 }
 
 void ps2xInputSetUiOpen(bool open)
