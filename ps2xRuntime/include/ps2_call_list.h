@@ -420,11 +420,14 @@
     X(sceeFontSetFont)                        \
     X(sceeFontSetScale)                       \
     X(sceIoctl)                               \
+    X(sceDevctl)                              \
+    X(sceFormat)                              \
     X(sceIpuInit)                             \
     X(sceIpuRestartDMA)                       \
     X(sceIpuStopDMA)                          \
     X(sceIpuSync)                             \
     X(sceLseek)                               \
+    X(sceMount)                               \
     X(sceMcChangeThreadPriority)              \
     X(sceMcChdir)                             \
     X(sceMcClose)                             \
@@ -477,6 +480,7 @@
     X(scePad2GetState)                        \
     X(scePad2Init)                            \
     X(scePad2Read)                            \
+    X(sceUmount)                              \
     X(scePadEnd)                              \
     X(scePadEnterPressMode)                   \
     X(scePadExitPressMode)                    \

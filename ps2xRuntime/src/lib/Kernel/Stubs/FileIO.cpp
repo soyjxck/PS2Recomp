@@ -103,6 +103,35 @@ namespace ps2_stubs
         ps2_syscalls::fioLseek(rdram, ctx, runtime);
     }
 
+    // The hard disk and what sits on it. A game that can install itself asks
+    // for the drive (sceDevctl on "hdd0:", sceMount of a "pfs" partition)
+    // through iomanX, which answers for a device it has no driver for as it
+    // does here: no console has a disk until its modules are loaded.
+    namespace
+    {
+        constexpr int32_t kNoSuchDevice = -19; // -ENODEV
+    }
+
+    void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, kNoSuchDevice);
+    }
+
+    void sceFormat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, kNoSuchDevice);
+    }
+
+    void sceMount(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, kNoSuchDevice);
+    }
+
+    void sceUmount(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, kNoSuchDevice);
+    }
+
     void sceOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ps2_syscalls::fioOpen(rdram, ctx, runtime);
