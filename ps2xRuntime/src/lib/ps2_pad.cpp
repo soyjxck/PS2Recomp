@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,12 @@ namespace
     // The mouse's two settings as changed while the game runs; below 0, as the file has them.
     std::atomic<int> g_mouseLook{-1};
     std::atomic<float> g_sensitivity{-1.0f};
+    // A game that takes the mouse's movement itself (ps2xInputMouseLookDirect):
+    // what has moved and not been taken yet, while the mouse is the camera's.
+    std::atomic<bool> g_lookDirect{false};
+    std::mutex g_takenMutex;
+    bool g_takeable = false;
+    float g_takeX = 0.0f, g_takeY = 0.0f;
 
     // A key or mouse button, as raylib numbers them; mouse buttons from 1000.
     constexpr int kMouseBase = 1000;
@@ -535,6 +542,22 @@ void ps2xInputSetUiOpen(bool open)
     g_uiOpen.store(open, std::memory_order_relaxed);
 }
 
+void ps2xInputMouseLookDirect(bool on)
+{
+    g_lookDirect.store(on, std::memory_order_relaxed);
+}
+
+bool ps2xInputTakeMouseLook(float &dx, float &dy)
+{
+    std::lock_guard<std::mutex> lock(g_takenMutex);
+    dx = g_takeX;
+    dy = g_takeY;
+    g_takeX = g_takeY = 0.0f;
+    if (!g_takeable)
+        dx = dy = 0.0f;
+    return g_takeable;
+}
+
 void ps2xInputFrame()
 {
     // Controllers this build of the window library has no layout for: a
@@ -574,7 +597,29 @@ void ps2xInputFrame()
             EnableCursor();
         lookX = lookY = 0.0f;
     }
-    if (captured)
+    // A game that takes the movement itself has it as it comes, and the
+    // stick stays at rest; not while a menu of the host's holds the pad, or
+    // the camera would jump by all the mouse did there when it closes.
+    const bool direct = captured && g_lookDirect.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_takenMutex);
+        g_takeable = direct && g_blocked.load(std::memory_order_relaxed) == 0;
+        if (g_takeable)
+        {
+            const Vector2 moved = GetMouseDelta();
+            g_takeX += moved.x * sensitivity;
+            g_takeY += moved.y * sensitivity;
+        }
+        else
+        {
+            g_takeX = g_takeY = 0.0f;
+        }
+    }
+    if (direct)
+    {
+        lookX = lookY = 0.0f;
+    }
+    else if (captured)
     {
         // A stick is a speed and the mouse a distance: how fast the mouse
         // is moving, smoothed over a twentieth of a second, is how far the

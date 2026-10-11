@@ -36,4 +36,20 @@ void ps2xInputBlock(bool block);
 void ps2xInputSetMouseLook(bool on);
 void ps2xInputSetMouseSensitivity(float sensitivity);
 
+// For a game that turns its camera by the mouse itself. A stick is a speed
+// and the mouse a distance, so the mouse as the right stick is the best a
+// pad can carry and no more: it lags, and it tops out at whatever the game
+// does with a stick pushed all the way.
+//
+// ps2xInputMouseLookDirect(true) says the game takes the mouse's movement
+// instead: the right stick is then left at rest by the mouse (keys bound to
+// it still push it). ps2xInputTakeMouseLook gives what the mouse has moved
+// since it was last asked, right and down positive, in the mouse's own
+// counts times the sensitivity, and true; or false and nothing while the
+// mouse is not the camera's: mouse_look off, another device in use, the
+// window without the focus, a menu or debug window open, the pad held by
+// a menu of the host's, a run driven by PS2X_PAD_SCRIPT. From any thread.
+void ps2xInputMouseLookDirect(bool on);
+bool ps2xInputTakeMouseLook(float &dx, float &dy);
+
 #endif
