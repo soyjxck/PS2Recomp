@@ -165,7 +165,13 @@ namespace
     }
 }
 
-int main(int argc, char *argv[])
+// A game with a start-up of its own (an installer, say) compiles this file
+// with PS2X_RUNTIME_MAIN set to another name and calls that from its main.
+#ifndef PS2X_RUNTIME_MAIN
+#define PS2X_RUNTIME_MAIN main
+#endif
+
+int PS2X_RUNTIME_MAIN(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
     redirectStdioToLogcat();
