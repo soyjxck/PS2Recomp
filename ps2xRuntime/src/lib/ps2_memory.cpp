@@ -1390,7 +1390,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    // A chain ends at its end tag. These bounds are for one
+                    // that never does (tags that lead back to themselves),
+                    // and sit far above a frame's display list: a busy one
+                    // is several thousand tags, and megabytes when the
+                    // program sends its microprograms again for every model.
                     const int kMaxChainTags = 1 << 20;
+                    const size_t kMaxChainBytes = size_t{256} << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1451,7 +1457,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-                    while (tagsProcessed < kMaxChainTags)
+                    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
                     {
                         const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
@@ -1567,6 +1573,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    if (tagsProcessed >= kMaxChainTags || chainBuf.size() >= kMaxChainBytes)
+                    {
+                        // Cut short, the rest of the list is not drawn:
+                        // say so, once per channel.
+                        static uint32_t reported = 0u;
+                        const uint32_t channelBit = 1u << ((channelBase >> 12) & 0xFu);
+                        if ((reported & channelBit) == 0u)
+                        {
+                            reported |= channelBit;
+                            std::fprintf(stderr, "[dma] chain on channel 0x%08x cut off after %d tags and %zu bytes: it has no end\n",
+                                         channelBase, tagsProcessed, chainBuf.size());
+                        }
+                    }
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;

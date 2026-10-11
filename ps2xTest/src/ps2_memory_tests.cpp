@@ -1498,6 +1498,57 @@ void register_ps2_memory_tests()
                      "qwc-zero compact VIF1 chain should clear the STR bit after drain");
         });
 
+        tc.Run("VIF1 DMA chain of thousands of tags is walked to its end", [](TestCase &t)
+        {
+            // A frame's display list in a game that sends a packet per
+            // model part: more tags than the walker used to allow, and
+            // what came after them (the copy to the screen) was dropped.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00100000u;
+            constexpr uint32_t kTags = 6000u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            for (uint32_t i = 0; i < kTags; ++i)
+            {
+                const bool last = i + 1u == kTags;
+                writeDmaTag(rdram, kTag + i * 16u, makeDmaTag(0u, last ? 7u : 1u, 0u, false));
+                const uint32_t itopCmd = makeVifCmd(0x04u, 0u, last ? 0x155u : 0x2AAu);
+                std::memcpy(rdram + kTag + i * 16u + 12u, &itopCmd, sizeof(itopCmd));
+            }
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
+                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+            mem.processPendingTransfers();
+
+            t.Equals(mem.vif1_regs.itops, 0x155u, "the last tag's VIFcode should have been reached");
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
+                     "the chain should clear the STR bit after drain");
+        });
+
+        tc.Run("VIF1 DMA chain that leads back to itself is cut off", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00100000u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            writeDmaTag(rdram, kTag, makeDmaTag(0u, 2u, kTag, false)); // NEXT: itself
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
+                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+            mem.processPendingTransfers();
+
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u,
+                     "a chain without an end should still let go of the channel");
+        });
+
         tc.Run("VIF1 DMA chain transfers REF tag high bytes when TTE is enabled", [](TestCase &t)
         {
             PS2Memory mem;
