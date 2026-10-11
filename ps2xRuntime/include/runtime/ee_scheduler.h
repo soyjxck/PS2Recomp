@@ -236,6 +236,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    Deferred,
 };
 
 struct EeEvent
@@ -315,6 +316,18 @@ public:
 
     int setAlarm(uint16_t ticks, uint32_t handler, uint32_t argument, uint32_t gp, uint32_t sp);
     int cancelAlarm(int id);
+    // Runs `action` on the scheduler's thread once the emulated clock is
+    // delayCycles further on: for what a console finishes later than it is
+    // asked (a reply that has to cross the SIF).
+    void runAfter(uint64_t delayCycles, std::function<void()> action);
+    // What a call that the IOP has to answer costs its caller, in cycles
+    // (ps2x::setSifRpcDelay, PS2X_SIF_RPC_DELAY_US; 0 unless a game asks),
+    // and the wait itself: the running thread stops for that long and goes
+    // on with the registers it has now, while lower threads run. Called
+    // last by a handler, after it has set its results; it returns at once
+    // when there is nothing to wait for or no thread to make wait.
+    [[nodiscard]] uint64_t iopRoundTripCycles() const noexcept;
+    void waitIopRoundTrip();
     void queueInvocation(GuestInvocation invocation);
     [[noreturn]] void invokeCurrent(GuestInvocation invocation);
     [[noreturn]] void invokeCurrentSequence(std::vector<GuestInvocation> invocations);
@@ -407,6 +420,9 @@ private:
     std::unordered_map<int, EeSemaphore> m_semaphores;
     std::unordered_map<int, EeEventFlag> m_eventFlags;
     std::unordered_map<int, EeAlarm> m_alarms;
+    std::unordered_map<uint32_t, std::function<void()>> m_deferredActions;
+    uint32_t m_nextDeferredAction = 1;
+    uint64_t m_roundTripSequence = 0;
     std::unordered_map<int, EeIrqHandler> m_intcHandlers;
     std::unordered_map<int, EeIrqHandler> m_dmacHandlers;
     int m_nextThreadId = kFirstThreadId;

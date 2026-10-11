@@ -169,6 +169,8 @@ namespace ps2_stubs
         }
     }
 
+    static void waitForCdCommand(PS2Runtime *runtime);
+
     CdDebugSnapshot getCdDebugSnapshot()
     {
         CdDebugSnapshot snapshot{};
@@ -370,7 +372,12 @@ namespace ps2_stubs
 
     void sceCdDiskReady(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        const bool blocking = getRegU32(ctx, 4) == 0u;
         setReturnS32(ctx, 2);
+        if (blocking)
+        {
+            waitForCdCommand(runtime);
+        }
     }
 
     void sceCdGetDiskType(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -544,9 +551,21 @@ namespace ps2_stubs
 
     static void searchCdFile(uint8_t *rdram, R5900Context *ctx, uint32_t layer);
 
+    // The S and N commands that libcdvd sends and waits for: the caller is
+    // off the processor until the IOP has answered (nothing by default, see
+    // ps2x::setSifRpcDelay).
+    static void waitForCdCommand(PS2Runtime *runtime)
+    {
+        if (runtime != nullptr)
+        {
+            runtime->eeScheduler().waitIopRoundTrip();
+        }
+    }
+
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         searchCdFile(rdram, ctx, 0u);
+        waitForCdCommand(runtime);
     }
 
     // sceCdLayerSearchFile(file, name, layer): the file system of one layer of
@@ -555,6 +574,7 @@ namespace ps2_stubs
     void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         searchCdFile(rdram, ctx, getRegU32(ctx, 6) != 0u ? 1u : 0u);
+        waitForCdCommand(runtime);
     }
 
     // libcdvd 2.4's form: sceCdReadDvdDualInfo(int *on_dual).
@@ -565,6 +585,7 @@ namespace ps2_stubs
             *onDual = cdImageLayer1Start() != 0u ? 1 : 0;
         }
         setReturnS32(ctx, 1);
+        waitForCdCommand(runtime);
     }
 
     // The later form, sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start).

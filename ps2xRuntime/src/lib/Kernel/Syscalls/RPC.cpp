@@ -678,6 +678,16 @@ namespace ps2_syscalls
             {
                 completeClient(base, true);
             };
+            if (const uint64_t delay = runtime->eeScheduler().iopRoundTripCycles(); delay != 0u && (mode & kSifRpcModeNowait) != 0u)
+            {
+                // The caller goes on (and usually waits for what the end
+                // function signals) while the reply is on its way; the end
+                // function then runs as the SIF interrupt would call it.
+                SET_GPR_U32(&callback.context, 29, 0u);
+                runtime->eeScheduler().runAfter(delay, [runtime, queued = std::move(callback)]() mutable
+                                                { runtime->eeScheduler().queueInvocation(std::move(queued)); });
+                return;
+            }
             runtime->eeScheduler().invokeCurrent(std::move(callback));
         };
 
@@ -700,6 +710,12 @@ namespace ps2_syscalls
             runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
         finishCall(nullptr, *ctx);
+        if ((mode & kSifRpcModeNowait) == 0u)
+        {
+            // The caller of a blocking call is off the processor until the
+            // reply has crossed the SIF.
+            runtime->eeScheduler().waitIopRoundTrip();
+        }
     }
 
     uint32_t findEeRpcServer(uint8_t *rdram, uint32_t sid)

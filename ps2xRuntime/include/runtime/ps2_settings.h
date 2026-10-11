@@ -191,6 +191,17 @@ namespace ps2x
     };
     // Any thread may call it.
     void setFlatLayer(const FlatLayer &layer);
+
+    // How long a call that the IOP answers takes, in emulated microseconds:
+    // the caller of a blocking one (sceSifCallRpc without SIF_RPC_M_NOWAIT,
+    // sceCdSearchFile, sceCdDiskReady(0)...) waits that long, and the end
+    // function of a no-wait one runs that much later. 0, the default, is no
+    // time at all: the IOP's side of a call is done when the EE's function
+    // returns. On a console the answer crosses the SIF some hundreds of
+    // microseconds later and the caller's thread is off the processor
+    // meanwhile; a game whose threads count on that says how long in its
+    // override. PS2X_SIF_RPC_DELAY_US wins over this.
+    void setSifRpcDelay(uint32_t microseconds);
 }
 
 #endif // PS2_SETTINGS_H

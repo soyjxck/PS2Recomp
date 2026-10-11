@@ -1,5 +1,6 @@
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/gs_worker.h"
+#include "runtime/ps2_settings.h"
 
 namespace
 {
@@ -17,6 +18,17 @@ namespace
         }();
         return cycles;
     }
+}
+
+namespace
+{
+    std::atomic<uint32_t> g_iopRoundTripMicroseconds{0u};
+    constexpr uint32_t kIopRoundTripWaitType = 0x53494601u;
+}
+
+void ps2x::setSifRpcDelay(uint32_t microseconds)
+{
+    g_iopRoundTripMicroseconds.store(microseconds, std::memory_order_relaxed);
 }
 
 // Has the scheduler wait for the GS a set emulated time after an interrupt was
@@ -123,6 +135,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_semaphores.clear();
     m_eventFlags.clear();
     m_alarms.clear();
+    m_deferredActions.clear();
     m_intcHandlers.clear();
     m_dmacHandlers.clear();
     m_nextThreadId = kFirstThreadId;
@@ -1144,6 +1157,52 @@ int EeScheduler::cancelAlarm(int id)
     return KE_OK;
 }
 
+void EeScheduler::runAfter(uint64_t delayCycles, std::function<void()> action)
+{
+    assertExecutor();
+    const uint32_t id = m_nextDeferredAction++;
+    m_deferredActions.emplace(id, std::move(action));
+    scheduleEvent(m_eeCycle + std::max<uint64_t>(delayCycles, 1u),
+                  std::chrono::steady_clock::now() +
+                      std::chrono::microseconds((delayCycles * 1000000ull) / kEeClockHz),
+                  EeEvent{EeEventType::Deferred, id, 0});
+}
+
+uint64_t EeScheduler::iopRoundTripCycles() const noexcept
+{
+    static const char *const fromEnvironment = std::getenv("PS2X_SIF_RPC_DELAY_US");
+    const uint64_t microseconds = fromEnvironment
+                                      ? std::strtoull(fromEnvironment, nullptr, 10)
+                                      : g_iopRoundTripMicroseconds.load(std::memory_order_relaxed);
+    return (microseconds * kEeClockHz) / 1000000ull;
+}
+
+void EeScheduler::waitIopRoundTrip()
+{
+    const uint64_t cycles = iopRoundTripCycles();
+    GuestThread *self = cycles != 0u && std::this_thread::get_id() == m_executorThread ? currentThread() : nullptr;
+    if (self == nullptr || m_insideInterrupt || !self->invocations.empty())
+    {
+        return;
+    }
+
+    // The wait ends as any other does, with a result in $v0: the handler's
+    // own, and $v1, are put back when the thread goes on.
+    const R5900Context *context = &self->activeContext();
+    const uint64_t v0 = GPR_U64(context, 2);
+    const uint64_t v1 = GPR_U64(context, 3);
+    const uint64_t token = ++m_roundTripSequence;
+    scheduleEvent(m_eeCycle + cycles,
+                  std::chrono::steady_clock::now() + std::chrono::microseconds((cycles * 1000000ull) / kEeClockHz),
+                  EeEvent{EeEventType::ExternalWake, kIopRoundTripWaitType, token});
+    waitExternal(EeWaitReason::External, kIopRoundTripWaitType, token,
+                 [v0, v1](R5900Context &resumeContext)
+                 {
+                     SET_GPR_U64(&resumeContext, 2, v0);
+                     SET_GPR_U64(&resumeContext, 3, v1);
+                 });
+}
+
 void EeScheduler::queueInvocation(GuestInvocation invocation)
 {
     assertExecutor();
@@ -2007,6 +2066,18 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);
         break;
+    case EeEventType::Deferred:
+    {
+        auto deferred = m_deferredActions.find(event.id);
+        if (deferred == m_deferredActions.end())
+        {
+            break;
+        }
+        const std::function<void()> action = std::move(deferred->second);
+        m_deferredActions.erase(deferred);
+        action();
+        break;
+    }
     case EeEventType::VBlankEnd:
         dispatchIrq(false, 3u);
         break;
