@@ -86,6 +86,9 @@ private:
         Line,
     };
     bool DrawFast(const GSPrimitiveBatch &batch, FastKind kind);
+    // ps2x::setFlatLayer: the primitive made narrower (m_flatBatch), if it
+    // is of that layer.
+    bool NarrowFlat(const GSPrimitiveBatch &batch);
     bool PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareLine(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
@@ -285,6 +288,25 @@ private:
     // primitive only the software path can draw. GpuDownload brings them.
     // (display.renderer = hybrid keeps both drawing, as a check.)
     bool m_cardOnly = false;
+    // NarrowFlat: the primitive being drawn is one of its sprites, and the
+    // run of primitives at one depth it last saw (where it narrows them about).
+    bool m_flatSprite = false;
+    GSPrimitiveBatch m_flatBatch;
+    struct
+    {
+        bool set = false;
+        double depth = 0.0;
+        float about = 0.0f;
+    } m_flatRun;
+    // And the cluster it is in the middle of: what its pieces cover so far
+    // and the side of the frame they keep to.
+    struct FlatCluster
+    {
+        bool set = false;
+        float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+        float about = 0.0f;
+    };
+    FlatCluster m_flatCluster, m_flatText;
     std::array<uint8_t, kVramPages> m_cardAhead{};
     // The last image transfer that stored anything in each page, and what
     // kind of pixels it was (GpuAdopt).

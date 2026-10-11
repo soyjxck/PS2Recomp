@@ -612,7 +612,16 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram || batch.vertexCount == 0u)
         return;
-    DrawPrimitive(batch);
+    if (NarrowFlat(batch))
+    {
+        m_flatSprite = m_flatBatch.state.prim.type == GS_PRIM_SPRITE;
+        DrawPrimitive(m_flatBatch);
+        m_flatSprite = false;
+    }
+    else
+    {
+        DrawPrimitive(batch);
+    }
     if (g_backgroundDrawing.load(std::memory_order_acquire) != m_vram)
         FlushPrimitives("direct");
 }

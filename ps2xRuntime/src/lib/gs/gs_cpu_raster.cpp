@@ -1692,6 +1692,11 @@ struct GSCpuBackend::PreparedPrimitive
     int originX = 0, originY = 0;
     float spanX = 1.0f, spanY = 1.0f;
     float tu0 = 0.0f, tv0 = 0.0f, tu1 = 0.0f, tv1 = 0.0f;
+    // A sprite put between pixels (NarrowFlat): where its sides are and the
+    // texel coordinates there, for a surface with more pixels than the
+    // game's to draw it where it is.
+    bool placed = false;
+    float sideX0 = 0.0f, sideX1 = 0.0f, sideU0 = 0.0f, sideU1 = 0.0f;
 
     // A sprite drawn into the shadow that only copies a frame buffer (see
     // PrepareBlit): where the pixels come from, which may be the shadow as
@@ -2456,8 +2461,24 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
         }
         return way;
     };
-    const Way across = wayOf(v0.x, v1.x, ctx.xyoffset.ofx, v0.u, v1.u, true);
+    Way across = wayOf(v0.x, v1.x, ctx.xyoffset.ofx, v0.u, v1.u, true);
     const Way down = wayOf(v0.y, v1.y, ctx.xyoffset.ofy, v0.v, v1.v, false);
+    // A sprite of the flat layer made narrower: the same picture over fewer
+    // pixels, so its sides stay where they fall, between pixels, and it
+    // covers the pixels whose middles lie between them.
+    float sideX0 = 0.0f, sideX1 = 0.0f;
+    if (m_flatSprite)
+    {
+        const float offset = static_cast<float>(ctx.xyoffset.ofx) * 0.0625f;
+        sideX0 = v0.x - offset;
+        sideX1 = v1.x - offset;
+        across = Way{};
+        across.flipped = sideX0 > sideX1;
+        if (across.flipped)
+            std::swap(sideX0, sideX1);
+        across.first = static_cast<int>(std::ceil(sideX0 - 0.5f));
+        across.count = std::max(1, static_cast<int>(std::ceil(sideX1 - 0.5f)) - across.first);
+    }
 
     // Which corner each vertex is at decides the direction the texture runs.
     const bool flipX = across.flipped;
@@ -2481,6 +2502,9 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     primitive.originY = y0;
     primitive.spanX = static_cast<float>(spanX);
     primitive.spanY = static_cast<float>(spanY);
+    primitive.placed = m_flatSprite;
+    primitive.sideX0 = sideX0;
+    primitive.sideX1 = sideX1;
 
     if (!p.tme)
         return true;
@@ -2522,6 +2546,24 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     };
     asRead(across, tu0, tu1);
     asRead(down, tv0, tv1);
+    if (primitive.placed)
+    {
+        // The texels lie from side to side; a pixel reads what its middle
+        // is over. Filtered, the sides read the middles of the first and
+        // last texels and nothing of the texels next to them, which are
+        // another picture's (the letter beside it in the texture).
+        if (p.linear && std::fabs(tu1 - tu0) > 1.0f)
+        {
+            const float half = tu1 > tu0 ? 0.5f : -0.5f;
+            tu0 += half;
+            tu1 -= half;
+        }
+        primitive.sideU0 = tu0;
+        primitive.sideU1 = tu1;
+        const float step = (tu1 - tu0) / std::max(sideX1 - sideX0, 0.0625f);
+        tu0 += (static_cast<float>(across.first) - sideX0) * step;
+        tu1 = tu0 + static_cast<float>(across.count) * step;
+    }
     primitive.tu0 = tu0;
     primitive.tv0 = tv0;
     primitive.tu1 = tu1;
@@ -2538,8 +2580,10 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
                        : coordinate;
         };
         const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
-        const float firstU = quantise(rowU);
-        const float lastU = quantise(rowU + static_cast<float>(primitive.maxX - primitive.minX) * stepU);
+        // (One put between pixels is drawn by a surface with more of them
+        // from anywhere between its sides.)
+        const float firstU = primitive.placed ? primitive.sideU0 : quantise(rowU);
+        const float lastU = primitive.placed ? primitive.sideU1 : quantise(rowU + static_cast<float>(primitive.maxX - primitive.minX) * stepU);
         const float firstV = quantise(primitive.tv0 + (static_cast<float>(primitive.minY - primitive.originY) + 0.5f) * stepV);
         const float lastV = quantise(primitive.tv0 + (static_cast<float>(primitive.maxY - primitive.originY) + 0.5f) * stepV);
         // Fixed-point coordinates come out the same here as there; a divide
@@ -3489,6 +3533,176 @@ bool GSCpuBackend::CopyScaledFrame(const GSFrameReg &frame, SurfaceScale scale, 
         }
         WaitForBatch(waitFor);
     }
+}
+
+namespace
+{
+    std::atomic<float> g_flatNarrow{1.0f};
+    std::atomic<uint32_t> g_flatChanges{0u};
+    std::mutex g_flatMutex;
+    ps2x::FlatLayer g_flatLayer;
+}
+
+void ps2x::setFlatLayer(const FlatLayer &layer)
+{
+    std::lock_guard<std::mutex> lock(g_flatMutex);
+    if (std::memcmp(&g_flatLayer, &layer, sizeof(layer)) == 0)
+        return;
+    g_flatLayer = layer;
+    g_flatChanges.fetch_add(1u, std::memory_order_relaxed);
+    g_flatNarrow.store(layer.narrow > 0.0f && layer.narrow < 1.0f ? layer.narrow : 1.0f, std::memory_order_relaxed);
+}
+
+bool GSCpuBackend::NarrowFlat(const GSPrimitiveBatch &batch)
+{
+    const float narrow = g_flatNarrow.load(std::memory_order_relaxed);
+    if (narrow >= 1.0f)
+        return false;
+    // The GS thread's own copy of what was asked for.
+    static ps2x::FlatLayer layer;
+    static uint32_t changes = 0u;
+    if (const uint32_t now = g_flatChanges.load(std::memory_order_relaxed); now != changes)
+    {
+        std::lock_guard<std::mutex> lock(g_flatMutex);
+        layer = g_flatLayer;
+        changes = now;
+    }
+    const GSDrawState &state = batch.state;
+    const GSContext &ctx = state.context;
+    const float width = layer.width;
+    if (static_cast<float>(ctx.frame.fbw * 64u) != width)
+        return false;
+    int count = 0;
+    switch (state.prim.type)
+    {
+    case GS_PRIM_SPRITE:
+    case GS_PRIM_LINE:
+    case GS_PRIM_LINESTRIP:
+        count = 2;
+        break;
+    case GS_PRIM_TRIANGLE:
+    case GS_PRIM_TRISTRIP:
+    case GS_PRIM_TRIFAN:
+        count = 3;
+        break;
+    default:
+        return false;
+    }
+    if (batch.vertexCount < count)
+        return false;
+    const bool sprite = state.prim.type == GS_PRIM_SPRITE;
+
+    // One depth for all of it (a sprite has its second vertex's).
+    const double z = batch.vertices[count - 1].z;
+    if (!sprite)
+    {
+        for (int i = 0; i < count - 1; ++i)
+        {
+            if (batch.vertices[i].z != z)
+                return false;
+        }
+    }
+    const float offsetX = static_cast<float>(ctx.xyoffset.ofx) * 0.0625f, offsetY = static_cast<float>(ctx.xyoffset.ofy) * 0.0625f;
+    float left = batch.vertices[0].x - offsetX, right = left;
+    float top = batch.vertices[0].y - offsetY, bottom = top;
+    for (int i = 1; i < count; ++i)
+    {
+        left = std::min(left, batch.vertices[i].x - offsetX);
+        right = std::max(right, batch.vertices[i].x - offsetX);
+        top = std::min(top, batch.vertices[i].y - offsetY);
+        bottom = std::max(bottom, batch.vertices[i].y - offsetY);
+    }
+
+    const double depth = layer.depth;
+    const bool depthTested = ((ctx.test >> 16) & 1u) != 0u && ((ctx.test >> 17) & 3u) >= 2u;
+    float about;
+    bool farSideStays = false;
+    if (z == depth || z >= layer.ceiling)
+    {
+        // Nothing of it on the frame, or all the way across it, or a
+        // picture of the scene.
+        if (right <= 0.0f || left >= width || (left <= 0.5f && right >= width - 0.5f))
+            return false;
+        if (state.prim.tme && (ctx.tex0.psm == 0u || ctx.tex0.psm == 1u))
+            return false;
+        auto touches = [&](const FlatCluster &cluster, float reach)
+        {
+            return cluster.set && left <= cluster.x1 + reach && right >= cluster.x0 - reach && top <= cluster.y1 + reach &&
+                   bottom >= cluster.y0 - reach;
+        };
+        auto grow = [&](FlatCluster &cluster)
+        {
+            cluster.x0 = std::min(cluster.x0, left);
+            cluster.y0 = std::min(cluster.y0, top);
+            cluster.x1 = std::max(cluster.x1, right);
+            cluster.y1 = std::max(cluster.y1, bottom);
+        };
+        if (state.prim.tme && layer.text != 0u && ctx.tex0.tbp0 == layer.text)
+        {
+            // A letter: of the text it is near, which is where its first
+            // letter said.
+            if (touches(m_flatText, 40.0f))
+            {
+                grow(m_flatText);
+            }
+            else
+            {
+                m_flatText = {true, left, top, right, bottom, touches(m_flatCluster, 24.0f) ? m_flatCluster.about : width * 0.5f};
+            }
+            about = m_flatText.about;
+        }
+        else
+        {
+            m_flatText.set = false;
+            if (touches(m_flatCluster, 8.0f))
+            {
+                grow(m_flatCluster);
+            }
+            else
+            {
+                m_flatCluster = {true, left, top, right, bottom, (left + right) * 0.5f};
+                for (const ps2x::FlatLayer::Side &side : layer.sides)
+                {
+                    if (side.towards != 0 && left >= side.x0 && right <= side.x1 && top >= side.y0 && bottom <= side.y1)
+                    {
+                        m_flatCluster.about = side.towards < 0 ? 0.0f : width;
+                        break;
+                    }
+                }
+            }
+            about = m_flatCluster.about;
+            farSideStays = about == 0.0f || about == width;
+        }
+    }
+    else if (z > depth || (sprite && depthTested && z > 0.0))
+    {
+        // Over something in the scene: the run of primitives at this depth
+        // keeps the place its first one has.
+        const float middle = (left + right) * 0.5f;
+        if (!m_flatRun.set || m_flatRun.depth != z || std::fabs(middle - m_flatRun.about) > width * 0.15f)
+        {
+            m_flatRun.set = true;
+            m_flatRun.depth = z;
+            m_flatRun.about = middle;
+        }
+        about = m_flatRun.about;
+    }
+    else
+    {
+        return false;
+    }
+
+    GSPrimitiveBatch &narrowed = m_flatBatch;
+    narrowed = batch;
+    for (int i = 0; i < count; ++i)
+    {
+        const float x = batch.vertices[i].x - offsetX;
+        // (What reaches from a corner to the far side of the frame still does.)
+        if (farSideStays && (about == 0.0f ? x >= width - 0.5f : x <= 0.5f))
+            continue;
+        narrowed.vertices[i].x = offsetX + about + (x - about) * narrow;
+    }
+    return true;
 }
 
 bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)

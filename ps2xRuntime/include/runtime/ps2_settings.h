@@ -13,6 +13,7 @@
 // which wins: test runs are driven that way.
 
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -147,6 +148,44 @@ namespace ps2x
     // draws some of its screens for a wider picture than others (its scenes
     // widened, its movies and menus not). Any thread may call it.
     void setPresentationAspect(float widthOverHeight);
+
+    // What a game draws flat over its scenes (gauges, maps, text) is laid
+    // out for a 4:3 picture. Once the scenes are made for a wider one and
+    // shown stretched out to it, that layer is stretched with them. This
+    // has the GS draw the layer narrower by `narrow` (the game's aspect
+    // over the picture's, 0.75 for 16:9; 1 or 0 for as the game sends it),
+    // so that it comes out the shape it was drawn. The layer is what goes
+    // into a frame `width` pixels wide at `depth` exactly, the nearest
+    // there is, or at `ceiling` and past it; not what spans the whole
+    // width (a fade, a band behind text) and not what is drawn from a
+    // texture of whole colours (a picture of the scene, worked over).
+    // - Pieces that touch make a cluster, which is narrowed about where
+    //   its first piece is, and so stays where the game put it (a gauge
+    //   in its place, a cursor over what it points at). A cluster that
+    //   starts inside one of `sides` is narrowed about that side of the
+    //   frame instead and keeps to its corner; a piece of it that reaches
+    //   the far side still does.
+    // - Text, drawn from the texture at `text`, goes with the cluster it
+    //   starts in, and about the middle of the frame if it starts in none.
+    // - Sprites tested against the scene's depth, and what lies between
+    //   `depth` and `ceiling`, are marks and labels set over things in the
+    //   scene, each a run of primitives at one depth: narrowed about the
+    //   first of the run.
+    struct FlatLayer
+    {
+        float narrow = 1.0f;
+        float width = 640.0f;
+        float depth = 65535.0f;
+        float ceiling = 16777215.0f;
+        uint32_t text = 0; // TBP0; 0 for no such texture
+        struct Side
+        {
+            float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
+            int towards = 0; // -1 the left of the frame, 1 the right, 0 unused
+        } sides[4]{};
+    };
+    // Any thread may call it.
+    void setFlatLayer(const FlatLayer &layer);
 }
 
 #endif // PS2_SETTINGS_H

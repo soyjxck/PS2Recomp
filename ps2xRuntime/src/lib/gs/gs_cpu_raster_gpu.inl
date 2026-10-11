@@ -980,9 +980,11 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
     if (q.sprite)
     {
         const GSVertex &v1 = q.v[1];
-        const float x0 = static_cast<float>(q.originX), y0 = static_cast<float>(q.originY);
-        const float x1 = x0 + q.spanX, y1 = y0 + q.spanY;
-        float tu0 = q.tu0, tv0 = q.tv0, tu1 = q.tu1, tv1 = q.tv1;
+        // Where it is in the game's pixels; one put between them is drawn
+        // there, in the surface's own.
+        const float x0 = q.placed ? q.sideX0 : static_cast<float>(q.originX), y0 = static_cast<float>(q.originY);
+        const float x1 = q.placed ? q.sideX1 : x0 + q.spanX, y1 = y0 + q.spanY;
+        float tu0 = q.placed ? q.sideU0 : q.tu0, tv0 = q.tv0, tu1 = q.placed ? q.sideU1 : q.tu1, tv1 = q.tv1;
         // The frame being squeezed into a field (see ScaleUp): the same
         // lines of it every time.
         if (scale.y > scale.x && p.tme && std::fabs(tv1 - tv0) >= q.spanY * 1.5f)
