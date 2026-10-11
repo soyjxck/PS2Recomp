@@ -196,8 +196,26 @@ void ps2x::setDisplayMode(DisplayMode mode)
         const int monitor = GetCurrentMonitor();
         g_windowedWidth = GetScreenWidth();
         g_windowedHeight = GetScreenHeight();
+#if defined(__APPLE__)
+        // macOS: a window cannot be given the monitor's size first. The
+        // desktop keeps it under the menu bar, and the size it comes back
+        // with is then the mode raylib asks for. Nor is the desktop's own
+        // mode on offer: a "Retina" desktop counts in points, the modes
+        // are in the panel's pixels, and anything asked in points gets
+        // the smallest of them. So the screen is taken over first, and
+        // then asked for the mode of its own pixels; in full screen the
+        // size goes to the monitor, and raylib keeps what it is told.
+        const Vector2 scale = GetWindowScaleDPI();
+        const int width = static_cast<int>(static_cast<float>(GetMonitorWidth(monitor)) * scale.x + 0.5f);
+        const int height = static_cast<int>(static_cast<float>(GetMonitorHeight(monitor)) * scale.y + 0.5f);
+        ToggleFullscreen();
+        SetWindowSize(width, height);
+        // What it was given, should that not be what was asked.
+        SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+#else
         SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
         ToggleFullscreen();
+#endif
     }
 #else
     (void)mode;
