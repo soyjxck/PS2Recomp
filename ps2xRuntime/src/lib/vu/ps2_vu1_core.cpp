@@ -470,7 +470,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (blockProfile && m_state.pc + 32ull <= codeSize)
                 recordUncompiledBlock(blockProfile, m_unit == Unit::VU1 ? 1u : 0u,
                                       vuCode + m_state.pc);
-            programEnded = runDecodedPair<false>(decoded, budgetEnd, codeSize);
+            programEnded = runDecodedPair<false, InterpretedPair>(decoded, budgetEnd, codeSize);
         }
         if (programEnded)
             break;

@@ -767,7 +767,7 @@ inline void VU1Interpreter::advanceTo(uint64_t targetCycle)
 PS2_VU_FORCE_INLINE uint64_t VU1Interpreter::calculatePairReadyCycleInline(const DecodedInstructionPair &decoded) const
 {
     uint64_t ready = m_cycle;
-    const auto checkUsage = [&](const InstructionUsage &usage) PS2_VU_INLINE_LAMBDA
+    const auto checkUsage = [&](const InstructionUsage &usage) PS2_VU_INLINE_SMALL_LAMBDA
     {
         for (uint32_t index = 0; index < usage.vfReadCount; ++index)
         {
@@ -1309,9 +1309,89 @@ constexpr VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructi
     return decoded;
 }
 
-template <bool compiled>
-PS2_VU_FORCE_INLINE bool VU1Interpreter::runDecodedPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize)
+// What a pair asks of the executors, as a type.
+struct VU1Interpreter::InterpretedPair
 {
+    static const DecodedInstructionPair &decoding(const DecodedInstructionPair &given) { return given; }
+    static uint64_t readiness(const VU1Interpreter &vu, const DecodedInstructionPair &decoded)
+    {
+        return vu.calculatePairReadyCycle(decoded);
+    }
+    static void upper(VU1Interpreter &vu, const DecodedInstructionPair &decoded) { vu.execUpper(decoded.upper); }
+    static void lower(VU1Interpreter &vu, const DecodedInstructionPair &decoded)
+    {
+        vu.execLower(decoded.lower, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs, vu.m_activeMemory,
+                     decoded.upper);
+    }
+};
+
+// A compiled pair's words are known when it is compiled. Its decoding is
+// handed over by value, a copy that is nothing but constants, so that the
+// tests runDecodedPair makes on it are decided then by any compiler. How it
+// reaches the executors is PS2_VU_EXECUTORS (ps2_vu1_detail.h).
+template <VU1Interpreter::Unit unit, uint64_t word>
+struct VU1Interpreter::CompiledPair
+{
+    static constexpr DecodedInstructionPair kDecoded =
+        decodeInstructionWords(static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u), unit);
+    static constexpr DecodedInstructionPair decoding(const DecodedInstructionPair &) { return kDecoded; }
+    static PS2_VU_FORCE_INLINE uint64_t readiness(const VU1Interpreter &vu, const DecodedInstructionPair &decoded)
+    {
+        return vu.calculatePairReadyCycleInline(decoded);
+    }
+    static PS2_VU_FORCE_INLINE void upper(VU1Interpreter &vu, const DecodedInstructionPair &decoded)
+    {
+#if PS2_VU_EXECUTORS == 2
+        (void)decoded;
+        vu.execUpperConstant<kDecoded.upper>();
+#elif PS2_VU_EXECUTORS == 1
+        vu.execUpper(decoded.upper);
+#else
+        vu.execUpperInline(decoded.upper);
+#endif
+    }
+    static PS2_VU_FORCE_INLINE void lower(VU1Interpreter &vu, const DecodedInstructionPair &decoded)
+    {
+#if PS2_VU_EXECUTORS == 2
+        vu.execLowerConstant<kDecoded.lower>(vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs,
+                                             vu.m_activeMemory, decoded.upper);
+#elif PS2_VU_EXECUTORS == 1
+        vu.execLower(decoded.lower, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs, vu.m_activeMemory,
+                     decoded.upper);
+#else
+        vu.execLowerInline(decoded.lower, vu.m_activeVuData, vu.m_activeVuDataSize, *vu.m_activeGs,
+                           vu.m_activeMemory, decoded.upper);
+#endif
+    }
+};
+
+// An executor for one instruction word (PS2_VU_EXECUTORS 2): the general
+// one with the word put in, in a function of its own that every pair with
+// the word calls.
+template <uint32_t instr>
+PS2_VU_NO_INLINE void VU1Interpreter::execUpperConstant()
+{
+    execUpperInline(instr);
+}
+
+template <uint32_t instr>
+PS2_VU_NO_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory,
+                                                        uint32_t upperInstr)
+{
+    execLowerInline(instr, vuData, dataSize, gs, memory, upperInstr);
+}
+
+template <VU1Interpreter::Unit unit, uint64_t word>
+PS2_VU_COMPILED_PAIR bool VU1Interpreter::runCompiledPair(uint64_t budgetEnd)
+{
+    return runDecodedPair<true, CompiledPair<unit, word>>(CompiledPair<unit, word>::kDecoded, budgetEnd,
+                                                          m_cachedCodeSize);
+}
+
+template <bool compiled, class Operations>
+PS2_VU_FORCE_INLINE bool VU1Interpreter::runDecodedPair(const DecodedInstructionPair &given, uint64_t budgetEnd, uint32_t codeSize)
+{
+    const auto &decoded = Operations::decoding(given);
     bool programEnded = false;
     if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
     {
@@ -1319,20 +1399,9 @@ PS2_VU_FORCE_INLINE bool VU1Interpreter::runDecodedPair(const DecodedInstruction
         return false;
     }
 
-    const auto readiness = [&]() PS2_VU_INLINE_LAMBDA {
-        if constexpr (compiled) return calculatePairReadyCycleInline(decoded);
-        else return calculatePairReadyCycle(decoded);
-    };
-    const auto upper = [&]() PS2_VU_INLINE_LAMBDA {
-        if constexpr (compiled) execUpperInline(decoded.upper);
-        else execUpper(decoded.upper);
-    };
-    const auto lower = [&]() PS2_VU_INLINE_LAMBDA {
-        if constexpr (compiled)
-            execLowerInline(decoded.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, decoded.upper);
-        else
-            execLower(decoded.lower, m_activeVuData, m_activeVuDataSize, *m_activeGs, m_activeMemory, decoded.upper);
-    };
+    const auto readiness = [&]() PS2_VU_INLINE_SMALL_LAMBDA { return Operations::readiness(*this, decoded); };
+    const auto upper = [&]() PS2_VU_INLINE_SMALL_LAMBDA { Operations::upper(*this, decoded); };
+    const auto lower = [&]() PS2_VU_INLINE_SMALL_LAMBDA { Operations::lower(*this, decoded); };
     uint64_t readyCycle = readiness();
     while (readyCycle > m_cycle)
     {
@@ -1534,7 +1603,7 @@ bool VU1Interpreter::runCompiledBlock(VU1Interpreter &vu, uint64_t budgetEnd)
     uint32_t nextPC = startPC;
     bool active = true;
     bool ended = false;
-    const auto step = [&]<uint64_t word>() PS2_VU_INLINE_LAMBDA {
+    const auto step = [&]<uint64_t word>() PS2_VU_INLINE_SMALL_LAMBDA {
         if (!active)
             return;
         // A callback can replace code, and any pair may exhaust the cycle budget.
@@ -1546,9 +1615,7 @@ bool VU1Interpreter::runCompiledBlock(VU1Interpreter &vu, uint64_t budgetEnd)
             active = false;
             return;
         }
-        static constexpr auto decoded = decodeInstructionWords(static_cast<uint32_t>(word),
-                                                        static_cast<uint32_t>(word >> 32u), unit);
-        ended = vu.runDecodedPair<true>(decoded, budgetEnd, vu.m_cachedCodeSize);
+        ended = vu.runCompiledPair<unit, word>(budgetEnd);
         active = !ended;
         nextPC += 8u;
     };

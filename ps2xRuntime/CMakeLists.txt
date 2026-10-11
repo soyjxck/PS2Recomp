@@ -461,6 +461,12 @@ if(PS2X_VU_AOT_IMAGES OR PS2X_VU_AOT_PAIR_IMAGES OR PS2X_VU_AOT_LOOP_IMAGES)
     set_source_files_properties(${PS2X_VU_AOT_SOURCES} PROPERTIES
         SKIP_UNITY_BUILD_INCLUSION ON
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
+    # MSVC: machine code for these where they stand. Left to the link's
+    # whole-program step, all of it is generated again, by one process,
+    # each time anything else in the runtime changes.
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set_source_files_properties(${PS2X_VU_AOT_SOURCES} PROPERTIES COMPILE_OPTIONS "/GL-")
+    endif()
     # Thousands of specialized inline scopes otherwise dominate compile time.
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT PS2X_VU_AOT_DEBUG_INFO)
         set_source_files_properties(
@@ -513,6 +519,9 @@ if(PS2X_VU_PROGRAM_PROFILES)
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES COMPILE_OPTIONS "-g0")
+    elseif(MSVC)
+        # As for the blocks above.
+        set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES COMPILE_OPTIONS "/GL-")
     endif()
 endif()
 

@@ -279,8 +279,20 @@ private:
     static CompiledBlock findCompiledBlock(const uint8_t *code, uint32_t size, Unit unit);
     template <Unit unit, uint64_t... words>
     static bool runCompiledBlock(VU1Interpreter &vu, uint64_t budgetEnd);
-    template <bool compiled>
-    bool runDecodedPair(const DecodedInstructionPair &decoded, uint64_t budgetEnd, uint32_t codeSize);
+    // What a pair asks of the executors (ps2_vu1_exec.inl): an interpreted
+    // pair with the words it was decoded from, a compiled pair with
+    // operations made for its words.
+    struct InterpretedPair;
+    template <Unit unit, uint64_t word>
+    struct CompiledPair;
+    template <bool compiled, class Operations>
+    bool runDecodedPair(const DecodedInstructionPair &given, uint64_t budgetEnd, uint32_t codeSize);
+    template <Unit unit, uint64_t word>
+    bool runCompiledPair(uint64_t budgetEnd);
+    template <uint32_t instr>
+    void execUpperConstant();
+    template <uint32_t instr>
+    void execLowerConstant(uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);
 
     void execUpper(uint32_t instr);
     void execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSize, GS &gs, PS2Memory *memory, uint32_t upperInstr);

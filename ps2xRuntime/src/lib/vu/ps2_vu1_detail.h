@@ -17,6 +17,38 @@
 #define PS2_VU_INLINE_LAMBDA
 #endif
 
+// How a compiled block is cut up for the compiler (PS2_VU_EXECUTORS).
+//
+// 0, Clang and GCC: a block's pairs, and each pair's two executors, go
+// into the block's one function, and the instruction words fold as they
+// go.
+//
+// MSVC cannot do that. It puts the whole of an executor into a pair before
+// it folds anything, which costs seconds for each and does not end for a
+// few thousand pairs; and left to itself it put nothing in, so that one
+// general body ran for every pair on words it read back at run time.
+// There a pair is a function of its own for each distinct pair of words,
+// with the pair's own bookkeeping (when its operands are ready, what it
+// writes) folded for them, and
+// 1, the default: it calls the general executors;
+// 2, PS2X_VU_FOLD_EXECUTORS=1: it calls an executor made for each
+//    distinct word, faster to run and seconds of compiling apiece.
+#if defined(_MSC_VER) && !defined(__clang__)
+#if defined(PS2X_VU_FOLD_EXECUTORS) && PS2X_VU_FOLD_EXECUTORS
+#define PS2_VU_EXECUTORS 2
+#else
+#define PS2_VU_EXECUTORS 1
+#endif
+#define PS2_VU_NO_INLINE __declspec(noinline)
+#define PS2_VU_COMPILED_PAIR __declspec(noinline)
+#define PS2_VU_INLINE_SMALL_LAMBDA [[msvc::forceinline]]
+#else
+#define PS2_VU_EXECUTORS 0
+#define PS2_VU_NO_INLINE
+#define PS2_VU_COMPILED_PAIR PS2_VU_FORCE_INLINE
+#define PS2_VU_INLINE_SMALL_LAMBDA PS2_VU_INLINE_LAMBDA
+#endif
+
 // Instruction field extraction helpers
 inline constexpr uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
 inline constexpr uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
