@@ -67,8 +67,12 @@ namespace
     // What the host loop and the pad reads, on different threads, tell each other.
     std::atomic<int> g_device{-2};      // a controller's index; -1 keyboard and mouse; -2 nothing used yet
     std::atomic<bool> g_uiOpen{false};  // a debug window wants the mouse
+    std::atomic<int> g_blocked{0};      // 1 a menu of the host's has the pad; 2 it had, until all is let go
     std::atomic<float> g_lookX{0.0f};   // the mouse as the right stick, -1..1
     std::atomic<float> g_lookY{0.0f};
+    // The mouse's two settings as changed while the game runs; below 0, as the file has them.
+    std::atomic<int> g_mouseLook{-1};
+    std::atomic<float> g_sensitivity{-1.0f};
 
     // A key or mouse button, as raylib numbers them; mouse buttons from 1000.
     constexpr int kMouseBase = 1000;
@@ -329,6 +333,24 @@ namespace
     }
 }
 
+namespace
+{
+    bool scripted()
+    {
+        static const bool is = []
+        {
+            const char *script = std::getenv("PS2X_PAD_SCRIPT");
+            return script != nullptr && script[0] != '\0';
+        }();
+        return is;
+    }
+
+    // The device in use into a pad's state: the buttons (a bit clear for
+    // one that is down) and the sticks into data[2..7]. The buttons are
+    // returned as well.
+    uint16_t readDevices(uint8_t *data);
+}
+
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
@@ -340,15 +362,48 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     data[2] = 0xFF;
     data[3] = 0xFF;
     data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
-
-    static const bool scripted = []
-    {
-        const char *script = std::getenv("PS2X_PAD_SCRIPT");
-        return script != nullptr && script[0] != '\0';
-    }();
-    if (scripted)
+    if (scripted())
         return true;
 
+    const uint16_t btns = readDevices(data);
+
+    // A menu of the host's has the pad, or had it: the game sees a pad
+    // at rest until every button has been let go, so that the press
+    // that closed the menu is not also the game's.
+    if (const int blocked = g_blocked.load(std::memory_order_relaxed); blocked != 0)
+    {
+        int had = 2;
+        if (blocked == 2 && btns == 0xFFFFu)
+            g_blocked.compare_exchange_strong(had, 0, std::memory_order_relaxed);
+        data[2] = data[3] = 0xFF;
+        data[4] = data[5] = data[6] = data[7] = kPadStickCenter;
+    }
+
+    // PS2X_PAD_TRACE=1: the pad's state, each time it changes.
+    static const bool trace = []
+    {
+        const char *value = std::getenv("PS2X_PAD_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (trace)
+    {
+        static uint8_t last[8] = {};
+        if (std::memcmp(last, data, sizeof(last)) != 0)
+        {
+            std::memcpy(last, data, sizeof(last));
+            std::fprintf(stderr, "[pad] device %d pressed %04x left %3u,%3u right %3u,%3u\n",
+                         g_device.load(std::memory_order_relaxed),
+                         static_cast<unsigned>(static_cast<uint16_t>(~(data[2] | (data[3] << 8)))), data[6], data[7],
+                         data[4], data[5]);
+        }
+    }
+    return true;
+}
+
+namespace
+{
+uint16_t readDevices(uint8_t *data)
+{
     uint16_t btns = 0xFFFFu;
     auto clearBit = [&btns](uint16_t mask)
     { btns &= ~mask; };
@@ -412,24 +467,8 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);
-
-    // PS2X_PAD_TRACE=1: the pad's state, each time it changes.
-    static const bool trace = []
-    {
-        const char *value = std::getenv("PS2X_PAD_TRACE");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    if (trace)
-    {
-        static uint8_t last[8] = {};
-        if (std::memcmp(last, data, sizeof(last)) != 0)
-        {
-            std::memcpy(last, data, sizeof(last));
-            std::fprintf(stderr, "[pad] device %d pressed %04x left %3u,%3u right %3u,%3u\n", device,
-                         static_cast<unsigned>(static_cast<uint16_t>(~btns)), data[6], data[7], data[4], data[5]);
-        }
-    }
-    return true;
+    return btns;
+}
 }
 
 int ps2xInputDevice()
@@ -450,6 +489,45 @@ const char *ps2xInputKeyLabel(uint16_t button)
         if (bound.mask == button)
             return bound.label.c_str();
     return "";
+}
+
+uint16_t ps2xInputButtons()
+{
+    if (scripted())
+        return 0u;
+    uint8_t data[8] = {0, 0, 0xFF, 0xFF, kPadStickCenter, kPadStickCenter, kPadStickCenter, kPadStickCenter};
+    uint16_t down = static_cast<uint16_t>(~readDevices(data));
+    // The left stick past half-way counts as the directional buttons.
+    if (data[6] < 64)
+        down |= PAD_LEFT;
+    if (data[6] > 192)
+        down |= PAD_RIGHT;
+    if (data[7] < 64)
+        down |= PAD_UP;
+    if (data[7] > 192)
+        down |= PAD_DOWN;
+    return down;
+}
+
+void ps2xInputBlock(bool block)
+{
+    if (block)
+        g_blocked.store(1, std::memory_order_relaxed);
+    else
+    {
+        int had = 1;
+        g_blocked.compare_exchange_strong(had, 2, std::memory_order_relaxed);
+    }
+}
+
+void ps2xInputSetMouseLook(bool on)
+{
+    g_mouseLook.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+void ps2xInputSetMouseSensitivity(float sensitivity)
+{
+    g_sensitivity.store(std::clamp(sensitivity, 0.05f, 20.0f), std::memory_order_relaxed);
 }
 
 void ps2xInputSetUiOpen(bool open)
@@ -481,7 +559,11 @@ void ps2xInputFrame()
     static bool captured = false;
     static float lookX = 0.0f, lookY = 0.0f;
     const Bindings &keys = bindings();
-    const bool want = keys.mouseLook && g_device.load(std::memory_order_relaxed) == -1 && IsWindowFocused() &&
+    const int look = g_mouseLook.load(std::memory_order_relaxed);
+    const float asked = g_sensitivity.load(std::memory_order_relaxed);
+    const float sensitivity = asked >= 0.0f ? asked : keys.sensitivity;
+    const bool want = (look < 0 ? keys.mouseLook : look != 0) && g_device.load(std::memory_order_relaxed) == -1 &&
+                      IsWindowFocused() &&
                       !g_uiOpen.load(std::memory_order_relaxed);
     if (want != captured)
     {
@@ -501,8 +583,8 @@ void ps2xInputFrame()
         const Vector2 moved = GetMouseDelta();
         constexpr float kFullAt = 1700.0f; // pixels a second that push the stick all the way
         const float blend = 1.0f - std::exp(-seconds / 0.05f);
-        lookX += (moved.x / seconds * keys.sensitivity / kFullAt - lookX) * blend;
-        lookY += (moved.y / seconds * keys.sensitivity / kFullAt - lookY) * blend;
+        lookX += (moved.x / seconds * sensitivity / kFullAt - lookX) * blend;
+        lookY += (moved.y / seconds * sensitivity / kFullAt - lookY) * blend;
     }
     g_lookX.store(std::clamp(lookX, -1.0f, 1.0f), std::memory_order_relaxed);
     g_lookY.store(std::clamp(lookY, -1.0f, 1.0f), std::memory_order_relaxed);
