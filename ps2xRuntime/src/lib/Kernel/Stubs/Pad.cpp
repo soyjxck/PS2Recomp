@@ -926,6 +926,209 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // --- libpad2 (with libdbc and libvib) -----------------------------------
+    //
+    // The pad library of SDK 2.7 and later, for dbcman.irx and its device
+    // drivers (ds2o.irx for a DualShock 2). A controller is a socket, opened
+    // with the port and slot it is in and a work area the IOP fills.
+    // scePad2Read hands back what the controller sends, in the order it
+    // sends it: two bytes of switches (active low), the right stick and the
+    // left, twelve pressures. That is libpad's buffer without its two
+    // leading bytes, and a game that moved from libpad copies it there.
+    namespace
+    {
+        constexpr int32_t kPad2StateNoLink = 0;
+        constexpr int32_t kPad2StateStable = 1;
+        constexpr size_t kPad2SocketCount = 16; // the library's own table
+        constexpr uint32_t kPad2ButtonDataSize = 18u;
+
+        struct Pad2Socket
+        {
+            bool open = false;
+            int port = 0;
+            int slot = 0;
+        };
+        Pad2Socket g_pad2Sockets[kPad2SocketCount]{}; // guarded by g_padStateMutex
+
+        void closePad2SocketLocked(Pad2Socket &socket)
+        {
+            if (PadPortState *portState = lookupPadPortStateLocked(socket.port, socket.slot))
+            {
+                portState->open = false;
+                portState->pressureEnabled = false;
+            }
+            socket = Pad2Socket{};
+        }
+    }
+
+    void sceDbcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        // The library binds three RPC servers of dbcman.irx here and waits
+        // for each. Nothing below it is left to talk to.
+        setReturnS32(ctx, 1);
+    }
+
+    void sceDbcEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 1);
+    }
+
+    void scePad2Init(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            for (Pad2Socket &socket : g_pad2Sockets)
+            {
+                socket = Pad2Socket{};
+            }
+        }
+        setReturnS32(ctx, 1);
+    }
+
+    void scePad2End(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            for (Pad2Socket &socket : g_pad2Sockets)
+            {
+                if (socket.open)
+                {
+                    closePad2SocketLocked(socket);
+                }
+            }
+        }
+        setReturnS32(ctx, 1);
+    }
+
+    // int scePad2CreateSocket(scePad2SocketParam *param, void *workArea):
+    // the socket's number, or -1. param is { option, port, slot, number,
+    // name[16] } and may be null, for the first controller.
+    void scePad2CreateSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)runtime;
+        const uint32_t paramAddr = getRegU32(ctx, 4);
+        const uint32_t workAddr = getRegU32(ctx, 5);
+        if ((workAddr & 0x3Fu) != 0u)
+        {
+            // "libpad2: buffer addr is not 64 byte align."
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        int32_t port = 0;
+        int32_t slot = 0;
+        if (const uint8_t *param = paramAddr != 0u ? getConstMemPtr(rdram, paramAddr) : nullptr)
+        {
+            std::memcpy(&port, param + 4, sizeof(port));
+            std::memcpy(&slot, param + 8, sizeof(slot));
+        }
+
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        PadPortState *portState = lookupPadPortStateLocked(port, slot);
+        if (!portState)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        for (size_t index = 0; index < kPad2SocketCount; ++index)
+        {
+            Pad2Socket &socket = g_pad2Sockets[index];
+            if (socket.open)
+            {
+                continue;
+            }
+            initializePadPortLocked(*portState, workAddr);
+            // There is no mode to ask for: the driver reports the sticks
+            // and the pressures of a DualShock 2 from the start.
+            portState->analogMode = true;
+            portState->pressureEnabled = true;
+            socket.open = true;
+            socket.port = port;
+            socket.slot = slot;
+            setReturnS32(ctx, static_cast<int32_t>(index));
+            return;
+        }
+        setReturnS32(ctx, -1);
+    }
+
+    void scePad2DeleteSocket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t index = getRegU32(ctx, 4);
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        if (index >= kPad2SocketCount || !g_pad2Sockets[index].open)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+        closePad2SocketLocked(g_pad2Sockets[index]);
+        setReturnS32(ctx, 1);
+    }
+
+    void scePad2GetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        const uint32_t index = getRegU32(ctx, 4);
+        std::lock_guard<std::mutex> lock(g_padStateMutex);
+        const bool open = index < kPad2SocketCount && g_pad2Sockets[index].open;
+        setReturnS32(ctx, open ? kPad2StateStable : kPad2StateNoLink);
+    }
+
+    // int scePad2Read(int socket, scePad2ButtonState *data): the number of
+    // bytes written (18 for a DualShock 2), or -1.
+    void scePad2Read(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t index = getRegU32(ctx, 4);
+        const uint32_t dataAddr = getRegU32(ctx, 5);
+        uint8_t *data = getMemPtr(rdram, dataAddr);
+        Pad2Socket socket;
+        {
+            std::lock_guard<std::mutex> lock(g_padStateMutex);
+            if (index < kPad2SocketCount)
+            {
+                socket = g_pad2Sockets[index];
+            }
+        }
+
+        uint8_t status[32]{};
+        if (!socket.open || !data || !readPadPortData(socket.port, socket.slot, runtime, status, dataAddr))
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        ps2TraceGuestRangeWrite(rdram, dataAddr, kPad2ButtonDataSize, "scePad2Read", ctx);
+        // Switches, sticks and the pressures from right to square are where
+        // libpad has them; then L1, R1, L2, R2, from the switches.
+        const uint16_t buttons = static_cast<uint16_t>(status[2] | (status[3] << 8));
+        const auto pressure = [buttons](uint16_t mask)
+        { return static_cast<uint8_t>((buttons & mask) == 0u ? 0xFFu : 0u); };
+        std::memcpy(data, status + 2, 14);
+        data[14] = pressure(kPadBtnL1);
+        data[15] = pressure(kPadBtnR1);
+        data[16] = pressure(kPadBtnL2);
+        data[17] = pressure(kPadBtnR2);
+        setReturnS32(ctx, static_cast<int32_t>(kPad2ButtonDataSize));
+    }
+
+    // libvib: the motors. Accepted and dropped.
+    void sceVibSetActParam(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        (void)rdram;
+        (void)runtime;
+        setReturnS32(ctx, 1);
+    }
+
     PadDebugSnapshot getPadDebugSnapshot()
     {
         PadDebugSnapshot snapshot{};

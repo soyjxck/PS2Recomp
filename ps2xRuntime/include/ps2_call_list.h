@@ -325,6 +325,8 @@
     X(sceCdSyncS)                             \
     X(sceCdTrayReq)                           \
     X(sceClose)                               \
+    X(sceDbcEnd)                              \
+    X(sceDbcInit)                             \
     X(sceDeci2Close)                          \
     X(sceDeci2ExLock)                         \
     X(sceDeci2ExRecv)                         \
@@ -464,6 +466,12 @@
     X(sceMpegSetDefaultPtsGap)                \
     X(sceMpegSetImageBuff)                    \
     X(sceOpen)                                \
+    X(scePad2CreateSocket)                    \
+    X(scePad2DeleteSocket)                    \
+    X(scePad2End)                             \
+    X(scePad2GetState)                        \
+    X(scePad2Init)                            \
+    X(scePad2Read)                            \
     X(scePadEnd)                              \
     X(scePadEnterPressMode)                   \
     X(scePadExitPressMode)                    \
@@ -641,6 +649,7 @@
     X(sceTtyInit)                             \
     X(sceTtyRead)                             \
     X(sceTtyWrite)                            \
+    X(sceVibSetActParam)                      \
     X(sceVpu0Reset)                           \
     X(sceVu0AddVector)                        \
     X(sceVu0ApplyMatrix)                      \
