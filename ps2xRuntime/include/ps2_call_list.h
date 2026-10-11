@@ -306,6 +306,11 @@
     X(sceCdReadChain)                         \
     X(sceCdReadClock)                         \
     X(sceCdReadIOPm)                          \
+    X(sceCdLayerSearchFile)                   \
+    X(sceCdPOffCallback)                      \
+    X(sceCdPowerOff)                          \
+    X(sceCdReadDvdDualInfo)                   \
+    X(sceCdReadDvdDualInfo2)                  \
     X(sceCdSearchFile)                        \
     X(sceCdSeek)                              \
     X(sceCdStInit)                            \

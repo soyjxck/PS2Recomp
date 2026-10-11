@@ -755,5 +755,104 @@ void register_ps2_runtime_io_tests()
             t.Equals(std::memcmp(test.rdram.data() + bufAddr, "cd-image", 8), 0,
                      "sceCdRead should copy sector data from the configured image");
         });
+
+        tc.Run("a disc image's files are found at their own sectors, on both layers", [](TestCase &t)
+        {
+            TestContext test;
+
+            // A dual-layer DVD in 40 sectors: a volume of 32 sectors with
+            // A.BIN, and a second one whose descriptor sits where the first
+            // ends and whose sector numbers count from 16 before that.
+            constexpr uint32_t kSectorSize = 2048u;
+            constexpr uint32_t kLayer1Start = 16u;
+            std::vector<uint8_t> image(40u * kSectorSize, 0u);
+            auto put32 = [&](size_t offset, uint32_t value)
+            { std::memcpy(image.data() + offset, &value, sizeof(value)); };
+            auto putRecord = [&](size_t offset, uint32_t extent, uint32_t size, uint8_t flags, const std::string &name) -> size_t
+            {
+                const size_t length = (33u + name.size() + 1u) & ~size_t{1};
+                image[offset] = static_cast<uint8_t>(length);
+                put32(offset + 2u, extent);
+                put32(offset + 10u, size);
+                image[offset + 25u] = flags;
+                image[offset + 32u] = static_cast<uint8_t>(name.size());
+                std::memcpy(image.data() + offset + 33u, name.data(), name.size());
+                return offset + length;
+            };
+            auto putVolume = [&](uint32_t base, uint32_t sectors, const std::string &fileName, const char *payload)
+            {
+                const size_t descriptor = static_cast<size_t>(base + 16u) * kSectorSize;
+                image[descriptor] = 1u;
+                std::memcpy(image.data() + descriptor + 1u, "CD001", 5u);
+                put32(descriptor + 80u, sectors);
+                (void)putRecord(descriptor + 156u, 18u, kSectorSize, 2u, std::string(1, '\0'));
+
+                size_t record = static_cast<size_t>(base + 18u) * kSectorSize;
+                record = putRecord(record, 18u, kSectorSize, 2u, std::string(1, '\0'));
+                record = putRecord(record, 18u, kSectorSize, 2u, std::string(1, '\1'));
+                (void)putRecord(record, 20u, static_cast<uint32_t>(std::strlen(payload)), 0u, fileName);
+                std::memcpy(image.data() + static_cast<size_t>(base + 20u) * kSectorSize, payload, std::strlen(payload));
+            };
+            putVolume(0u, 32u, "A.BIN;1", "first");
+            putVolume(kLayer1Start, 8u, "B.BIN;1", "second");
+
+            const std::filesystem::path imagePath = test.paths.base / "dual.iso";
+            {
+                std::ofstream out(imagePath, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(image.data()), static_cast<std::streamsize>(image.size()));
+            }
+
+            PS2Runtime::IoPaths ioPaths;
+            ioPaths.elfDirectory = test.paths.cdRoot;
+            ioPaths.hostRoot = test.paths.cdRoot;
+            ioPaths.cdRoot = test.paths.cdRoot;
+            ioPaths.mcRoot = test.paths.mcRoot;
+            ioPaths.cdImage = imagePath;
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t fileAddr = GUEST_BUFFER_AREA_START + 0x1E00;
+            constexpr uint32_t bufAddr = GUEST_BUFFER_AREA_START + 0x2000;
+            constexpr uint32_t infoAddr = GUEST_BUFFER_AREA_START + 0x2800;
+            constexpr uint32_t pathAddr = GUEST_STRING_AREA_START + 0xB00;
+
+            auto search = [&](const char *path, uint32_t layer, bool layered)
+            {
+                writeGuestString(test.rdram.data(), pathAddr, path);
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, fileAddr);
+                setRegU32(test.ctx, 5, pathAddr);
+                setRegU32(test.ctx, 6, layer);
+                if (layered)
+                    ps2_stubs::sceCdLayerSearchFile(test.rdram.data(), &test.ctx, nullptr);
+                else
+                    ps2_stubs::sceCdSearchFile(test.rdram.data(), &test.ctx, nullptr);
+                return getRegS32(&test.ctx, 2);
+            };
+
+            t.Equals(search("\\A.BIN;1", 0u, false), 1, "sceCdSearchFile should find a file of the image");
+            t.Equals(readGuestU32(test.rdram.data(), fileAddr + 0), 20u, "the file is at the sector the image has it at");
+            t.Equals(readGuestU32(test.rdram.data(), fileAddr + 4), 5u, "and has the size its directory record gives");
+
+            t.Equals(search("\\B.BIN;1", 0u, true), 0, "layer 0 does not have layer 1's files");
+            t.Equals(search("\\B.BIN;1", 1u, true), 1, "sceCdLayerSearchFile should find a file of layer 1");
+            const uint32_t layer1Lsn = readGuestU32(test.rdram.data(), fileAddr + 0);
+            t.Equals(layer1Lsn, kLayer1Start + 20u, "a layer 1 file's sector counts from the start of the disc");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, layer1Lsn);
+            setRegU32(test.ctx, 5, 1u);
+            setRegU32(test.ctx, 6, bufAddr);
+            ps2_stubs::sceCdRead(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdRead should read the sector sceCdLayerSearchFile gave");
+            t.Equals(std::memcmp(test.rdram.data() + bufAddr, "second", 6), 0, "and it holds the file");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, infoAddr);
+            setRegU32(test.ctx, 5, infoAddr + 4u);
+            ps2_stubs::sceCdReadDvdDualInfo2(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(getRegS32(&test.ctx, 2), 1, "sceCdReadDvdDualInfo should succeed");
+            t.Equals(readGuestU32(test.rdram.data(), infoAddr), 1u, "the disc is dual-layer");
+            t.Equals(readGuestU32(test.rdram.data(), infoAddr + 4u), kLayer1Start, "and layer 1 starts 16 sectors before its descriptor");
+        });
     });
 }

@@ -65,6 +65,11 @@ namespace ps2_stubs
     void sceCdReadClock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdReadIOPm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceCdReadDvdDualInfo2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceCdPOffCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceCdPowerOff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdStandby(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceCdStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

@@ -1650,6 +1650,13 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     {
         normalized.mcRoot = normalizeAbsolutePath(std::filesystem::path(mcRoot));
     }
+    // PS2X_CD_IMAGE=<iso>: the disc as an image. Files are looked up in its
+    // directories and read at their own sectors (both layers of a DVD9);
+    // what was extracted next to the ELF is still found there.
+    if (const char *cdImage = std::getenv("PS2X_CD_IMAGE"); cdImage != nullptr && cdImage[0] != '\0')
+    {
+        normalized.cdImage = normalizeAbsolutePath(std::filesystem::path(cdImage));
+    }
 
     runtimeIoPaths() = normalized;
 }

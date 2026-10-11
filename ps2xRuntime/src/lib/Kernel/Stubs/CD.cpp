@@ -542,7 +542,57 @@ namespace ps2_stubs
         sceCdRead(rdram, ctx, runtime);
     }
 
+    static void searchCdFile(uint8_t *rdram, R5900Context *ctx, uint32_t layer);
+
     void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        searchCdFile(rdram, ctx, 0u);
+    }
+
+    // sceCdLayerSearchFile(file, name, layer): the file system of one layer of
+    // a dual-layer DVD. What it finds on layer 1 is at a sector number that
+    // sceCdRead takes as it is.
+    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        searchCdFile(rdram, ctx, getRegU32(ctx, 6) != 0u ? 1u : 0u);
+    }
+
+    // libcdvd 2.4's form: sceCdReadDvdDualInfo(int *on_dual).
+    void sceCdReadDvdDualInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (int32_t *onDual = reinterpret_cast<int32_t *>(getMemPtr(rdram, getRegU32(ctx, 4))); onDual)
+        {
+            *onDual = cdImageLayer1Start() != 0u ? 1 : 0;
+        }
+        setReturnS32(ctx, 1);
+    }
+
+    // The later form, sceCdReadDvdDualInfo(int *on_dual, u32 *layer1_start).
+    // The name binds the first: a 2.4 caller leaves a1 as it happens to be.
+    void sceCdReadDvdDualInfo2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (uint32_t *layer1Start = reinterpret_cast<uint32_t *>(getMemPtr(rdram, getRegU32(ctx, 5))); layer1Start)
+        {
+            *layer1Start = cdImageLayer1Start();
+        }
+        sceCdReadDvdDualInfo(rdram, ctx, runtime);
+    }
+
+    void sceCdPOffCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0); // no callback was set before
+    }
+
+    void sceCdPowerOff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (uint32_t *result = reinterpret_cast<uint32_t *>(getMemPtr(rdram, getRegU32(ctx, 4))); result)
+        {
+            *result = 0u;
+        }
+        setReturnS32(ctx, 1);
+    }
+
+    static void searchCdFile(uint8_t *rdram, R5900Context *ctx, uint32_t layer)
     {
         uint32_t fileAddr = getRegU32(ctx, 4);
         uint32_t pathAddr = getRegU32(ctx, 5);
@@ -600,7 +650,7 @@ namespace ps2_stubs
         }
 
         CdFileEntry entry;
-        bool found = registerCdFile(path, entry);
+        bool found = registerCdFile(path, entry, layer);
         CdFileEntry resolvedEntry = entry;
         std::string resolvedPath;
 

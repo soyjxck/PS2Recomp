@@ -211,6 +211,173 @@ namespace
         return sectors > 0 ? static_cast<uint32_t>(sectors) : 1;
     }
 
+    // A configured disc image is the disc: its files are found in its own
+    // directories and read at the sectors they are at, which a game that
+    // keeps sector numbers in tables of its own depends on. A dual-layer DVD
+    // has a second volume for layer 1; its descriptors sit where the first
+    // volume ends and its sector numbers count from 16 sectors before that.
+    struct CdImageFile
+    {
+        std::string key;
+        uint32_t lbn = 0;
+        uint32_t sizeBytes = 0;
+        uint32_t layer = 0;
+    };
+
+    std::vector<CdImageFile> g_cdImageFiles;
+    std::filesystem::path g_cdImageIndexPath;
+    bool g_cdImageIndexed = false;
+    uint32_t g_cdImageLayer1Start = 0;
+
+    bool readCdImageSectors(std::ifstream &image, uint64_t lbn, uint8_t *dst, size_t byteCount)
+    {
+        image.clear();
+        image.seekg(static_cast<std::streamoff>(lbn * kCdSectorSize), std::ios::beg);
+        image.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(byteCount));
+        return static_cast<size_t>(image.gcount()) == byteCount;
+    }
+
+    void indexCdImageDirectory(std::ifstream &image,
+                               uint32_t volumeBase,
+                               uint32_t layer,
+                               uint32_t directoryLbn,
+                               uint32_t directoryBytes,
+                               const std::string &prefix,
+                               uint32_t depth)
+    {
+        constexpr uint32_t kMaxDirectoryBytes = 4u * 1024u * 1024u;
+        if (depth > 8u || directoryBytes == 0u || directoryBytes > kMaxDirectoryBytes)
+        {
+            return;
+        }
+
+        std::vector<uint8_t> records(directoryBytes);
+        if (!readCdImageSectors(image, static_cast<uint64_t>(volumeBase) + directoryLbn, records.data(), records.size()))
+        {
+            return;
+        }
+
+        for (size_t pos = 0; pos < records.size();)
+        {
+            const size_t length = records[pos];
+            if (length == 0u)
+            {
+                // Records do not cross sectors: the rest of this one is padding.
+                pos = (pos / kCdSectorSize + 1u) * kCdSectorSize;
+                continue;
+            }
+            if (length < 34u || pos + length > records.size())
+            {
+                break;
+            }
+
+            const uint8_t *record = records.data() + pos;
+            pos += length;
+
+            uint32_t extent = 0u;
+            uint32_t bytes = 0u;
+            std::memcpy(&extent, record + 2u, sizeof(extent));
+            std::memcpy(&bytes, record + 10u, sizeof(bytes));
+            const size_t nameLength = std::min<size_t>(record[32u], length - 33u);
+            if (nameLength == 1u && record[33u] <= 1u)
+            {
+                continue; // the directory itself and its parent
+            }
+
+            const std::string name = toLowerAscii(
+                stripIsoVersionSuffix(std::string(reinterpret_cast<const char *>(record + 33u), nameLength)));
+            if ((record[25u] & 0x02u) != 0u)
+            {
+                indexCdImageDirectory(image, volumeBase, layer, extent, bytes, prefix + name + "/", depth + 1u);
+            }
+            else
+            {
+                g_cdImageFiles.push_back(CdImageFile{prefix + name, volumeBase + extent, bytes, layer});
+            }
+        }
+    }
+
+    void ensureCdImageIndex()
+    {
+        const std::filesystem::path imagePath = getCdImagePath();
+        if (g_cdImageIndexed && g_cdImageIndexPath == imagePath)
+        {
+            return;
+        }
+
+        g_cdImageFiles.clear();
+        g_cdImageLayer1Start = 0u;
+        g_cdImageIndexPath = imagePath;
+        g_cdImageIndexed = true;
+        if (imagePath.empty())
+        {
+            return;
+        }
+
+        std::ifstream image(imagePath, std::ios::binary);
+        uint64_t totalSectors = 0u;
+        if (!image.is_open() || !tryGetCdImageTotalSectors(totalSectors))
+        {
+            return;
+        }
+
+        auto indexVolume = [&](uint32_t volumeBase, uint32_t layer, uint32_t &volumeSectorsOut) -> bool
+        {
+            std::array<uint8_t, kCdSectorSize> descriptor{};
+            if (static_cast<uint64_t>(volumeBase) + 17u > totalSectors ||
+                !readCdImageSectors(image, static_cast<uint64_t>(volumeBase) + 16u, descriptor.data(), descriptor.size()) ||
+                descriptor[0] != 1u || std::memcmp(descriptor.data() + 1u, "CD001", 5u) != 0)
+            {
+                return false;
+            }
+
+            uint32_t rootExtent = 0u;
+            uint32_t rootBytes = 0u;
+            std::memcpy(&volumeSectorsOut, descriptor.data() + 80u, sizeof(volumeSectorsOut));
+            std::memcpy(&rootExtent, descriptor.data() + 156u + 2u, sizeof(rootExtent));
+            std::memcpy(&rootBytes, descriptor.data() + 156u + 10u, sizeof(rootBytes));
+            indexCdImageDirectory(image, volumeBase, layer, rootExtent, rootBytes, std::string(), 0u);
+            return true;
+        };
+
+        uint32_t layer0Sectors = 0u;
+        uint32_t layer1Sectors = 0u;
+        if (indexVolume(0u, 0u, layer0Sectors) && layer0Sectors >= 32u && layer0Sectors < totalSectors &&
+            indexVolume(layer0Sectors - 16u, 1u, layer1Sectors))
+        {
+            g_cdImageLayer1Start = layer0Sectors - 16u;
+        }
+
+        // Files that are only on the host get sector numbers past the disc's.
+        g_nextPseudoLbn = static_cast<uint32_t>(
+            std::max<uint64_t>(g_nextPseudoLbn, std::min<uint64_t>(totalSectors + 16u, 0xF0000000u)));
+    }
+
+    bool findCdImageFile(const std::string &key, uint32_t layer, CdFileEntry &entryOut)
+    {
+        ensureCdImageIndex();
+        for (const CdImageFile &file : g_cdImageFiles)
+        {
+            if (file.layer == layer && file.key == key)
+            {
+                entryOut.hostPath = g_cdImageIndexPath;
+                entryOut.sizeBytes = file.sizeBytes;
+                entryOut.baseLbn = file.lbn;
+                entryOut.sectors = sectorsForBytes(file.sizeBytes);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Where layer 1 starts in sector numbers; 0 for a single-layer disc, a
+    // directory of files, or no disc image at all.
+    uint32_t cdImageLayer1Start()
+    {
+        ensureCdImageIndex();
+        return g_cdImageLayer1Start;
+    }
+
     std::string cdPathKey(const std::string &ps2Path)
     {
         return toLowerAscii(normalizeCdPathNoPrefix(ps2Path));
@@ -322,11 +489,23 @@ namespace
         }
     }
 
-    bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+    bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut, uint32_t layer = 0u)
     {
         const std::string key = cdPathKey(ps2Path);
         if (key.empty())
         {
+            g_lastCdError = -1;
+            return false;
+        }
+
+        if (findCdImageFile(key, layer, entryOut))
+        {
+            g_lastCdError = 0;
+            return true;
+        }
+        if (layer != 0u)
+        {
+            // Only a disc image has a second layer.
             g_lastCdError = -1;
             return false;
         }
@@ -501,6 +680,20 @@ namespace
             if (lbn >= entry.baseLbn && lbn < endLbn)
             {
                 entryOut = entry;
+                return true;
+            }
+        }
+
+        ensureCdImageIndex();
+        for (const CdImageFile &file : g_cdImageFiles)
+        {
+            const uint32_t sectors = sectorsForBytes(file.sizeBytes);
+            if (lbn >= file.lbn && lbn < file.lbn + sectors)
+            {
+                entryOut.hostPath = g_cdImageIndexPath;
+                entryOut.sizeBytes = file.sizeBytes;
+                entryOut.baseLbn = file.lbn;
+                entryOut.sectors = sectors;
                 return true;
             }
         }
