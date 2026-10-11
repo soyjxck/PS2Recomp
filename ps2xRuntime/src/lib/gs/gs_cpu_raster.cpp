@@ -2377,16 +2377,18 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     const GSVertex &v1 = batch.vertices[1];
     const GSContext &ctx = state.context;
 
-    const int ofx = ctx.xyoffset.ofx >> 4;
-    const int ofy = ctx.xyoffset.ofy >> 4;
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    // The pixels covered run from x0 to x1 - 1: whole pixels, by the GS's
+    // rule for corners that fall between them. The texels the vertices name
+    // are spread evenly over those pixels, as they are for corners on whole
+    // pixels.
+    int x0 = gsSpriteEdge(v0.x, ctx.xyoffset.ofx);
+    int y0 = gsSpriteEdge(v0.y, ctx.xyoffset.ofy);
+    int x1 = gsSpriteEdge(v1.x, ctx.xyoffset.ofx);
+    int y1 = gsSpriteEdge(v1.y, ctx.xyoffset.ofy);
 
     // Which corner each vertex is at decides the direction the texture runs.
-    const bool flipX = x0 > x1;
-    const bool flipY = y0 > y1;
+    const bool flipX = v0.x > v1.x;
+    const bool flipY = v0.y > v1.y;
     if (flipX)
         std::swap(x0, x1);
     if (flipY)

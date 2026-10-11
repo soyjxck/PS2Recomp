@@ -1354,13 +1354,11 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const GSVertex &v1 = batch.vertices[1];
     const auto &ctx = state.context;
 
-    int ofx = ctx.xyoffset.ofx >> 4;
-    int ofy = ctx.xyoffset.ofy >> 4;
-
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    // Whole pixels, by the GS's rule for corners that fall between them.
+    int x0 = gsSpriteEdge(v0.x, ctx.xyoffset.ofx);
+    int y0 = gsSpriteEdge(v0.y, ctx.xyoffset.ofy);
+    int x1 = gsSpriteEdge(v1.x, ctx.xyoffset.ofx);
+    int y1 = gsSpriteEdge(v1.y, ctx.xyoffset.ofy);
     u32 z1 = static_cast<u32>(v1.z);
 
     if (x0 > x1)
