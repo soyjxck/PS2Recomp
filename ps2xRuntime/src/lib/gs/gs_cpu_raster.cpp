@@ -381,6 +381,11 @@ struct GSCpuBackend::FastPipeline
     bool textureIsTarget = false;
     // The texels the primitive can sample (the whole texture when it wraps).
     int sampledU0 = 0, sampledV0 = 0, sampledU1 = 0, sampledV1 = 0;
+    // The same where a REPEAT axis runs past an end of the texture, as the
+    // coordinates are before they wrap (so below 0 or past the size); the
+    // sampled texels above are all of the axis then. Empty (last before
+    // first) when it does not, or when they cover the axis anyway.
+    int reachU0 = 0, reachU1 = -1, reachV0 = 0, reachV1 = -1;
 
     // Sets the sampled rectangle from the lowest and highest texel
     // coordinates the primitive's pixels can have, as sample() receives them;
@@ -391,13 +396,15 @@ struct GSCpuBackend::FastPipeline
         sampledV0 = 0;
         sampledU1 = texW - 1;
         sampledV1 = texH - 1;
+        reachU0 = reachV0 = 0;
+        reachU1 = reachV1 = -1;
         if (!tme)
             return;
         if (u0 > u1)
             std::swap(u0, u1);
         if (v0 > v1)
             std::swap(v0, v1);
-        auto range = [this, slack](float low, float high, int size, uint8_t wrap, int &first, int &last)
+        auto range = [this, slack](float low, float high, int size, uint8_t wrap, int &first, int &last, int &reachFirst, int &reachLast)
         {
             if (!(low > -32768.0f && high < 32768.0f))
                 return;
@@ -417,6 +424,11 @@ struct GSCpuBackend::FastPipeline
             if (lo < 0 || hi > size - 1)
             {
                 // REPEAT brings those in from the far side; CLAMP holds them at the edge.
+                if (wrap == 0u && hi - lo + 1 < size)
+                {
+                    reachFirst = lo;
+                    reachLast = hi;
+                }
                 if (wrap != 1u)
                     return;
                 lo = std::min(std::max(lo, 0), size - 1);
@@ -425,8 +437,8 @@ struct GSCpuBackend::FastPipeline
             first = lo;
             last = hi;
         };
-        range(u0, u1, texW, wrapU, sampledU0, sampledU1);
-        range(v0, v1, texH, wrapV, sampledV0, sampledV1);
+        range(u0, u1, texW, wrapU, sampledU0, sampledU1, reachU0, reachU1);
+        range(v0, v1, texH, wrapV, sampledV0, sampledV1, reachV0, reachV1);
     }
 
     bool setup(GSCpuBackend &owner, const GSDrawState &state);

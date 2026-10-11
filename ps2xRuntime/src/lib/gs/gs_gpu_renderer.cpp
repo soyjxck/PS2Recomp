@@ -174,7 +174,15 @@ vec4 texelAt(ivec2 c)
 {
     c = ivec2(wrapTexel(c.x, uWrap.x, uTexSize.x, uRegion.x, uRegion.y),
               wrapTexel(c.y, uWrap.y, uTexSize.y, uRegion.z, uRegion.w));
-    c = clamp(c - uTexOrigin, ivec2(0), uTexExtent - ivec2(1));
+    // The image may start before the texture's first texel where REPEAT
+    // brings the far side in: its texels are in the order the coordinates
+    // have them.
+    c -= uTexOrigin;
+    if (uWrap.x == 0)
+        c.x &= uTexSize.x - 1;
+    if (uWrap.y == 0)
+        c.y &= uTexSize.y - 1;
+    c = clamp(c, ivec2(0), uTexExtent - ivec2(1));
     return floor(texelFetch(uTexture, c, 0) * 255.0 + 0.5);
 }
 

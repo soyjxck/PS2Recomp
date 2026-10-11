@@ -703,27 +703,113 @@ void GSCpuBackend::GpuFlush()
 void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
 {
     GpuState &gpu = *m_gpu;
-    // A region wrap mode takes texels from somewhere other than where the
-    // coordinates point: all of the texture then. Whole blocks of 32, so
-    // that a neighbouring primitive finds its texels here too.
-    int x0 = p.wrapU >= 2u ? 0 : p.sampledU0, x1 = p.wrapU >= 2u ? p.texW - 1 : p.sampledU1;
-    int y0 = p.wrapV >= 2u ? 0 : p.sampledV0, y1 = p.wrapV >= 2u ? p.texH - 1 : p.sampledV1;
+    // The texels the primitive can read: where its coordinates point, or
+    // with a region wrap mode where those are taken to. REGION_CLAMP holds
+    // them between MIN and MAX, so it is that part of the range; with
+    // REGION_REPEAT they are MAX with the bits of MIN free, so from MAX to
+    // MAX | MIN. (Not all of the texture: Drakengard's font is a glyph at
+    // a time in a texture it calls 1024 by 1024, clamped to the glyph, and
+    // a million texels were decoded for each letter of a loading screen.)
+    // Whole blocks of 32, so that a neighbouring primitive finds its texels
+    // here too.
+    auto reach = [](uint8_t wrap, int first, int last, int low, int high, int size, int &from, int &to)
+    {
+        from = first;
+        to = last;
+        if (wrap == 2u)
+        {
+            from = clampInt(first, low, std::max(low, high));
+            to = clampInt(last, low, std::max(low, high));
+        }
+        else if (wrap == 3u)
+        {
+            from = high;
+            to = high | low;
+        }
+        from = clampInt(from, 0, size - 1);
+        to = clampInt(to, from, size - 1);
+    };
+    int x0, x1, y0, y1;
+    reach(p.wrapU, p.sampledU0, p.sampledU1, p.minU, p.maxU, p.texW, x0, x1);
+    reach(p.wrapV, p.sampledV0, p.sampledV1, p.minV, p.maxV, p.texH, y0, y1);
     x0 = clampInt(x0, 0, p.texW - 1) & ~31;
     y0 = clampInt(y0, 0, p.texH - 1) & ~31;
     x1 = std::min(clampInt(x1, 0, p.texW - 1) | 31, p.texW - 1);
     y1 = std::min(clampInt(y1, 0, p.texH - 1) | 31, p.texH - 1);
+    // With REPEAT, coordinates that run past an end of the texture take
+    // texels from the far side: a filtered sprite that starts at the first
+    // texel reads the last one beside it. That is a few texels, not the
+    // whole axis: they are kept as the coordinates have them, from below 0
+    // or past the size, and the shader looks them up the same way. (The
+    // font again: 1024 by 1024 by name, a glyph at a time in fact, filtered
+    // from its first texel, and decoded whole for every letter.)
+    auto window = [](int reach0, int reach1, int size, int &from, int &to)
+    {
+        if (reach1 < reach0)
+            return;
+        const int first = reach0 & ~31, last = reach1 | 31;
+        if (last - first + 1 < size)
+        {
+            from = first;
+            to = last;
+        }
+    };
+    window(p.reachU0, p.reachU1, p.texW, x0, x1);
+    window(p.reachV0, p.reachV1, p.texH, y0, y1);
+    // A window as the one to four rectangles of the texture it is.
+    const auto parts = [&p](int wx0, int wy0, int wx1, int wy1, auto &&use)
+    {
+        const auto split = [](int a, int b, int size, int out[2][2])
+        {
+            if (a >= 0 && b < size)
+            {
+                out[0][0] = a;
+                out[0][1] = b;
+                return 1;
+            }
+            if (b - a + 1 >= size)
+            {
+                out[0][0] = 0;
+                out[0][1] = size - 1;
+                return 1;
+            }
+            const int first = a & (size - 1), last = b & (size - 1);
+            if (first <= last)
+            {
+                out[0][0] = first;
+                out[0][1] = last;
+                return 1;
+            }
+            out[0][0] = first;
+            out[0][1] = size - 1;
+            out[1][0] = 0;
+            out[1][1] = last;
+            return 2;
+        };
+        int across[2][2], down[2][2];
+        const int columns = split(wx0, wx1, p.texW, across), rows = split(wy0, wy1, p.texH, down);
+        for (int row = 0; row < rows; ++row)
+            for (int column = 0; column < columns; ++column)
+                use(across[column][0], down[row][0], across[column][1], down[row][1]);
+    };
+    const auto changedSince = [&](const GpuState::Texture &held)
+    {
+        bool drawn = false, uploaded = false;
+        parts(held.x0, held.y0, held.x1, held.y1, [&](int px0, int py0, int px1, int py1)
+              { drawn = drawn || DrawnSince(p.texture, px0, py0, px1, py1, held.serial); });
+        if (!drawn && held.checkedUpload != m_lastUploadSerial)
+            parts(held.x0, held.y0, held.x1, held.y1, [&](int px0, int py0, int px1, int py1)
+                  { uploaded = uploaded || UploadedSince(p.texture, px0, py0, px1, py1, held.serial); });
+        return drawn || uploaded;
+    };
 
     uint64_t key = mixKey(ConversionKey(p), (static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm);
     key = mixKey(key, (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
     GpuState::Texture &texture = gpu.textures[key];
     bool good = texture.id != 0u && texture.x0 <= x0 && texture.y0 <= y0 && texture.x1 >= x1 && texture.y1 >= y1 &&
-                !DrawnSince(p.texture, texture.x0, texture.y0, texture.x1, texture.y1, texture.serial);
-    if (good && texture.checkedUpload != m_lastUploadSerial)
-    {
-        good = !UploadedSince(p.texture, texture.x0, texture.y0, texture.x1, texture.y1, texture.serial);
-        if (good)
-            texture.checkedUpload = m_lastUploadSerial;
-    }
+                !changedSince(texture);
+    if (good)
+        texture.checkedUpload = m_lastUploadSerial;
     if (!good)
     {
         const bool had = texture.id != 0u;
@@ -735,14 +821,29 @@ void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
             x1 = std::max(x1, texture.x1);
             y1 = std::max(y1, texture.y1);
         }
-        FlushPrimitivesTouching(p.texture, x0, y0, x1, y1, false, "texture");
-        GpuDownload(p.texture, x0, y0, x1, y1, GpuState::WhyTexture, 0u, true);
+        // (What has grown to the size of the texture is the texture.)
+        if (x1 - x0 + 1 >= p.texW)
+        {
+            x0 = 0;
+            x1 = p.texW - 1;
+        }
+        if (y1 - y0 + 1 >= p.texH)
+        {
+            y0 = 0;
+            y1 = p.texH - 1;
+        }
+        parts(x0, y0, x1, y1, [&](int px0, int py0, int px1, int py1)
+              {
+                  FlushPrimitivesTouching(p.texture, px0, py0, px1, py1, false, "texture");
+                  GpuDownload(p.texture, px0, py0, px1, py1, GpuState::WhyTexture, 0u, true);
+              });
         const int width = x1 - x0 + 1, height = y1 - y0 + 1;
         gpu.pixels.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
         uint32_t *out = gpu.pixels.data();
+        const int wrapAcross = p.texW - 1, wrapDown = p.texH - 1;
         for (int v = y0; v <= y1; ++v)
             for (int u = x0; u <= x1; ++u)
-                *out++ = p.fetch(u, v);
+                *out++ = p.fetch(u & wrapAcross, v & wrapDown);
         const uint64_t hash = hashBytes(reinterpret_cast<const uint8_t *>(gpu.pixels.data()), gpu.pixels.size() * sizeof(uint32_t),
                                         0x452821E638D01377ull);
         uint32_t most = 0u;
