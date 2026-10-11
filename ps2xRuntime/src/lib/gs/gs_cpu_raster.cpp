@@ -2225,6 +2225,20 @@ void GSCpuBackend::QueueImage(const GSMem::SurfaceLayout &layout, uint8_t dpsm, 
     // Pending primitives that write or sample these pages come first.
     if (!queue.pending.empty() && (intersects(pages, queue.written) || intersects(pages, queue.read)))
         queue.submit("upload");
+    // A small image is stored here and now when nothing the pool still has
+    // touches its pages: handing it over costs more than storing it, and
+    // what is drawn from it next only waits for it. (A page of text is
+    // thousands of glyphs a frame, each sent and then drawn from at once:
+    // this thread and the pool woke each other for every one of them, and
+    // that was most of what this thread did.)
+    constexpr size_t kStoredHereBytes = 4096u;
+    if (bytes <= kStoredHereBytes &&
+        std::max(RasterQueue::lastBatch(pages, queue.pageWriter), RasterQueue::lastBatch(pages, queue.pageReader)) <=
+            queue.retired.load(std::memory_order_acquire))
+    {
+        StoreImagePixels(m_vram, layout, dpsm, streamBits, dsax, dsay, rrw, 0u, rrw * rrh, data, bytes, 0u);
+        return;
+    }
     queue.submitImage(m_vram, layout, dpsm, streamBits, dsax, dsay, rrw, rrh, data, bytes, pages);
 }
 
