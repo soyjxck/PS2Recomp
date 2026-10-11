@@ -727,6 +727,31 @@ void register_ps2_runtime_kernel_tests()
                      "the resumed waiter should re-enter its priority queue once");
         });
 
+        tc.Run("a started thread finds the constant (0, 0, 0, 1) in VF0", [](TestCase &t)
+        {
+            // Code that builds a unit matrix out of VF0 (vsub vf4, vf0, vf0;
+            // vadd.w vf4, vf4, vf0; vmr32 ...) gets a matrix of zeros on a
+            // thread whose VF0 is zero.
+            TestEnv env;
+            EeScheduler &ee = env.runtime.eeScheduler();
+            ee.reset(env.rdram.data(), env.ctx);
+            ee.bindMainContextForSyscall(env.ctx, env.rdram.data());
+
+            const int id = ee.createThread(EeThreadCreateParams{0u, K_SCHED_HIGH, 0x24000u, 0x800u,
+                                                                 0u, 20, 0u});
+            t.Equals(ee.startThread(id, 0u, env.ctx, false), KE_OK, "StartThread should accept the dormant thread");
+
+            alignas(16) float vf0[4] = {};
+            _mm_store_ps(vf0, ee.thread(id)->context.vu0_vf[0]);
+            t.IsTrue(vf0[0] == 0.0f && vf0[1] == 0.0f && vf0[2] == 0.0f && vf0[3] == 1.0f,
+                     "the context of a started thread should hold VF0 = (0, 0, 0, 1)");
+
+            alignas(16) float fresh[4] = {};
+            _mm_store_ps(fresh, R5900Context{}.vu0_vf[0]);
+            t.IsTrue(fresh[0] == 0.0f && fresh[1] == 0.0f && fresh[2] == 0.0f && fresh[3] == 1.0f,
+                     "every new context should hold VF0 = (0, 0, 0, 1)");
+        });
+
         tc.Run("semaphore signal, delete, and release complete blocked contexts with exact results", [](TestCase &t)
         {
             const auto blockMain = [](TestEnv &env, int &semaId)

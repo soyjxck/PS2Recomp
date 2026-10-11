@@ -150,6 +150,10 @@ struct alignas(16) R5900Context
 
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
+        // VF0 is the constant (0, 0, 0, 1). The console has one VU0 and every
+        // thread reads the constant from it; here each thread has a context
+        // of its own, so each context has to hold it from the start.
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
 
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
