@@ -4,6 +4,7 @@
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_settings.h"
 
 #include <array>
 #include <atomic>
@@ -445,6 +446,30 @@ namespace
         SignalSema(rdram, ctx, runtime);
         ctx->pc = 0u;
         runtime->requestStop();
+    }
+
+    // A thread that makes a call the IOP answers: it sets its result and
+    // waits out the round trip, and records the result where it goes on.
+    void schedulerRoundTripCaller(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (ctx->pc == K_SCHED_A)
+        {
+            gSchedulerTrace->push_back(10);
+            ctx->pc = K_SCHED_A_RESUME;
+            setRegU32(*ctx, 2, 0x1234u);
+            runtime->eeScheduler().waitIopRoundTrip();
+            return;
+        }
+        gSchedulerWaitResultA = getRegS32(*ctx, 2);
+        gSchedulerTrace->push_back(11);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void schedulerRoundTripBystander(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        gSchedulerTrace->push_back(20);
+        ctx->pc = 0u;
     }
 
     constexpr uint32_t K_EVENT_FIFO_MAIN = 0x301000u;
@@ -912,6 +937,42 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(gSchedulerWaitResultA, gSchedulerSemaphoreId, "first waiter receives sid on resume");
             t.Equals(gSchedulerWaitResultB, gSchedulerSemaphoreId, "second waiter receives sid on resume");
             t.Equals(ee.semaphore(gSchedulerSemaphoreId)->count, 0, "direct handoff must not increment count");
+        });
+
+        tc.Run("a call the IOP answers takes its caller off the processor when a game asks for that", [](TestCase &t)
+        {
+            auto run = [](uint32_t delayMicroseconds, std::vector<int> &trace)
+            {
+                TestEnv env;
+                gSchedulerTrace = &trace;
+                gSchedulerWaitResultA = 0;
+                env.runtime.registerFunction(K_SCHED_MAIN, schedulerMainExit);
+                env.runtime.registerFunction(K_SCHED_A, schedulerRoundTripCaller);
+                env.runtime.registerFunction(K_SCHED_A_RESUME, schedulerRoundTripCaller);
+                env.runtime.registerFunction(K_SCHED_B, schedulerRoundTripBystander);
+                env.ctx.pc = K_SCHED_MAIN;
+
+                ps2x::setSifRpcDelay(delayMicroseconds);
+                EeScheduler &ee = env.runtime.eeScheduler();
+                ee.reset(env.rdram.data(), env.ctx);
+                const int caller = ee.createThread(EeThreadCreateParams{0, K_SCHED_A, 0x20000u, 0x800u, 0, 5, 0});
+                const int bystander = ee.createThread(EeThreadCreateParams{0, K_SCHED_B, 0x21000u, 0x800u, 0, 20, 0});
+                ee.startThread(caller, 0, env.ctx, false);
+                ee.startThread(bystander, 0, env.ctx, false);
+                ee.run();
+                ps2x::setSifRpcDelay(0u);
+            };
+
+            std::vector<int> instant;
+            run(0u, instant);
+            t.IsTrue(instant == std::vector<int>({1, 10, 11}),
+                     "with no delay asked for the caller goes straight on");
+
+            std::vector<int> delayed;
+            run(250u, delayed);
+            t.IsTrue(delayed == std::vector<int>({1, 10, 20, 11}),
+                     "a lower thread runs while the caller waits for the answer");
+            t.Equals(gSchedulerWaitResultA, 0x1234, "and the caller goes on with the result its call had");
         });
 
         tc.Run("setup heap and allocator primitives track end-of-heap", [](TestCase &t)
