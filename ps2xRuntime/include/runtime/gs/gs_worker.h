@@ -2,7 +2,10 @@
 
 #include <cstdint>
 
+#include "runtime/gs/gs_types.h"
+
 class GS;
+struct GSRegisters;
 
 // Runs the GS (GIF packet decoding and rasterising) on its own thread, so the
 // EE does not wait for a frame's drawing while it prepares the next packets.
@@ -17,7 +20,9 @@ class GS;
 // PS2X_GS_THREAD=0 processes packets on the calling thread, as before.
 namespace GsWorker
 {
-    void start(GS &gs);
+    // `registers`: the privileged registers the guest writes (lagsInterrupts
+    // reads its interrupt mask there).
+    void start(GS &gs, const GSRegisters *registers = nullptr);
     void stop();
     bool running();
 
@@ -45,6 +50,43 @@ namespace GsWorker
 
     // The same for VU1's queue alone: what its registers and memory need.
     bool drainVu1(Wait why);
+
+    // How many vblanks the GS, and VU1 before it, may be behind the EE:
+    // ps2x::setGsLag, or PS2X_GS_LAG=<n>. 0, the default: never behind, as
+    // described above. Otherwise the EE does not wait at a vblank for what it
+    // sent during the frame, only for what it had sent n vblanks before, and
+    // it does not wait before it idles, in sceGsSyncPath, or for a FINISH or
+    // SIGNAL while the guest has both masked: a frame is drawn while the EE
+    // prepares the next one. A game that sends a frame and then waits for the
+    // vblank, as most do, otherwise has the host do the two in turn.
+    //
+    // The guest cannot tell: the paths read as idle either way, the picture
+    // is shown with the display registers of the vblank the GS has reached
+    // (postVBlank), the library's register writes take their turn in the
+    // queue, and whatever reads the GS's or VU1's state (CSR, a stored image,
+    // VU1's memory) or changes the interrupt mask still waits for the queue.
+    // So emulated timing still does not depend on how fast the host draws.
+    // What changes is the host's: the picture is up to n vblanks late when
+    // the host cannot keep up, and not at all when it can.
+    uint32_t lagVBlanks();
+
+    // Whether the GS may be behind and the guest has both of its interrupts,
+    // SIGNAL and FINISH, masked: nothing queued can then interrupt the guest,
+    // and what it reads of the two in CSR waits for the queue by itself.
+    bool lagsInterrupts();
+
+    // The EE's vblank, with the display registers as they are at it, in its
+    // place among what was posted.
+    using Display = GSDisplayRegisters;
+    void postVBlank(const Display &display);
+
+    // While the GS may lag, the display of the last vblank it has passed:
+    // what its VRAM is shown with (GS::latchHostPresentationFrame). False
+    // otherwise, or before the first.
+    bool shownDisplay(Display &display);
+
+    // Returns when the GS has passed that vblank. True if it had to wait.
+    bool waitForVBlank(uint64_t tick, Wait why = Wait::VBlank);
 
     // Called by a sender on the EE side after posting a packet that raises an
     // interrupt. Without a hook the caller waits for the queue (the interrupt

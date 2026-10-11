@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "System.h"
+#include "runtime/gs/gs_worker.h"
 
 namespace ps2_syscalls
 {
@@ -64,6 +65,10 @@ namespace ps2_syscalls
         uint64_t oldImr = 0;
         if (runtime)
         {
+            // A GS that may lag: what is queued raises its interrupts under
+            // the mask it was sent with.
+            if (GsWorker::lagVBlanks() != 0u)
+                GsWorker::drain();
             oldImr = runtime->memory().gs().imr;
             runtime->memory().gs().imr = newImr;
         }

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "runtime/gs/gs_worker.h"
+
 class PS2Memory;
 
 // Runs VIF1 (unpacking into VU1 memory, MSCAL, DIRECT) and the VU1
@@ -32,6 +34,10 @@ namespace Vu1Worker
 
     void postVif1(const uint8_t *data, uint32_t sizeBytes);
     void postPath3(const uint8_t *data, uint32_t sizeBytes);
+
+    // The EE's vblank, passed on to the GS worker in its place among what was
+    // posted (GsWorker::postVBlank).
+    void postVBlank(const GsWorker::Display &display);
 
     // Returns when everything posted so far has been handled. True if there
     // was anything to wait for.

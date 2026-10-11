@@ -143,6 +143,14 @@ namespace
         } while (!csr.compare_exchange_weak(expected, desired));
     }
 
+    // With GsWorker::lagVBlanks, a SIGNAL or FINISH among what is queued is
+    // raised before the guest clears the two, as it was on the console.
+    inline void settleCsrStatus(uint64_t value)
+    {
+        if ((value & 0x3ull) != 0u && GsWorker::lagVBlanks() != 0u)
+            GsWorker::drain(GsWorker::Wait::Csr);
+    }
+
     constexpr std::array<uint32_t, 4> kEeTimerBases = {
         0x10000000u,
         0x10000800u,
@@ -1000,6 +1008,8 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
             // Done as a single atomic RMW -- see writeCsrHalf's comment.
+            if (off == 0u)
+                settleCsrStatus(value);
             writeCsrHalf(gs_regs.csr, off, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
@@ -1059,6 +1069,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
             // atomic RMW -- see writeCsrFull's comment.
+            settleCsrStatus(value);
             writeCsrFull(gs_regs.csr, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
@@ -1214,6 +1225,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
+            if (off == 0u)
+                settleCsrStatus(value);
             writeCsrHalf(gs_regs.csr, off, value);
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))

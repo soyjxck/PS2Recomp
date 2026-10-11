@@ -202,6 +202,13 @@ namespace ps2x
     // meanwhile; a game whose threads count on that says how long in its
     // override. PS2X_SIF_RPC_DELAY_US wins over this.
     void setSifRpcDelay(uint32_t microseconds);
+
+    // How many vblanks the GS, and VU1 before it, may be behind the EE
+    // (GsWorker::lagVBlanks in runtime/gs/gs_worker.h says what that means).
+    // 0, the default: never behind. A game whose frames take the host longer
+    // to draw than to prepare says how far in its override: 2 is one frame of
+    // a game that draws every other vblank. PS2X_GS_LAG wins over this.
+    void setGsLag(uint32_t vblanks);
 }
 
 #endif // PS2_SETTINGS_H

@@ -274,6 +274,15 @@ struct GSTransferSnapshot
     size_t localToHostPendingBytes = 0;
 };
 
+// What the display registers held at one vblank. They are the EE's to write
+// at any time, so a GS that is behind the EE (GsWorker::lagVBlanks) has its
+// VRAM shown with the ones of the last vblank it has passed.
+struct GSDisplayRegisters
+{
+    uint64_t tick = 0;
+    uint64_t pmode = 0, smode2 = 0, dispfb1 = 0, display1 = 0, dispfb2 = 0, display2 = 0, bgcolor = 0;
+};
+
 struct GSPresentationRequest
 {
     uint64_t pmode = 0;

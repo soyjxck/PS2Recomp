@@ -4,6 +4,8 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_worker.h"
+#include "runtime/ps2_settings.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -4832,6 +4834,100 @@ void register_ps2_gs_tests()
             }
             t.IsTrue(pattern2Ok,
                      "second T4HL transfer to a different DBP should be byte-correct, proving the discarded excess bytes from the first transfer did not leak into subsequent transfer state");
+        });
+
+        tc.Run("a GS that may lag passes each vblank in its turn and shows with that vblank's display", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "the GS and its worker should start");
+
+            GsWorker::Display shown;
+            t.IsFalse(GsWorker::shownDisplay(shown), "a GS that never lags is shown with the EE's own registers");
+
+            ps2x::setGsLag(2u);
+            t.Equals(GsWorker::lagVBlanks(), 2u, "the lag should be what the game asked for");
+            t.IsFalse(GsWorker::shownDisplay(shown), "before the first vblank there is no display of one");
+
+            GsWorker::Display first;
+            first.tick = 5u;
+            first.dispfb1 = 0x1234u;
+            GsWorker::Display second;
+            second.tick = 6u;
+            second.dispfb1 = 0x4321u;
+            second.bgcolor = 0x00FF00u;
+            GsWorker::postVBlank(first);
+            GsWorker::postVBlank(second);
+            GsWorker::waitForVBlank(6u);
+            t.IsTrue(GsWorker::shownDisplay(shown), "a vblank the GS has passed should give the display");
+            t.Equals(shown.tick, static_cast<uint64_t>(6u), "the display should be the last vblank's");
+            t.Equals(shown.dispfb1, static_cast<uint64_t>(0x4321u), "DISPFB1 should be as the EE had it at that vblank");
+            t.Equals(shown.bgcolor, static_cast<uint64_t>(0x00FF00u), "BGCOLOR should be as the EE had it at that vblank");
+            t.IsFalse(GsWorker::waitForVBlank(5u), "a vblank already passed is not waited for");
+
+            ps2x::setGsLag(0u);
+            t.IsFalse(GsWorker::shownDisplay(shown), "with the lag off the EE's own registers show again");
+        });
+
+        tc.Run("a GS that may lag keeps FINISH from the guest only while it is masked", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "the GS and its worker should start");
+
+            runtime.memory().gs().imr = 0x7F00u;
+            t.IsFalse(GsWorker::lagsInterrupts(), "a GS that never lags has every interrupt wait for it");
+            ps2x::setGsLag(2u);
+            t.IsTrue(GsWorker::lagsInterrupts(), "with SIGNAL and FINISH masked nothing queued can interrupt the guest");
+            runtime.memory().gs().imr = 0x7D00u; // FINISH unmasked
+            t.IsFalse(GsWorker::lagsInterrupts(), "an unmasked FINISH is waited for as before");
+            runtime.memory().gs().imr = 0x7F00u;
+
+            // FINISH in a packet, then the guest clears the bit: the write
+            // waits for the packet, so the bit is clear afterwards.
+            std::vector<uint8_t> packet;
+            appendU64(packet, makeGifTag(1u, GIF_FMT_PACKED, 1u, true));
+            appendU64(packet, 0xEull);
+            appendU64(packet, 0ull);
+            appendU64(packet, 0x61ull); // FINISH
+            GsWorker::post(packet.data(), static_cast<uint32_t>(packet.size()));
+            runtime.memory().write32(PS2_GS_PRIV_REG_BASE + 0x1000u, 0x2u);
+            GsWorker::drain();
+            t.Equals(static_cast<uint32_t>(runtime.memory().gs().csr.load() & 0x2u), 0u,
+                     "a FINISH that was queued when the guest cleared CSR should not turn up afterwards");
+
+            ps2x::setGsLag(0u);
+        });
+
+        tc.Run("a GS that may lag takes the library's draw environment in its turn", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+            t.IsTrue(runtime.syncCoreSubsystems(), "the GS and its worker should start");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x00100000u;
+            const uint64_t pairs[16] = {
+                (0x40ull << 0) | (10ull << 16), GS_REG_FRAME_1, // FBP 0x40, FBW 10
+                0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full,
+                0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full, 0x7Full};
+            std::memcpy(rdram.data() + kEnvAddr, pairs, sizeof(pairs));
+
+            ps2x::setGsLag(2u);
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            ps2_stubs::sceGsPutDrawEnv(rdram.data(), &ctx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0, "sceGsPutDrawEnv should succeed");
+            GsWorker::drain();
+            t.Equals(runtime.gs().getContextFrame(0).fbp, 0x40u, "FRAME_1 should arrive through the queue");
+            t.Equals(runtime.gs().getContextFrame(0).fbw, 10u, "FRAME_1 should arrive whole");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            ps2_stubs::sceGsSyncPath(rdram.data(), &ctx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0, "sceGsSyncPath should find the paths idle");
+
+            ps2x::setGsLag(0u);
         });
     });
 }

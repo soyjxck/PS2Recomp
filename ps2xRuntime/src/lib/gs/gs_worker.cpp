@@ -1,5 +1,7 @@
 #include "runtime/gs/gs_worker.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_memory.h"
+#include "runtime/ps2_settings.h"
 #include "runtime/vu1_worker.h"
 
 #include <atomic>
@@ -71,8 +73,14 @@ namespace
         std::mutex mutex;
         std::condition_variable workReady;
         std::condition_variable workDone;
-        std::deque<std::vector<uint8_t>> queue;
+        struct Packet
+        {
+            std::vector<uint8_t> data;
+            GsWorker::Display vblank; // tick not 0: no packet, a vblank of the EE's
+        };
+        std::deque<Packet> queue;
         std::vector<std::vector<uint8_t>> spare; // buffers to reuse
+        GsWorker::Display vblankReached;
         size_t queuedBytes = 0;
         uint64_t posted = 0;
         uint64_t completed = 0;
@@ -88,7 +96,7 @@ namespace
         {
             // Everything queued is taken in one go, so the threads that post
             // meet this one at the lock once per run, not per packet.
-            std::deque<std::vector<uint8_t>> taken;
+            std::deque<Packet> taken;
             std::unique_lock<std::mutex> lock(mutex);
             for (;;)
             {
@@ -108,10 +116,19 @@ namespace
                 const auto started = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
                 size_t bytes = 0;
-                for (const std::vector<uint8_t> &packet : taken)
+                for (const Packet &packet : taken)
                 {
-                    gs->processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
-                    bytes += packet.size();
+                    if (packet.vblank.tick != 0u)
+                    {
+                        {
+                            std::lock_guard<std::mutex> guard(mutex);
+                            vblankReached = packet.vblank;
+                        }
+                        workDone.notify_all();
+                        continue;
+                    }
+                    gs->processGIFPacket(packet.data.data(), static_cast<uint32_t>(packet.data.size()));
+                    bytes += packet.data.size();
                 }
                 const uint64_t count = taken.size();
 
@@ -143,8 +160,8 @@ namespace
                 queuedBytes -= bytes;
                 while (!taken.empty())
                 {
-                    if (spare.size() < 256u)
-                        spare.push_back(std::move(taken.front()));
+                    if (spare.size() < 256u && taken.front().vblank.tick == 0u)
+                        spare.push_back(std::move(taken.front().data));
                     taken.pop_front();
                 }
                 workDone.notify_all();
@@ -162,6 +179,13 @@ namespace
 namespace
 {
     std::atomic<void (*)()> g_interruptSentHook{nullptr};
+    std::atomic<uint32_t> g_lagVBlanks{0u}; // what the game asked for
+    std::atomic<const GSRegisters *> g_registers{nullptr};
+}
+
+void ps2x::setGsLag(uint32_t vblanks)
+{
+    g_lagVBlanks.store(vblanks, std::memory_order_relaxed);
 }
 
 namespace GsWorker
@@ -173,6 +197,8 @@ namespace GsWorker
 
     void interruptSent()
     {
+        if (lagsInterrupts())
+            return;
         if (void (*hook)() = g_interruptSentHook.load(std::memory_order_acquire))
             hook();
         else
@@ -243,12 +269,17 @@ namespace GsWorker
         return false;
     }
 
-    void start(GS &gs)
+    void start(GS &gs, const GSRegisters *registers)
     {
         Worker &w = worker();
         if (w.active.load(std::memory_order_acquire))
             return;
         w.gs = &gs;
+        g_registers.store(registers, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            w.vblankReached = {};
+        }
         const char *value = std::getenv("PS2X_GS_THREAD");
         if (value != nullptr && value[0] == '0')
             return;
@@ -262,6 +293,7 @@ namespace GsWorker
     void stop()
     {
         Worker &w = worker();
+        g_registers.store(nullptr, std::memory_order_release);
         if (!w.active.exchange(false, std::memory_order_acq_rel))
             return;
         {
@@ -307,7 +339,7 @@ namespace GsWorker
             std::lock_guard<std::mutex> lock(w.mutex);
             wasEmpty = w.queue.empty();
             w.queuedBytes += packet.size();
-            w.queue.push_back(std::move(packet));
+            w.queue.push_back(Worker::Packet{std::move(packet), {}});
             ++w.posted;
         }
         // The worker only sleeps on an empty queue.
@@ -318,6 +350,83 @@ namespace GsWorker
         // this packet raises is pending when the send returns.
         if (!Vu1Worker::onWorkerThread() && raisesInterrupt(data, sizeBytes))
             interruptSent();
+    }
+
+    uint32_t lagVBlanks()
+    {
+        static const int64_t fromEnvironment = []() -> int64_t
+        {
+            const char *value = std::getenv("PS2X_GS_LAG");
+            return value != nullptr && value[0] != '\0' ? static_cast<int64_t>(std::strtoul(value, nullptr, 10)) : -1;
+        }();
+        return fromEnvironment >= 0 ? static_cast<uint32_t>(fromEnvironment) : g_lagVBlanks.load(std::memory_order_relaxed);
+    }
+
+    bool lagsInterrupts()
+    {
+        if (lagVBlanks() == 0u)
+            return false;
+        const GSRegisters *registers = g_registers.load(std::memory_order_acquire);
+        return registers != nullptr && ((registers->imr >> 8) & 0x3u) == 0x3u;
+    }
+
+    bool shownDisplay(Display &display)
+    {
+        if (lagVBlanks() == 0u)
+            return false;
+        Worker &w = worker();
+        std::lock_guard<std::mutex> lock(w.mutex);
+        display = w.vblankReached;
+        return display.tick != 0u;
+    }
+
+    void postVBlank(const Display &display)
+    {
+        // Behind what VU1 has still to send.
+        if (Vu1Worker::defers())
+        {
+            Vu1Worker::postVBlank(display);
+            return;
+        }
+        Worker &w = worker();
+        const bool queued = w.active.load(std::memory_order_acquire) && std::this_thread::get_id() != w.threadId;
+        bool wasEmpty = false;
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            if (queued)
+            {
+                wasEmpty = w.queue.empty();
+                w.queue.push_back(Worker::Packet{{}, display});
+                ++w.posted;
+            }
+            else
+            {
+                w.vblankReached = display;
+            }
+        }
+        if (!queued)
+            w.workDone.notify_all();
+        else if (wasEmpty)
+            w.workReady.notify_one();
+    }
+
+    bool waitForVBlank(uint64_t tick, Wait why)
+    {
+        Worker &w = worker();
+        if (std::this_thread::get_id() == w.threadId || Vu1Worker::onWorkerThread())
+            return false;
+        const bool wantStats = statsWanted();
+        const auto start = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        {
+            std::unique_lock<std::mutex> lock(w.mutex);
+            if (w.vblankReached.tick >= tick)
+                return false;
+            w.workDone.wait(lock, [&]
+                            { return w.vblankReached.tick >= tick; });
+        }
+        if (wantStats)
+            countWait(why, start);
+        return true;
     }
 
     bool drainVu1(Wait why)

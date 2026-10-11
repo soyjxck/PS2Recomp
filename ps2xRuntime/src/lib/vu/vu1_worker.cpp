@@ -15,6 +15,7 @@ namespace
     struct Item
     {
         bool path3 = false;
+        GsWorker::Display vblank; // tick not 0: no data, a vblank of the EE's
         std::vector<uint8_t> data;
     };
 
@@ -51,14 +52,16 @@ namespace
                 lock.unlock();
 
                 const uint32_t size = static_cast<uint32_t>(item.data.size());
-                if (item.path3)
+                if (item.vblank.tick != 0u)
+                    GsWorker::postVBlank(item.vblank);
+                else if (item.path3)
                     memory->submitGifPacket(GifPathId::Path3, item.data.data(), size, true);
                 else
                     memory->processVIF1Data(item.data.data(), size);
 
                 lock.lock();
                 ++completed;
-                if (spare.size() < 64u)
+                if (spare.size() < 64u && item.vblank.tick == 0u)
                     spare.push_back(std::move(item.data));
                 workDone.notify_all();
             }
@@ -164,6 +167,19 @@ namespace Vu1Worker
         worker().post(true, data, sizeBytes);
         if (GsWorker::raisesInterrupt(data, sizeBytes))
             GsWorker::interruptSent();
+    }
+
+    void postVBlank(const GsWorker::Display &display)
+    {
+        Worker &w = worker();
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            Item item;
+            item.vblank = display;
+            w.queue.push_back(std::move(item));
+            ++w.posted;
+        }
+        w.workReady.notify_one();
     }
 
     bool drain()

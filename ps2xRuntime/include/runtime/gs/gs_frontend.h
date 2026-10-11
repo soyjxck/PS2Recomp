@@ -129,7 +129,9 @@ public:
     bool isDebugHistoryPaused() const;
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
-    void latchHostPresentationFrame();
+    // `display`: the registers to show VRAM with, when they are not the EE's
+    // as they are now (see GSDisplayRegisters).
+    void latchHostPresentationFrame(const GSDisplayRegisters *display = nullptr);
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,

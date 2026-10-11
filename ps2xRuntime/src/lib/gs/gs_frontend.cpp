@@ -603,7 +603,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
-void GS::latchHostPresentationFrame()
+void GS::latchHostPresentationFrame(const GSDisplayRegisters *display)
 {
     GSPresentationRequest request{};
     {
@@ -617,6 +617,17 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+        if (display)
+        {
+            request.pmode = display->pmode;
+            request.smode2 = display->smode2;
+            request.dispfb1 = display->dispfb1;
+            request.display1 = display->display1;
+            request.dispfb2 = display->dispfb2;
+            request.display2 = display->display2;
+            request.bgcolor = display->bgcolor;
+            request.vsyncTick = display->tick;
+        }
     }
 
     PresentationFrame frame{};

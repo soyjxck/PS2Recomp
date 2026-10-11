@@ -1247,7 +1247,10 @@ namespace ps2_stubs
 
     void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        GsWorker::drain(GsWorker::Wait::SyncPath);
+        // A GS that may lag: the paths are idle as far as the guest can tell,
+        // and what it sends next is drawn after what it sent before.
+        if (GsWorker::lagVBlanks() == 0u)
+            GsWorker::drain(GsWorker::Wait::SyncPath);
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
 

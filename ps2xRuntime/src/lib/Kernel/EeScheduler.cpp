@@ -218,7 +218,7 @@ void EeScheduler::run()
             {
                 // Nothing to run: the interrupt the guest is waiting for may
                 // be in the packets the GS has not reached yet.
-                if (GsWorker::drain(GsWorker::Wait::Idle))
+                if (!GsWorker::lagsInterrupts() && GsWorker::drain(GsWorker::Wait::Idle))
                     continue;
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
@@ -1971,7 +1971,24 @@ void EeScheduler::processDueDeadlines()
                 // What the guest sent during the frame is drawn before its
                 // vblank, and a FINISH or SIGNAL among it reaches the guest
                 // first, as it would on hardware that kept up.
-                if (GsWorker::drain(GsWorker::Wait::VBlank))
+                // A GS that may lag is told of the vblank in its turn, and the
+                // wait is for the vblank that many before this one.
+                bool caughtUp = false;
+                if (const uint64_t lag = GsWorker::lagVBlanks(); lag != 0u)
+                {
+                    const uint64_t tick = m_vsyncTick + 1u;
+                    const GSRegisters &regs = m_runtime.memory().gs();
+                    GsWorker::postVBlank(GsWorker::Display{tick, regs.pmode, regs.smode2, regs.dispfb1, regs.display1,
+                                                           regs.dispfb2, regs.display2, regs.bgcolor});
+                    if (tick > lag)
+                        GsWorker::waitForVBlank(tick - lag);
+                    caughtUp = true;
+                }
+                else
+                {
+                    caughtUp = GsWorker::drain(GsWorker::Wait::VBlank);
+                }
+                if (caughtUp)
                 {
                     const uint32_t gsInterrupts = pendingGsInterrupts();
                     if ((gsInterrupts & ~m_gsIrqLatched) != 0u)
@@ -2090,7 +2107,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             scheduleEvent(m_eeCycle + gsFinishDelayCycles(), std::chrono::steady_clock::now(),
                           EeEvent{EeEventType::Dmac, kGsSyncDue, 0});
         }
-        else if (event.id == kGsSyncDue && GsWorker::drain(GsWorker::Wait::InterruptDue))
+        else if (event.id == kGsSyncDue && !GsWorker::lagsInterrupts() && GsWorker::drain(GsWorker::Wait::InterruptDue))
         {
             const uint32_t gsInterrupts = pendingGsInterrupts();
             if ((gsInterrupts & ~m_gsIrqLatched) != 0u)

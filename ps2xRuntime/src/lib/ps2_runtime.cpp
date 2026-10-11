@@ -959,6 +959,7 @@ void ps2xHoldForFrameDump(uint64_t tick)
 {
     if (!frameDumpPlan().dueAt(tick))
         return;
+    GsWorker::drain(); // a GS that may lag: the picture of this vblank, not of an earlier one
     const auto giveUp = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (g_frameDumpSavedTick.load(std::memory_order_acquire) < tick && std::chrono::steady_clock::now() < giveUp)
         std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -994,11 +995,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
-    const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    // A GS that may lag (GsWorker::lagVBlanks) has a new picture when it
+    // passes a vblank, shown with the display registers of that vblank.
+    uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
+    GsWorker::Display shown;
+    const bool lagging = GsWorker::shownDisplay(shown);
+    if (lagging)
+        currentTick = shown.tick;
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        rt->gs().latchHostPresentationFrame(lagging ? &shown : nullptr);
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -1335,7 +1342,7 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     ps2xSetGsBackgroundDrawing(gsVram);
-    GsWorker::start(m_gs);
+    GsWorker::start(m_gs, &m_memory.gs());
     Vu1Worker::start(m_memory);
     if (m_eeScheduler)
         ps2xInstallGsFinishDelay(*m_eeScheduler);
@@ -3428,10 +3435,15 @@ void PS2Runtime::run()
                 while (nextPerfTick <= emulatedTick)
                     nextPerfTick += perfTicks;
             }
-            if (exitTick != 0u && emulatedTick >= exitTick)
+            // A GS that may lag: the run ends with the picture of that tick
+            // shown (and saved, if frames are), not when the EE gets there.
+            uint64_t shownTick = emulatedTick;
+            if (GsWorker::Display shown; GsWorker::shownDisplay(shown))
+                shownTick = shown.tick;
+            if (exitTick != 0u && shownTick >= exitTick)
             {
                 std::fprintf(stderr, "[run] PS2X_EXIT_AT reached at emu=%.2fs\n",
-                             static_cast<double>(emulatedTick) / kTestVBlanksPerSecond);
+                             static_cast<double>(shownTick) / kTestVBlanksPerSecond);
                 ps2x::audio::stopOutput(); // PS2X_AUDIO_DUMP is closed with its length in it
                 std::fflush(nullptr);
                 std::_Exit(0);

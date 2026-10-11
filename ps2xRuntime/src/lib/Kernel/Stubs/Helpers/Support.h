@@ -2175,6 +2175,22 @@ namespace
     {
         if (!runtime || !pairs || !runtime->syncCoreSubsystems())
             return;
+        // A GS that may lag: after what the guest sent before, as the packet
+        // the library sends them in is.
+        if (GsWorker::lagVBlanks() != 0u && pairCount <= 16u)
+        {
+            uint64_t packet[2u + 2u * 16u];
+            packet[0] = static_cast<uint64_t>(pairCount) | (1ull << 15) | (1ull << 60); // NLOOP, EOP, NREG = 1
+            packet[1] = 0xEull;                                                        // A+D
+            for (size_t i = 0; i < pairCount; ++i)
+            {
+                packet[2u + 2u * i] = pairs[i].value;
+                packet[3u + 2u * i] = pairs[i].reg & 0xFFu;
+            }
+            runtime->memory().processGIFPacket(reinterpret_cast<const uint8_t *>(packet),
+                                               static_cast<uint32_t>((2u + 2u * pairCount) * sizeof(uint64_t)));
+            return;
+        }
         for (size_t i = 0; i < pairCount; ++i)
         {
             runtime->gs().writeRegister(static_cast<uint8_t>(pairs[i].reg & 0xFFu), pairs[i].value);
