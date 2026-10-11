@@ -407,8 +407,13 @@ public:
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
     bool m_path3Masked = false;
+    // Image data a GIF IMAGE tag sent with DIRECT announced and that has
+    // not arrived yet. It comes as the payload of the DIRECT that follows,
+    // or raw, at the start of the next transfer, when the DIRECT carrying
+    // it was cut short by the end of this one.
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
+    bool m_vif1PendingPath2ImageRaw = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer

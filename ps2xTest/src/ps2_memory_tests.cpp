@@ -2163,7 +2163,7 @@ void register_ps2_memory_tests()
             t.IsTrue(imageOk, "VIF1 DIRECT image should update GS VRAM through GIF path2");
         });
 
-        tc.Run("VIF1 DIRECT image tag can continue with raw image qwords", [](TestCase &t)
+        tc.Run("VIF1 DIRECT image tag sent alone is continued by the next DIRECT", [](TestCase &t)
         {
             PS2Memory mem;
             t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
@@ -2192,6 +2192,7 @@ void register_ps2_memory_tests()
             appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: GIF IMAGE tag only.
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: the image.
             for (uint32_t i = 0; i < 16u; ++i)
             {
                 packet.push_back(static_cast<uint8_t>(0xA0u + i));
@@ -2213,7 +2214,7 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw qwords after a DIRECT image tag should continue the PATH2 image upload");
+            t.IsTrue(imageOk, "the DIRECT after a DIRECT image tag should continue the PATH2 image upload");
         });
 
         tc.Run("VIF1 DIRECT finds an image continuation after packed setup", [](TestCase &t)
@@ -2245,6 +2246,7 @@ void register_ps2_memory_tests()
             appendU64(packet, GS_REG_TEXA);
             appendU64(packet, makeGifTag(1u, GIF_FMT_IMAGE, 0u, true));
             appendU64(packet, 0ull);
+            appendU32(packet, makeVifCmd(0x50u, 0u, 1u)); // DIRECT 1 QW payload: the image.
             for (uint32_t i = 0; i < 16u; ++i)
                 packet.push_back(static_cast<uint8_t>(0xC0u + i));
 
@@ -2264,7 +2266,119 @@ void register_ps2_memory_tests()
                     }
                 }
             }
-            t.IsTrue(imageOk, "raw image continuation after packed setup should not be decoded as VIF/GIF registers");
+            t.IsTrue(imageOk, "image continuation after packed setup should not be decoded as VIF/GIF registers");
+        });
+
+        tc.Run("VIF1 chain: an image sent by reference follows its tag", [](TestCase &t)
+        {
+            // What sceVif1PkRefLoadImage builds: the IMAGE tag in a DIRECT
+            // of its own, the data in the next DMA tag, which has a NOP
+            // and the DIRECT for it in its upper half. Those two VIFcodes
+            // are not the image's first eight bytes, and its last eight are
+            // not VIFcodes.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gs.processGIFPacket(data, sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(1u) << 16) | (static_cast<uint64_t>(1u) << 48));
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (16ull << 0) | (1ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kTag = 0x00026000u;
+            constexpr uint32_t kImage = 0x00027000u;
+            constexpr uint32_t kImageQwc = 4u;
+
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kTag, 0, 64u);
+            for (uint32_t i = 0; i < kImageQwc * 16u; ++i)
+                rdram[kImage + i] = static_cast<uint8_t>(0x10u + i);
+            // Read as a VIFcode the image's last word would be MARK 0x1234.
+            const uint32_t markCmd = makeVifCmd(0x07u, 0u, 0x1234u);
+            std::memcpy(rdram + kImage + kImageQwc * 16u - 4u, &markCmd, sizeof(markCmd));
+
+            writeDmaTag(rdram, kTag, makeDmaTag(1u, 1u, 0u, false)); // CNT: the IMAGE tag
+            const uint32_t directTag = makeVifCmd(0x50u, 0u, 1u);
+            std::memcpy(rdram + kTag + 12u, &directTag, sizeof(directTag));
+            writeU64(rdram, kTag + 16u, makeGifTag(static_cast<uint16_t>(kImageQwc), GIF_FMT_IMAGE, 0u, true));
+            writeU64(rdram, kTag + 24u, 0ull);
+
+            writeDmaTag(rdram, kTag + 32u, makeDmaTag(static_cast<uint16_t>(kImageQwc), 3u, kImage, false)); // REF: its data
+            const uint32_t directImage = makeVifCmd(0x50u, 0u, static_cast<uint16_t>(kImageQwc));
+            std::memcpy(rdram + kTag + 32u + 12u, &directImage, sizeof(directImage));
+
+            writeDmaTag(rdram, kTag + 48u, makeDmaTag(0u, 7u, 0u, false)); // END
+            const uint32_t itopCmd = makeVifCmd(0x04u, 0u, 0x123u);
+            std::memcpy(rdram + kTag + 48u + 12u, &itopCmd, sizeof(itopCmd));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kTag), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x144u),
+                     "write VIF1 CHCR STR|CHAIN|TTE should succeed");
+            mem.processPendingTransfers();
+
+            const uint8_t *vramOut = mem.getGSVRAM();
+            bool imageOk = true;
+            for (uint32_t x = 0; x < 16u && imageOk; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
+                imageOk = std::memcmp(vramOut + off, rdram + kImage + x * 4u, 4u) == 0;
+            }
+            t.IsTrue(imageOk, "the image should arrive whole and where it starts");
+            t.Equals(mem.vif1_regs.mark, 0u, "the end of the image should not run as VIFcodes");
+            t.Equals(mem.vif1_regs.itops, 0x123u, "the VIFcode after the image should be read as one");
+        });
+
+        tc.Run("VIF1 DIRECT cut short by the end of a transfer goes on in the next", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            GS gs;
+            gs.init(mem.getGSVRAM(), static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &mem.gs());
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gs.processGIFPacket(data, sizeBytes);
+            });
+            mem.setGifArbiter(&arbiter);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(1u) << 16) | (static_cast<uint64_t>(1u) << 48));
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, (16ull << 0) | (1ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            std::vector<uint8_t> first;
+            appendU32(first, makeVifCmd(0x50u, 0u, 5u)); // DIRECT: the tag and four qwords of image
+            appendU64(first, makeGifTag(4u, GIF_FMT_IMAGE, 0u, true));
+            appendU64(first, 0ull);
+            for (uint32_t i = 0; i < 32u; ++i)
+                first.push_back(static_cast<uint8_t>(0x40u + i));
+
+            std::vector<uint8_t> second;
+            for (uint32_t i = 32u; i < 64u; ++i)
+                second.push_back(static_cast<uint8_t>(0x40u + i));
+            appendU32(second, makeVifCmd(0x04u, 0u, 0x77u)); // ITOP
+
+            mem.processVIF1Data(first.data(), static_cast<uint32_t>(first.size()));
+            mem.processVIF1Data(second.data(), static_cast<uint32_t>(second.size()));
+
+            const uint8_t *vramOut = mem.getGSVRAM();
+            bool imageOk = true;
+            for (uint32_t x = 0; x < 16u && imageOk; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, x, 0u);
+                for (uint32_t c = 0; c < 4u; ++c)
+                    imageOk = imageOk && vramOut[off + c] == static_cast<uint8_t>(0x40u + x * 4u + c);
+            }
+            t.IsTrue(imageOk, "the second transfer should start with the rest of the image");
+            t.Equals(mem.vif1_regs.itops, 0x77u, "the VIFcode after the image should be read as one");
         });
 
         tc.Run("unaligned accesses throw", [](TestCase &t)
