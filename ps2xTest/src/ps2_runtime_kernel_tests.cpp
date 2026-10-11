@@ -1079,6 +1079,37 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(setupSp & 0xFu, 0u, "SetupThread should always return a 16-byte aligned stack pointer");
         });
 
+        tc.Run("SetupThread hands the program its boot path as argv[0]", [](TestCase &t)
+        {
+            TestEnv env;
+            constexpr uint32_t kArgsAddr = 0x00200000u;
+            const PS2Runtime::IoPaths oldPaths = PS2Runtime::getIoPaths();
+            PS2Runtime::IoPaths paths = oldPaths;
+            paths.elfPath = std::filesystem::path("game") / "slus_123.45";
+            PS2Runtime::setIoPaths(paths);
+
+            env.ctx.pc = 0x00100000u;
+            setRegU32(env.ctx, 29, PS2_RAM_SIZE - 0x10u);
+            setRegU32(env.ctx, 4, 0x0036A7F0u);
+            setRegU32(env.ctx, 5, 0xFFFFFFFFu);
+            setRegU32(env.ctx, 6, 0x00020000u);
+            setRegU32(env.ctx, 7, kArgsAddr);
+            t.IsTrue(callSyscall(0x3Cu, env.rdram.data(), &env.ctx, &env.runtime),
+                     "SetupThread syscall should dispatch");
+            PS2Runtime::setIoPaths(oldPaths);
+
+            // argc, sixteen argv pointers, then the strings.
+            uint32_t argc = 0u, argv0 = 0u, argv1 = 1u;
+            std::memcpy(&argc, env.rdram.data() + kArgsAddr, sizeof(argc));
+            std::memcpy(&argv0, env.rdram.data() + kArgsAddr + 4u, sizeof(argv0));
+            std::memcpy(&argv1, env.rdram.data() + kArgsAddr + 8u, sizeof(argv1));
+            t.Equals(argc, 1u, "a program started from a disc has one argument");
+            t.Equals(argv0, kArgsAddr + 0x44u, "argv[0] should point at the strings behind the pointers");
+            t.Equals(argv1, 0u, "argv[1] should stay null");
+            const std::string bootPath(reinterpret_cast<const char *>(env.rdram.data() + kArgsAddr + 0x44u));
+            t.IsTrue(bootPath == "cdrom0:\\SLUS_123.45;1", "argv[0] should be the disc path of the ELF, as in SYSTEM.CNF");
+        });
+
         tc.Run("SetupThread exposes stable main stack metadata through ReferThreadStatus", [](TestCase &t)
         {
             TestEnv env;
