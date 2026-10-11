@@ -177,6 +177,12 @@ namespace
             row.label = "Aspect Ratio";
             row.description = "The shape of the picture.";
             row.choices = {{"4:3", "4:3"}, {"16:9", "16:9"}, {"16:10", "16:10"}, {"21:9", "21:9"}};
+            row.apply = [](const std::string &)
+            {
+                float across = 0.0f, up = 0.0f;
+                if (ps2x::settingPair("PS2X_ASPECT", "display.aspect", across, up))
+                    ps2x::setPresentationAspect(across / up);
+            };
             rows.push_back(std::move(row));
         }
         {
@@ -208,6 +214,7 @@ namespace
             row.label = "Scaling";
             row.description = "How the picture is scaled up to the window: smooth, or with its pixels sharp.";
             row.choices = {{"linear", "Smooth"}, {"nearest", "Sharp"}};
+            row.apply = [](const std::string &value) { ps2x::setDisplayFilter(value != "nearest"); };
             rows.push_back(std::move(row));
         }
         {
