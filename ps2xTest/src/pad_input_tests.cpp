@@ -516,6 +516,75 @@ void register_pad_input_tests()
             t.IsTrue(std::string(reinterpret_cast<const char *>(rdram.data() + kPadDataAddr + 128)).find("BUSY") != std::string::npos,
                      "req state 1 should map to BUSY");
         });
+        tc.Run("libpad2 socket reads a DualShock 2 in wire order", [](TestCase &t)
+               {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+            R5900Context ctx;
+            constexpr uint32_t kParamAddr = 0x2000u;
+            constexpr uint32_t kWorkAddr = 0x3000u; // 64-byte aligned
+            constexpr uint32_t kStateAddr = 0x4000u;
+
+            ps2_stubs::sceDbcInit(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "sceDbcInit should succeed");
+            setRegU32(ctx, 4, 0u);
+            ps2_stubs::scePad2Init(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePad2Init should succeed");
+
+            setRegU32(ctx, 4, 0u);
+            ps2_stubs::scePad2GetState(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "a socket that was never created has no link");
+
+            // scePad2SocketParam { option, port, slot, number, name[16] }
+            const uint32_t param[4] = {2u, 0u, 0u, 0u};
+            std::memcpy(rdram.data() + kParamAddr, param, sizeof(param));
+
+            setRegU32(ctx, 4, kParamAddr);
+            setRegU32(ctx, 5, kWorkAddr + 4u);
+            ps2_stubs::scePad2CreateSocket(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<int32_t>(getRegU32(&ctx, 2)), static_cast<int32_t>(-1), "a work area that is not 64-byte aligned is refused");
+
+            setRegU32(ctx, 4, kParamAddr);
+            setRegU32(ctx, 5, kWorkAddr);
+            ps2_stubs::scePad2CreateSocket(rdram.data(), &ctx, nullptr);
+            const uint32_t socket = getRegU32(&ctx, 2);
+            t.IsTrue(static_cast<int32_t>(socket) >= 0, "scePad2CreateSocket should return a socket");
+
+            setRegU32(ctx, 4, socket);
+            ps2_stubs::scePad2GetState(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "an open socket is stable");
+
+            const uint16_t pressed = static_cast<uint16_t>(0xFFFFu & ~kPadBtnCross & ~kPadBtnStart & ~kPadBtnR1 & ~kPadBtnL2);
+            ps2_stubs::setPadOverrideState(pressed, 0x11, 0x22, 0x33, 0x44);
+            std::memset(rdram.data() + kStateAddr, 0xAA, 32);
+            setRegU32(ctx, 4, socket);
+            setRegU32(ctx, 5, kStateAddr);
+            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            ps2_stubs::clearPadOverrideState();
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(18), "scePad2Read should return the 18 bytes of a DualShock 2");
+
+            const uint8_t *data = rdram.data() + kStateAddr;
+            t.Equals(static_cast<uint32_t>(data[0] | (data[1] << 8)), static_cast<uint32_t>(pressed), "switches come first, active low");
+            t.Equals(data[2], static_cast<uint8_t>(0x33), "right stick x");
+            t.Equals(data[3], static_cast<uint8_t>(0x44), "right stick y");
+            t.Equals(data[4], static_cast<uint8_t>(0x11), "left stick x");
+            t.Equals(data[5], static_cast<uint8_t>(0x22), "left stick y");
+            t.Equals(data[12], static_cast<uint8_t>(0xFF), "cross pressure");
+            t.Equals(data[13], static_cast<uint8_t>(0x00), "square pressure");
+            t.Equals(data[14], static_cast<uint8_t>(0x00), "L1 pressure");
+            t.Equals(data[15], static_cast<uint8_t>(0xFF), "R1 pressure");
+            t.Equals(data[16], static_cast<uint8_t>(0xFF), "L2 pressure");
+            t.Equals(data[17], static_cast<uint8_t>(0x00), "R2 pressure");
+            t.Equals(data[18], static_cast<uint8_t>(0xAA), "nothing is written past the 18 bytes");
+
+            setRegU32(ctx, 4, socket);
+            ps2_stubs::scePad2DeleteSocket(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePad2DeleteSocket should succeed");
+            setRegU32(ctx, 4, socket);
+            setRegU32(ctx, 5, kStateAddr);
+            ps2_stubs::scePad2Read(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<int32_t>(getRegU32(&ctx, 2)), static_cast<int32_t>(-1), "a deleted socket cannot be read");
+        });
+
         tc.Run("scePadGetFrameCount increments", [](TestCase &t)
                {
             R5900Context ctx;
