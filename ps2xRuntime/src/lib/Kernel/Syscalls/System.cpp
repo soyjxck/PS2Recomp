@@ -468,10 +468,49 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    namespace
+    {
+        // What the kernel leaves in the block a program's crt0 hands to
+        // SetupThread, and crt0 then passes to main: argc, sixteen argv
+        // pointers and 256 bytes for the strings they point at. A program
+        // started from a disc has one argument, the path of SYSTEM.CNF's
+        // BOOT2 line ("cdrom0:\SLUS_123.45;1"), and games tell from it
+        // whether they run off the disc or off a development host.
+        void writeBootArguments(uint8_t *rdram, uint32_t argsAddr)
+        {
+            constexpr uint32_t kMaxArguments = 16u;
+            constexpr uint32_t kPayloadOffset = 4u + kMaxArguments * 4u;
+            constexpr size_t kPayloadSize = 256u;
+
+            uint8_t *args = argsAddr != 0u ? getMemPtr(rdram, argsAddr) : nullptr;
+            std::string name = PS2Runtime::getIoPaths().elfPath.filename().string();
+            if (!args || name.empty())
+            {
+                return;
+            }
+            for (char &character : name)
+            {
+                character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+            }
+            const std::string bootPath = "cdrom0:\\" + name + ";1";
+            if (bootPath.size() + 1u > kPayloadSize)
+            {
+                return;
+            }
+
+            const uint32_t argc = 1u;
+            const uint32_t argv0 = argsAddr + kPayloadOffset;
+            std::memcpy(args, &argc, sizeof(argc));
+            std::memcpy(args + 4, &argv0, sizeof(argv0));
+            std::memcpy(args + kPayloadOffset, bootPath.c_str(), bootPath.size() + 1u);
+        }
+    }
+
     // 0x3C SetupThread
     // args: $a0 = gp, $a1 = stack, $a2 = stack_size, $a3 = args, $t0 = root_func
     void SetupThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        writeBootArguments(rdram, getRegU32(ctx, 7));
         const uint32_t gp = getRegU32(ctx, 4);
         const uint32_t stack = getRegU32(ctx, 5);
         const int32_t stackSizeSigned = static_cast<int32_t>(getRegU32(ctx, 6));
