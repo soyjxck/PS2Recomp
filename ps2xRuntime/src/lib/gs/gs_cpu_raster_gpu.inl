@@ -806,7 +806,14 @@ void GSCpuBackend::GpuTextureFromVram(FastPipeline &p, GSGpu::Pipeline &state)
     uint64_t key = mixKey(ConversionKey(p), (static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm);
     key = mixKey(key, (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
     GpuState::Texture &texture = gpu.textures[key];
-    bool good = texture.id != 0u && texture.x0 <= x0 && texture.y0 <= y0 && texture.x1 >= x1 && texture.y1 >= y1 &&
+    // The copy has what is wanted if it reaches as far each way, or holds
+    // the whole of that axis: a window that starts below 0 is inside a
+    // whole texture, whatever its numbers say.
+    const auto holds = [](int held0, int held1, int want0, int want1, int size)
+    {
+        return (held0 <= want0 && held1 >= want1) || (held0 == 0 && held1 == size - 1);
+    };
+    bool good = texture.id != 0u && holds(texture.x0, texture.x1, x0, x1, p.texW) && holds(texture.y0, texture.y1, y0, y1, p.texH) &&
                 !changedSince(texture);
     if (good)
         texture.checkedUpload = m_lastUploadSerial;
