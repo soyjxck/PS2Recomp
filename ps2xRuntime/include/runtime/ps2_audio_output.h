@@ -13,7 +13,8 @@
 // percent at most) to keep it about half full.
 namespace ps2x::audio
 {
-    // Between InitAudioDevice() and CloseAudioDevice().
+    // Between InitAudioDevice() and CloseAudioDevice(). An unpaced run
+    // (PS2X_TURBO) is not played, only dumped if that is asked for.
     void startOutput();
     void stopOutput();
 

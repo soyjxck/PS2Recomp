@@ -148,7 +148,10 @@ namespace ps2x::audio
                 writeDumpHeader(kOpenDumpBytes);
         }
 #if !defined(PLATFORM_VITA)
-        if (g_started.load() || !IsAudioDeviceReady())
+        // An unpaced run (PS2X_TURBO) makes sound faster than it can be
+        // played: it is not, and the dump has all of it.
+        const char *turbo = std::getenv("PS2X_TURBO");
+        if (g_started.load() || !IsAudioDeviceReady() || (turbo && turbo[0] != '\0' && turbo[0] != '0'))
             return;
         g_stream = LoadAudioStream(kSampleRate, 16, 2);
         if (!IsAudioStreamValid(g_stream))
