@@ -179,6 +179,8 @@ namespace
     std::atomic<uint32_t> gMpegStreamCallbackDataAddr{0u};
     std::atomic<uint32_t> gMpegStreamCallbackLen{0u};
     std::atomic<uint32_t> gMpegStreamCallbackUserData{0u};
+    std::atomic<uint64_t> gMpegStreamCallbackBytes{0u};  // the first eight of the data
+    std::atomic<uint32_t> gMpegStreamCallbackAnswer{1u}; // what the callback returns
     constexpr uint32_t kMpegCallbackStopPc = 0x00124FF0u;
     std::atomic<int32_t> gMpegWaitResult{-999};
     std::atomic<uint32_t> gMpegWaitStage{0u};
@@ -284,7 +286,7 @@ namespace
         ctx->pc = 0u;
     }
 
-    void testRecordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    void recordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx)
     {
         if (!rdram || !ctx)
         {
@@ -304,9 +306,25 @@ namespace
         gMpegStreamCallbackDataAddr.store(dataAddr, std::memory_order_release);
         gMpegStreamCallbackLen.store(len, std::memory_order_release);
         gMpegStreamCallbackUserData.store(::getRegU32(ctx, 6), std::memory_order_release);
+        uint64_t bytes = 0u;
+        std::memcpy(&bytes, rdram + dataAddr, std::min<size_t>(len, sizeof(bytes)));
+        gMpegStreamCallbackBytes.store(bytes, std::memory_order_release);
         gMpegStreamCallbackCount.fetch_add(1u, std::memory_order_acq_rel);
+        setRegU32(*ctx, 2, gMpegStreamCallbackAnswer.load(std::memory_order_acquire));
         ctx->pc = 0u;
+    }
+
+    void testRecordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        recordMpegStreamCallback(rdram, ctx);
         runtime->requestStop();
+    }
+
+    // The same, returning to the library as a game's callback does: the
+    // run ends in testStopAfterMpegCallback, once the answer has been read.
+    void testAnswerMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        recordMpegStreamCallback(rdram, ctx);
     }
 
 }
@@ -660,8 +678,8 @@ void register_ps2_runtime_expansion_tests()
                      "registered audio stream callback should be invoked");
             t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 2u,
                      "audio callback data should report PCM stream type");
-            t.Equals(gMpegStreamCallbackDataAddr.load(std::memory_order_acquire), kAudioPacketAddr + 9u,
-                     "audio callback data should point at PES payload");
+            t.Equals(gMpegStreamCallbackBytes.load(std::memory_order_acquire), 0x050403020180ull,
+                     "audio callback data should point at a copy of the PES payload");
             t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire),
                      static_cast<uint32_t>(audioPayload.size()),
                      "audio callback data should report PES payload length");
@@ -742,6 +760,90 @@ void register_ps2_runtime_expansion_tests()
 
             t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
                      "new MPEG create should allow callbacks for the next stream");
+
+            runtime.requestStop();
+        });
+
+        tc.Run("a sound packet the game has no room for is offered again until it is taken", [](TestCase &t)
+        {
+            // A game's sound callback answers 0 while its own buffer is
+            // full, and the library keeps the packet for it. (Drakengard's
+            // holds a quarter of a second of a movie's sound; packets it
+            // could not take used to be gone, and the rest out of step.)
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+            runtime.registerFunction(kCallbackEntry, &testAnswerMpegStreamCallback);
+            runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
+            auto prepareCallbackDispatch = [&]()
+            {
+                R5900Context idleContext{};
+                idleContext.pc = kMpegCallbackStopPc;
+                runtime.eeScheduler().reset(rdram.data(), idleContext);
+            };
+            // One call of the kind a game makes while a movie plays, during
+            // the given vertical blank.
+            auto askIsEnd = [&](uint64_t vblank)
+            {
+                prepareCallbackDispatch();
+                runtime.memory().gs().vsyncTick.store(vblank, std::memory_order_release);
+                R5900Context isEndCtx{};
+                setRegU32(isEndCtx, 4, kMpegAddr);
+                ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, &runtime);
+                runtime.eeScheduler().run();
+            };
+
+            R5900Context addCtx{};
+            setRegU32(addCtx, 4, kMpegAddr);
+            setRegU32(addCtx, 5, 2u);
+            setRegU32(addCtx, 6, 0u);
+            setRegU32(addCtx, 7, kCallbackEntry);
+            setRegU32(addCtx, 8, 0x55667788u);
+            ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+
+            const std::vector<uint8_t> packet = {
+                0x00u, 0x00u, 0x01u, 0xBDu, 0x00u, 0x09u, 0x80u, 0x00u, 0x00u,
+                0xFFu, 0xA0u, 0x00u, 0x00u, 0x34u, 0x12u};
+            std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+            gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+            gMpegStreamCallbackAnswer.store(0u, std::memory_order_release);
+            prepareCallbackDispatch();
+            R5900Context demuxCtx{};
+            setRegU32(demuxCtx, 4, kMpegAddr);
+            setRegU32(demuxCtx, 5, kPacketAddr);
+            setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+            ps2_stubs::sceMpegDemuxPss(rdram.data(), &demuxCtx, &runtime);
+            runtime.eeScheduler().run();
+            t.Equals(getRegS32(demuxCtx, 2), static_cast<int32_t>(packet.size()),
+                     "the packet should be consumed from the game's buffer whether or not it has room for the sound");
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "the sound should be offered once");
+
+            // The game's buffer is used for something else meanwhile.
+            std::memset(rdram.data() + kPacketAddr, 0xEEu, packet.size());
+            askIsEnd(0u);
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 1u,
+                     "a packet that was not taken should not be offered again in the same vertical blank");
+            askIsEnd(1u);
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 2u,
+                     "but in the next one");
+            t.Equals(gMpegStreamCallbackBytes.load(std::memory_order_acquire), 0x12340000A0FFull,
+                     "with its own bytes, not what the game's buffer holds by then");
+            t.Equals(gMpegStreamCallbackLen.load(std::memory_order_acquire), 6u,
+                     "and its own length");
+
+            gMpegStreamCallbackAnswer.store(1u, std::memory_order_release);
+            askIsEnd(2u);
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 3u,
+                     "and again, until the game takes it");
+            askIsEnd(3u);
+            t.Equals(gMpegStreamCallbackCount.load(std::memory_order_acquire), 3u,
+                     "a packet that was taken should not be offered again");
 
             runtime.requestStop();
         });

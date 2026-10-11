@@ -17,6 +17,7 @@ extern "C"
 #endif
 
 #include <deque>
+#include <optional>
 #include <memory>
 
 #include "Syscalls/Helpers/State.h"
@@ -484,6 +485,14 @@ namespace ps2_stubs
         constexpr size_t kMpegTimingScanLimit = 4096u;
         constexpr size_t kMaxDecodedPicturesAhead = 8u;
 
+        // A packet of a movie's sound, as the stream carries it.
+        struct MpegAudioPacket
+        {
+            std::vector<uint8_t> bytes;
+            int64_t pts90k = -1;
+            int64_t dts90k = -1;
+        };
+
         struct MpegPlaybackState
         {
             uint32_t picturesServed = 0u;
@@ -512,6 +521,11 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // Sound the game has not taken yet (offerAudio).
+            std::deque<MpegAudioPacket> audioPackets;
+            size_t audioPacketBytes = 0u;
+            uint64_t audioOffer = 0u; // the offer the game is looking at, or 0
+            uint64_t audioRefusedTick = std::numeric_limits<uint64_t>::max(); // the vertical blank of its last "no room"
         };
 
         struct MpegStreamCallbackEvent
@@ -542,6 +556,7 @@ namespace ps2_stubs
             uint32_t isEndTraceCount = 0u;
             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
+            uint64_t audioOffers = 0u;
         };
 
         std::mutex g_mpeg_stub_mutex;
@@ -1152,6 +1167,44 @@ namespace ps2_stubs
             return out;
         }
 
+        // The callback a game's sound goes to: the one it registered for
+        // PCM, else the others these packets have been given to.
+        std::optional<MpegRegisteredCallback> audioCallback(uint32_t mpegAddr)
+        {
+            const auto registered = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (registered == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return std::nullopt;
+            }
+            for (const uint32_t type : {kMpegStrADPCM, kMpegStrPCM})
+            {
+                for (const MpegRegisteredCallback &callback : registered->second)
+                {
+                    if (callback.stream && callback.type == type && callback.func != 0u)
+                    {
+                        return callback;
+                    }
+                }
+            }
+            return std::nullopt;
+        }
+
+        void keepAudioPacket(MpegPlaybackState &playback, const uint8_t *bytes, size_t size, int64_t pts90k, int64_t dts90k)
+        {
+            // A game that stops taking its sound does not get to keep all of
+            // a movie's: the oldest goes first.
+            constexpr size_t kMostAudioBytes = 8u * 1024u * 1024u;
+            while (!playback.audioPackets.empty() && playback.audioPacketBytes + size > kMostAudioBytes &&
+                   !(playback.audioOffer != 0u && playback.audioPackets.size() == 1u))
+            {
+                const auto oldest = playback.audioPackets.begin() + (playback.audioOffer != 0u ? 1 : 0);
+                playback.audioPacketBytes -= oldest->bytes.size();
+                playback.audioPackets.erase(oldest);
+            }
+            playback.audioPackets.push_back(MpegAudioPacket{std::vector<uint8_t>(bytes, bytes + size), pts90k, dts90k});
+            playback.audioPacketBytes += size;
+        }
+
         void queueStreamCallbackEvent(uint32_t mpegAddr,
                                       uint32_t streamType,
                                       uint32_t dataAddr,
@@ -1345,24 +1398,9 @@ namespace ps2_stubs
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
                     const size_t payloadStart = pes.payloadOffset;
-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                    if (payloadStart < packetEnd && audioCallback(mpegAddr))
                     {
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents,
-                            pes.pts90k,
-                            pes.dts90k);
+                        keepAudioPacket(playback, buffer.data() + payloadStart, packetEnd - payloadStart, pes.pts90k, pes.dts90k);
                     }
                 }
 
@@ -1618,6 +1656,125 @@ namespace ps2_stubs
             invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
             {
                 runtime->guestFree(cbDataAddr);
+            };
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+        }
+
+        // A movie's sound goes to the game through the callback it
+        // registered for it, and the game takes a packet only when it has
+        // room for it: its callback answers 0 otherwise, and the library
+        // offers the same packet again later. (Drakengard's holds a quarter
+        // of a second, and a movie is read well ahead of that.) So the
+        // packets wait here in the order they came (keepAudioPacket) and are
+        // offered one at a time, the next as soon as one is taken, from the
+        // calls a game makes while a movie plays; after a "no room", not
+        // again before the next vertical blank (a game asks sceMpegIsEnd
+        // and the like many times a frame, and its buffer empties once).
+        // Each offer is a copy of its own, in guest memory: the game's read
+        // buffer has long since been filled with something else.
+        void offerAudio(uint8_t *rdram, const R5900Context &caller, PS2Runtime *runtime, uint32_t mpegAddr)
+        {
+            if (!rdram || !runtime)
+            {
+                return;
+            }
+
+            MpegRegisteredCallback callback;
+            MpegStreamCallbackEvent event{};
+            std::vector<uint8_t> bytes;
+            uint64_t offer = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                const auto found = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+                if (found == g_mpeg_stub_state.playbackByMpeg.end())
+                {
+                    return;
+                }
+                MpegPlaybackState &playback = found->second;
+                if (playback.audioOffer != 0u || playback.audioPackets.empty() ||
+                    playback.audioRefusedTick == runtime->memory().gs().vsyncTick.load(std::memory_order_acquire))
+                {
+                    return;
+                }
+                const std::optional<MpegRegisteredCallback> registered = audioCallback(mpegAddr);
+                if (!registered || !runtime->hasFunction(registered->func))
+                {
+                    playback.audioPackets.clear();
+                    playback.audioPacketBytes = 0u;
+                    return;
+                }
+                callback = *registered;
+                const MpegAudioPacket &packet = playback.audioPackets.front();
+                bytes = packet.bytes;
+                event.mpegAddr = mpegAddr;
+                event.streamType = callback.type;
+                event.len = static_cast<uint32_t>(bytes.size());
+                event.pts = packet.pts90k >= 0 ? static_cast<uint64_t>(packet.pts90k) : 0xFFFFFFFFFFFFFFFFull;
+                event.dts = packet.dts90k >= 0 ? static_cast<uint64_t>(packet.dts90k) : 0xFFFFFFFFFFFFFFFFull;
+                offer = playback.audioOffer = ++g_mpeg_stub_state.audioOffers;
+            }
+
+            // The callback's data, then the packet.
+            const uint32_t block = runtime->guestMalloc(kMpegCallbackDataSize + event.len, 16u);
+            uint8_t *packetAt = block != 0u ? getMemPtr(rdram, block + kMpegCallbackDataSize) : nullptr;
+            event.dataAddr = block + kMpegCallbackDataSize;
+            if (!packetAt || !writeMpegCallbackData(rdram, block, event))
+            {
+                if (block != 0u)
+                {
+                    runtime->guestFree(block);
+                }
+                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                const auto found = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+                if (found != g_mpeg_stub_state.playbackByMpeg.end() && found->second.audioOffer == offer)
+                {
+                    found->second.audioOffer = 0u;
+                }
+                return;
+            }
+            std::memcpy(packetAt, bytes.data(), bytes.size());
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.context = caller;
+            SET_GPR_U32(&invocation.context, 4, mpegAddr);
+            SET_GPR_U32(&invocation.context, 5, block);
+            SET_GPR_U32(&invocation.context, 6, callback.data);
+            SET_GPR_U32(&invocation.context, 7, 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.context.pc = callback.func;
+            invocation.onComplete = [rdram, runtime, block, mpegAddr, offer](const R5900Context &finished, R5900Context &)
+            {
+                R5900Context answer = finished;
+                const bool taken = getRegU32(&answer, 2) != 0u;
+                runtime->guestFree(block);
+                bool more = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    const auto found = g_mpeg_stub_state.playbackByMpeg.find(mpegAddr);
+                    // (A movie that was reset meanwhile has forgotten the offer.)
+                    if (found == g_mpeg_stub_state.playbackByMpeg.end() || found->second.audioOffer != offer)
+                    {
+                        return;
+                    }
+                    MpegPlaybackState &playback = found->second;
+                    playback.audioOffer = 0u;
+                    if (!taken)
+                    {
+                        playback.audioRefusedTick = runtime->memory().gs().vsyncTick.load(std::memory_order_acquire);
+                    }
+                    else if (!playback.audioPackets.empty())
+                    {
+                        playback.audioPacketBytes -= playback.audioPackets.front().bytes.size();
+                        playback.audioPackets.pop_front();
+                        more = !playback.audioPackets.empty();
+                    }
+                }
+                if (more)
+                {
+                    offerAudio(rdram, answer, runtime, mpegAddr);
+                }
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
@@ -2114,6 +2271,7 @@ namespace ps2_stubs
                     std::cerr << "[MPEG:DemuxPss:BACKPRESSURE] mpeg=0x" << std::hex << mpegAddr << std::dec << " decoded=" << decodedCount << std::endl;
                 });
             }
+            offerAudio(rdram, *ctx, runtime, mpegAddr);
             setReturnS32(ctx, 0);
             return;
         }
@@ -2144,6 +2302,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        offerAudio(rdram, *ctx, runtime, mpegAddr);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
@@ -2207,6 +2366,7 @@ namespace ps2_stubs
                               << " avail=" << availableBytes << std::endl;
                 });
             }
+            offerAudio(rdram, *ctx, runtime, mpegAddr);
             setReturnS32(ctx, 0);
             return;
         }
@@ -2238,6 +2398,7 @@ namespace ps2_stubs
         }
 
         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+        offerAudio(rdram, *ctx, runtime, mpegAddr);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
     }
 
@@ -2291,6 +2452,7 @@ namespace ps2_stubs
         uint32_t frameCount = 0u;
         bool haveFrame = false;
         MpegDecodedFrame frame;
+        offerAudio(rdram, *ctx, runtime, mpegAddr);
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
@@ -2451,8 +2613,8 @@ namespace ps2_stubs
 
     void sceMpegIsEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        offerAudio(rdram, *ctx, runtime, mpegAddr);
 
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
