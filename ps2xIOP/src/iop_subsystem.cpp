@@ -191,6 +191,17 @@ namespace ps2x::iop
         {
             return true;
         }
+        if (m_impl->emulator.hasRpcServer(sid))
+        {
+            return true;
+        }
+
+        // A bind request crosses the SIF, and the IOP takes it up after what
+        // it was already doing: a module that has just been started gets its
+        // server thread as far as sceSifRegisterRpc first. Not every game
+        // asks again when the first answer is "no such server".
+        constexpr uint64_t kBindSettleCycles = 200'000u; // about 5 ms of IOP time
+        m_impl->emulator.runUntilIdle(kBindSettleCycles);
         return m_impl->emulator.hasRpcServer(sid);
     }
 

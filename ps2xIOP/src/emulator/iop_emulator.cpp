@@ -649,6 +649,32 @@ namespace ps2x::iop::detail
             }
         }
 
+        void runUntilIdle(uint64_t maxCycles) noexcept
+        {
+            try
+            {
+                const uint64_t limit = totalCycles + maxCycles;
+                while (totalCycles < limit)
+                {
+                    servicePendingDmaInterrupts();
+                    servicePendingGuestCallbacks();
+                    timrman.serviceDue(totalCycles, *this);
+                    IopThread *next = kernel.beginNextReady(totalCycles);
+                    if (!next)
+                        break;
+                    const uint64_t before = totalCycles;
+                    runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, limit - totalCycles)));
+                    kernel.endTimeslice(*next, kThreadReturnSentinel);
+                    if (totalCycles == before)
+                        ++totalCycles;
+                }
+            }
+            catch (...)
+            {
+                // As runCycles(): never throw into the EE's side of the transport.
+            }
+        }
+
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
@@ -813,6 +839,12 @@ namespace ps2x::iop::detail
         m_impl->eeCycleCarry += eeCycles;
         if (m_impl->eeCycleCarry >= Impl::kEeCycleBatch)
             m_impl->flushEeCycles();
+    }
+
+    void IopEmulator::runUntilIdle(uint64_t maxCycles) noexcept
+    {
+        m_impl->flushEeCycles();
+        m_impl->runUntilIdle(maxCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
