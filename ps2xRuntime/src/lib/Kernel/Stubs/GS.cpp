@@ -578,7 +578,7 @@ namespace ps2_stubs
         uint32_t srcAddr = getRegU32(ctx, 5);
 
         GsImageMem img{};
-        if (!runtime || !runtime->syncCoreSubsystems() || !readGsImage(rdram, imgAddr, img))
+        if (!runtime || !runtime->syncCoreSubsystems() || !readGsLoadImage(rdram, imgAddr, img))
         {
             setReturnS32(ctx, -1);
             return;
@@ -1110,27 +1110,49 @@ namespace ps2_stubs
         setReturnS32(ctx, 8);
     }
 
+    namespace
+    {
+        GsImageMem gsImageFromSetDefArgs(uint8_t *rdram, R5900Context *ctx)
+        {
+            const GsSetDefImageArgs args = decodeGsSetDefImageArgs(rdram, ctx);
+
+            GsImageMem img{};
+            img.x = static_cast<uint16_t>(args.x);
+            img.y = static_cast<uint16_t>(args.y);
+            img.width = static_cast<uint16_t>(args.width);
+            img.height = static_cast<uint16_t>(args.height);
+            img.vram_addr = static_cast<uint16_t>(args.vramAddr);
+            img.vram_width = static_cast<uint8_t>(args.vramWidth);
+            img.psm = static_cast<uint8_t>(args.psm);
+            return img;
+        }
+    }
+
     void sceGsSetDefLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t imgAddr = getRegU32(ctx, 4);
-        const GsSetDefImageArgs args = decodeGsSetDefImageArgs(rdram, ctx);
+        (void)runtime;
+        const uint32_t imgAddr = getRegU32(ctx, 4);
+        const GsImageMem img = gsImageFromSetDefArgs(rdram, ctx);
 
-        GsImageMem img{};
-        img.x = static_cast<uint16_t>(args.x);
-        img.y = static_cast<uint16_t>(args.y);
-        img.width = static_cast<uint16_t>(args.width);
-        img.height = static_cast<uint16_t>(args.height);
-        img.vram_addr = static_cast<uint16_t>(args.vramAddr);
-        img.vram_width = static_cast<uint8_t>(args.vramWidth);
-        img.psm = static_cast<uint8_t>(args.psm);
-
-        writeGsImage(rdram, imgAddr, img);
-        setReturnS32(ctx, 0);
+        // As the library: a transfer longer than an IMAGE tag can count is
+        // refused and the structure left alone; otherwise the answer is
+        // the structure's size in quadwords.
+        const uint32_t imageQwc = gsLoadImageQwc(img.psm, img.width, img.height);
+        if (imageQwc > kGsLoadImageMaxQwc || !writeGsLoadImage(rdram, imgAddr, img, imageQwc))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+        setReturnS32(ctx, static_cast<int32_t>(kGsLoadImageQwc));
     }
 
     void sceGsSetDefStoreImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        sceGsSetDefLoadImage(rdram, ctx, runtime);
+        // sceGsStoreImage only ever goes to sceGsExecStoreImage, which is
+        // ours as well: the two share a form of their own.
+        (void)runtime;
+        writeGsImage(rdram, getRegU32(ctx, 4), gsImageFromSetDefArgs(rdram, ctx));
+        setReturnS32(ctx, 0);
     }
 
     void sceGsSwapDBuffDc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

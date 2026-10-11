@@ -1998,6 +1998,90 @@ namespace
         return true;
     }
 
+    // sceGsLoadImage, the structure sceGsSetDefLoadImage fills, is a GS
+    // packet: a GIF tag for four A+D writes, the values of BITBLTBUF, TRXPOS,
+    // TRXREG and TRXDIR each followed by its register number, and the IMAGE
+    // tag for the data. sceGsExecLoadImage sends it as it is, and so do
+    // programs that put it in a display list of their own (the first five
+    // quadwords in a VIF1 DIRECT, the image by reference after them), which
+    // is why it has to be the real thing in guest memory.
+    constexpr uint32_t kGsLoadImageBytes = 96u;
+    constexpr uint32_t kGsLoadImageQwc = kGsLoadImageBytes / 16u;
+    constexpr uint32_t kGsLoadImageMaxQwc = 0x7FFFu;
+
+    // Quadwords of image data for a transfer, as the library counts them (a
+    // whole number is the caller's business). 0: not a format it transfers.
+    static uint32_t gsLoadImageQwc(uint32_t psm, uint32_t width, uint32_t height)
+    {
+        const uint32_t pixels = width * height;
+        switch (psm)
+        {
+        case 0x00u: // CT32
+        case 0x30u: // Z32
+            return pixels >> 2;
+        case 0x01u: // CT24
+        case 0x31u: // Z24
+            return (pixels * 3u) >> 4;
+        case 0x02u: // CT16
+        case 0x0Au: // CT16S
+        case 0x32u: // Z16
+        case 0x3Au: // Z16S
+            return pixels >> 3;
+        case 0x13u: // T8
+        case 0x1Bu: // T8H
+            return pixels >> 4;
+        case 0x14u: // T4
+        case 0x24u: // T4HL
+        case 0x2Cu: // T4HH
+            return pixels >> 5;
+        default:
+            return 0u;
+        }
+    }
+
+    static bool writeGsLoadImage(uint8_t *rdram, uint32_t addr, const GsImageMem &img, uint32_t imageQwc)
+    {
+        uint8_t *ptr = getMemPtr(rdram, addr);
+        if (!ptr)
+            return false;
+
+        const uint64_t words[kGsLoadImageBytes / 8u] = {
+            0x1000000000000004ull, // GIF tag: NLOOP 4, one register,
+            0x000000000000000Eull, // A+D
+            (static_cast<uint64_t>(img.vram_addr) << 32) | (static_cast<uint64_t>(img.vram_width) << 48) |
+                (static_cast<uint64_t>(img.psm) << 56),
+            0x50ull, // BITBLTBUF
+            (static_cast<uint64_t>(img.x) << 32) | (static_cast<uint64_t>(img.y) << 48),
+            0x51ull, // TRXPOS
+            static_cast<uint64_t>(img.width) | (static_cast<uint64_t>(img.height) << 32),
+            0x52ull, // TRXREG
+            0ull,    // host to local
+            0x53ull, // TRXDIR
+            static_cast<uint64_t>(imageQwc & kGsLoadImageMaxQwc) | 0x8000ull | (2ull << 58), // IMAGE, EOP
+            0ull,
+        };
+        std::memcpy(ptr, words, sizeof(words));
+        return true;
+    }
+
+    static bool readGsLoadImage(uint8_t *rdram, uint32_t addr, GsImageMem &out)
+    {
+        const uint8_t *ptr = getConstMemPtr(rdram, addr);
+        if (!ptr)
+            return false;
+
+        uint64_t words[kGsLoadImageBytes / 8u];
+        std::memcpy(words, ptr, sizeof(words));
+        out.vram_addr = static_cast<uint16_t>((words[2] >> 32) & 0x3FFFu);
+        out.vram_width = static_cast<uint8_t>((words[2] >> 48) & 0x3Fu);
+        out.psm = static_cast<uint8_t>((words[2] >> 56) & 0x3Fu);
+        out.x = static_cast<uint16_t>((words[4] >> 32) & 0x7FFu);
+        out.y = static_cast<uint16_t>((words[4] >> 48) & 0x7FFu);
+        out.width = static_cast<uint16_t>(words[6] & 0xFFFu);
+        out.height = static_cast<uint16_t>((words[6] >> 32) & 0xFFFu);
+        return true;
+    }
+
     // sceGsSetDefDispEnv fills every field of sceGsDispEnv; callers allocate it
     // on the stack, so leaving pmode/smode2/bgcolor alone hands garbage to
     // sceGsPutDispEnv (both read circuits off -> no picture).

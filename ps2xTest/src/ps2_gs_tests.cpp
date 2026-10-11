@@ -4044,12 +4044,60 @@ void register_ps2_gs_tests()
                      "triangle fan quad should light at least one framebuffer row");
         });
 
+        tc.Run("sceGsSetDefLoadImage fills the packet a program can send itself", [](TestCase &t)
+        {
+            // Not every program hands the structure to sceGsExecLoadImage:
+            // some put its first five quadwords in a VIF1 DIRECT of their
+            // display list and the image after them. What is in guest
+            // memory has to be what the library writes there.
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kImageAddr = 0x4000u;
+            std::memset(rdram.data() + kImageAddr, 0xEE, 96u);
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kImageAddr);
+            setRegU32(ctx, 5, 0x3800u); // dbp
+            setRegU32(ctx, 6, 8u);      // dbw
+            setRegU32(ctx, 7, 0x13u);   // T8
+            setRegU32(ctx, 8, 16u);     // x
+            setRegU32(ctx, 9, 32u);     // y
+            setRegU32(ctx, 10, 512u);   // w
+            setRegU32(ctx, 11, 128u);   // h
+            ps2_stubs::sceGsSetDefLoadImage(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 6, "the structure is six quadwords");
+
+            uint64_t words[12];
+            std::memcpy(words, rdram.data() + kImageAddr, sizeof(words));
+            t.Equals(words[0], 0x1000000000000004ull, "GIF tag: four A+D writes, EOP left to the IMAGE tag");
+            t.Equals(words[1], 0x0Eull, "GIF tag registers: A+D");
+            t.Equals(words[2], 0x1308380000000000ull, "BITBLTBUF: DBP, DBW, DPSM");
+            t.Equals(words[3], 0x50ull, "BITBLTBUF's register number");
+            t.Equals(words[4], 0x0020001000000000ull, "TRXPOS: DSAX, DSAY");
+            t.Equals(words[5], 0x51ull, "TRXPOS's register number");
+            t.Equals(words[6], 0x0000008000000200ull, "TRXREG: RRW, RRH");
+            t.Equals(words[7], 0x52ull, "TRXREG's register number");
+            t.Equals(words[8], 0ull, "TRXDIR: host to local");
+            t.Equals(words[9], 0x53ull, "TRXDIR's register number");
+            t.Equals(words[10], 0x0800000000009000ull, "IMAGE tag: 512x128 texels of 8 bits in quadwords, EOP");
+            t.Equals(words[11], 0ull, "IMAGE tag upper half");
+
+            // More than an IMAGE tag counts: refused, nothing written.
+            std::memset(rdram.data() + kImageAddr, 0xEE, 96u);
+            setRegU32(ctx, 7, 0u);      // CT32
+            setRegU32(ctx, 10, 1024u);
+            setRegU32(ctx, 11, 1024u);
+            ps2_stubs::sceGsSetDefLoadImage(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<int32_t>(getRegU32Test(ctx, 2)), 0, "an image too long for one tag is refused");
+            t.Equals(rdram[kImageAddr], static_cast<uint8_t>(0xEEu), "and the structure left alone");
+        });
+
         tc.Run("sceGsExecLoadImage and sceGsExecStoreImage roundtrip and free guest packets", [](TestCase &t)
         {
             PS2Runtime runtime;
             t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
             uint8_t *const rdram = runtime.memory().getRDRAM();
             constexpr uint32_t kImageAddr = 0x4000u;
+            constexpr uint32_t kStoreImageAddr = 0x4100u;
             constexpr uint32_t kSrcAddr = 0x5000u;
             constexpr uint32_t kDstAddr = 0x6000u;
 
@@ -4061,7 +4109,21 @@ void register_ps2_gs_tests()
                 0xD0u, 0xE0u, 0xF0u, 0xFFu,
             };
 
-            writeGsImageTest(rdram, kImageAddr, image);
+            // The load structure is the library's own, a GS packet; the
+            // store one is private to the two store handlers.
+            R5900Context setCtx{};
+            setRegU32(setCtx, 4, kImageAddr);
+            setRegU32(setCtx, 5, 0u);  // dbp
+            setRegU32(setCtx, 6, 1u);  // dbw
+            setRegU32(setCtx, 7, 0u);  // CT32
+            setRegU32(setCtx, 8, 0u);  // x
+            setRegU32(setCtx, 9, 0u);  // y
+            setRegU32(setCtx, 10, 2u); // w
+            setRegU32(setCtx, 11, 2u); // h
+            ps2_stubs::sceGsSetDefLoadImage(rdram, &setCtx, &runtime);
+            t.Equals(static_cast<int32_t>(getRegU32Test(setCtx, 2)), 6,
+                     "sceGsSetDefLoadImage should answer the structure's six quadwords");
+            writeGsImageTest(rdram, kStoreImageAddr, image);
             std::memcpy(rdram + kSrcAddr, pixels, sizeof(pixels));
 
             R5900Context loadCtx{};
@@ -4090,7 +4152,7 @@ void register_ps2_gs_tests()
                                     "sceGsExecLoadImage should free its temporary GIF packet");
 
             R5900Context storeCtx{};
-            setRegU32(storeCtx, 4, kImageAddr);
+            setRegU32(storeCtx, 4, kStoreImageAddr);
             setRegU32(storeCtx, 5, kDstAddr);
             ps2_stubs::sceGsExecStoreImage(rdram, &storeCtx, &runtime);
             t.Equals(static_cast<int32_t>(getRegU32Test(storeCtx, 2)), 0,
