@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 namespace
 {
@@ -42,6 +43,9 @@ namespace
     std::atomic<uint32_t> g_levelNow{0};
     bool g_stats = false;
 
+    // The dump is written by the IOP's thread and closed by the window's.
+    std::mutex g_dumpMutex;
+    std::atomic<bool> g_dumping{false};
     std::FILE *g_dump = nullptr;
     uint32_t g_dumpBytes = 0;
     // The sizes in the dump's header until it is closed: a run that is cut
@@ -141,11 +145,15 @@ namespace ps2x::audio
     {
         if (const char *stats = std::getenv("PS2X_AUDIO_STATS"))
             g_stats = std::atoi(stats) != 0;
-        if (const char *path = std::getenv("PS2X_AUDIO_DUMP"); path && *path && !g_dump)
+        if (const char *path = std::getenv("PS2X_AUDIO_DUMP"); path && *path && !g_dumping.load())
         {
+            std::lock_guard<std::mutex> lock(g_dumpMutex);
             g_dump = std::fopen(path, "wb");
             if (g_dump)
+            {
                 writeDumpHeader(kOpenDumpBytes);
+                g_dumping.store(true);
+            }
         }
 #if !defined(PLATFORM_VITA)
         // An unpaced run (PS2X_TURBO) makes sound faster than it can be
@@ -172,8 +180,9 @@ namespace ps2x::audio
             g_stream = {};
         }
 #endif
-        if (g_dump)
+        if (g_dumping.exchange(false))
         {
+            std::lock_guard<std::mutex> lock(g_dumpMutex);
             writeDumpHeader(g_dumpBytes);
             std::fclose(g_dump);
             g_dump = nullptr;
@@ -182,9 +191,11 @@ namespace ps2x::audio
 
     void pushOutput(const int16_t *samples, size_t frames)
     {
-        if (g_dump)
+        if (g_dumping.load(std::memory_order_relaxed))
         {
-            g_dumpBytes += static_cast<uint32_t>(std::fwrite(samples, 1, frames * 4u, g_dump));
+            std::lock_guard<std::mutex> lock(g_dumpMutex);
+            if (g_dump)
+                g_dumpBytes += static_cast<uint32_t>(std::fwrite(samples, 1, frames * 4u, g_dump));
         }
         uint64_t written = g_written.load(std::memory_order_relaxed);
         for (size_t frame = 0; frame < frames; ++frame, ++written)

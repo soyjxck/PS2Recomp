@@ -3109,7 +3109,8 @@ void PS2Runtime::run()
             {
                 std::fprintf(stderr, "[run] PS2X_EXIT_AT reached at emu=%.2fs\n",
                              static_cast<double>(emulatedTick) / kTestVBlanksPerSecond);
-                std::fflush(nullptr); // the log, and PS2X_AUDIO_DUMP
+                ps2x::audio::stopOutput(); // PS2X_AUDIO_DUMP is closed with its length in it
+                std::fflush(nullptr);
                 std::_Exit(0);
             }
         }
