@@ -1325,16 +1325,34 @@ struct VU1Interpreter::InterpretedPair
     }
 };
 
-// A compiled pair's words are known when it is compiled. Its decoding is
-// handed over by value, a copy that is nothing but constants, so that the
-// tests runDecodedPair makes on it are decided then by any compiler. How it
-// reaches the executors is PS2_VU_EXECUTORS (ps2_vu1_detail.h).
+// A compiled pair's words are known when it is compiled. On MSVC (modes 1
+// and 2 of PS2_VU_EXECUTORS, ps2_vu1_detail.h) its decoding is handed over
+// by value, a copy that is nothing but constants, so that the tests
+// runDecodedPair makes on it are decided then. Clang and GCC (mode 0) are
+// given the constant itself, by reference, and share one body of
+// runDecodedPair: see decoding() and runCompiledPair below. The mode also
+// says how a pair reaches the executors.
 template <VU1Interpreter::Unit unit, uint64_t word>
 struct VU1Interpreter::CompiledPair
 {
     static constexpr DecodedInstructionPair kDecoded =
         decodeInstructionWords(static_cast<uint32_t>(word), static_cast<uint32_t>(word >> 32u), unit);
+#if PS2_VU_EXECUTORS == 0
+    // Clang and GCC fold a pair's words while they put the pair into its
+    // block, and only out of the constant itself. Handed a copy of it, or
+    // the constant by way of a call they have not put in yet, they put
+    // every executor in whole first and fold afterwards. So here the
+    // decoding is the one the pair was called with, kDecoded by reference.
+    // One file of blocks (Xenosaga's first of 32, Apple clang 21, -O3 with
+    // thin LTO): 64 s before the operations were a type, 701 s with the
+    // copy, 76 s with this and the one body below.
+    static PS2_VU_FORCE_INLINE constexpr const DecodedInstructionPair &decoding(const DecodedInstructionPair &given)
+    {
+        return given;
+    }
+#else
     static constexpr DecodedInstructionPair decoding(const DecodedInstructionPair &) { return kDecoded; }
+#endif
     static PS2_VU_FORCE_INLINE uint64_t readiness(const VU1Interpreter &vu, const DecodedInstructionPair &decoded)
     {
         return vu.calculatePairReadyCycleInline(decoded);
@@ -1384,8 +1402,20 @@ PS2_VU_NO_INLINE void VU1Interpreter::execLowerConstant(uint8_t *vuData, uint32_
 template <VU1Interpreter::Unit unit, uint64_t word>
 PS2_VU_COMPILED_PAIR bool VU1Interpreter::runCompiledPair(uint64_t budgetEnd)
 {
+#if PS2_VU_EXECUTORS == 0
+    // One body of runDecodedPair for every pair, as before the operations
+    // were a type: with the decoding handed in, nothing in them depends on
+    // the words, and a body made for each distinct pair of words was more
+    // than twice the compile time (165 s against 76 s). Any CompiledPair
+    // stands for all of them; a type of its own would say so better, and
+    // would have to be declared in ps2_vu1.h, which every game's generated
+    // code includes.
+    using AnyPair = CompiledPair<Unit::VU0, 0ull>;
+    return runDecodedPair<true, AnyPair>(CompiledPair<unit, word>::kDecoded, budgetEnd, m_cachedCodeSize);
+#else
     return runDecodedPair<true, CompiledPair<unit, word>>(CompiledPair<unit, word>::kDecoded, budgetEnd,
                                                           m_cachedCodeSize);
+#endif
 }
 
 template <bool compiled, class Operations>
