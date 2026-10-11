@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -276,6 +277,18 @@ namespace ps2x::iop::detail
 
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            // PS2X_IOP_TRACE=<n>: the first n calls modules make into the
+            // kernel's libraries, to see what a module does when it starts.
+            if (importTraceBudget != 0u)
+            {
+                --importTraceBudget;
+                std::ostringstream out;
+                out << "[IOP] call " << call.library << ':' << std::dec << call.ordinal << std::hex
+                    << " a0=0x" << cpu.gpr[4] << " a1=0x" << cpu.gpr[5] << " a2=0x" << cpu.gpr[6]
+                    << " a3=0x" << cpu.gpr[7] << " ra=0x" << cpu.gpr[31];
+                log(LogLevel::Info, out.str());
+            }
+
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
@@ -799,6 +812,10 @@ namespace ps2x::iop::detail
         bool servicingDmaInterrupts = false;
         bool servicingGuestCallbacks = false;
         uint32_t callDepth = 0u;
+        uint32_t importTraceBudget = [] {
+            const char *trace = std::getenv("PS2X_IOP_TRACE");
+            return trace ? static_cast<uint32_t>(std::strtoul(trace, nullptr, 0)) : 0u;
+        }();
         GuestCallback secrMcCommandHandler;
         GuestCallback secrMcDevIdHandler;
         GuestCallback checkKelfPathCallback;
