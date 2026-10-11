@@ -561,6 +561,11 @@ namespace ps2_stubs
         constexpr uint8_t kMpegPrivateStream1 = 0xBDu;
         constexpr size_t kStartCodeNotFound = std::numeric_limits<size_t>::max();
         constexpr uint32_t kMpegCallbackDataSize = 0x20u;
+        // sceMpegCbType of sceMpegAddCallback: the decoder is out of bitstream.
+        constexpr uint32_t kMpegCbNodata = 1u;
+        // Tag of the guest invocation that runs a program's no-data callback
+        // (the decoder's address goes in the low half).
+        constexpr uint64_t kMpegNodataInvocationTag = 0x4D50454700000000ull;
 
         uint64_t mpegPictureIntervalQ32(uint8_t frameRateCode, uint8_t frameRateExtensionN = 0u, uint8_t frameRateExtensionD = 0u)
         {
@@ -1581,26 +1586,28 @@ namespace ps2_stubs
             return true;
         }
 
-        void dispatchGuestStreamCallback(uint8_t *rdram,
-                                         R5900Context *callerCtx,
-                                         PS2Runtime *runtime,
-                                         const MpegStreamCallbackEvent &event,
-                                         const MpegRegisteredCallback &callback)
+        bool makeStreamCallbackInvocation(uint8_t *rdram,
+                                          R5900Context *callerCtx,
+                                          PS2Runtime *runtime,
+                                          const MpegStreamCallbackEvent &event,
+                                          const MpegRegisteredCallback &callback,
+                                          GuestInvocationKind kind,
+                                          GuestInvocation &invocation)
         {
             if (!rdram || !callerCtx || !runtime || callback.func == 0u || !runtime->hasFunction(callback.func))
             {
-                return;
+                return false;
             }
 
             const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
             if (cbDataAddr == 0u)
             {
-                return;
+                return false;
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
                 runtime->guestFree(cbDataAddr);
-                return;
+                return false;
             }
 
             R5900Context callbackCtx = *callerCtx;
@@ -1612,33 +1619,123 @@ namespace ps2_stubs
             SET_GPR_U32(&callbackCtx, 31, 0u);
             callbackCtx.pc = callback.func;
 
-            GuestInvocation invocation{};
-            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation = GuestInvocation{};
+            invocation.kind = kind;
             invocation.context = callbackCtx;
             invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
             {
                 runtime->guestFree(cbDataAddr);
             };
-            runtime->eeScheduler().queueInvocation(std::move(invocation));
+            return true;
         }
 
+        // The stream callbacks of what a demultiplexer call found. They are
+        // queued, to run when the caller is next at a scheduling point,
+        // except inside the program's own no-data callback: that one looks
+        // at the buffer they fill to decide whether it has read enough, and
+        // nothing queued runs until it has returned. There they run before
+        // the demultiplexer returns, as they do in the library. The caller
+        // has its return value set already: this may not come back.
         void dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
                                      const std::vector<MpegStreamCallbackEvent> &events)
         {
-            if (events.empty())
+            if (events.empty() || !runtime)
             {
                 return;
             }
 
+            EeScheduler &scheduler = runtime->eeScheduler();
+            std::vector<GuestInvocation> immediate;
             for (const MpegStreamCallbackEvent &event : events)
             {
+                const bool insideNodata =
+                    scheduler.hasInvocation(GuestInvocationKind::HleCall, kMpegNodataInvocationTag | event.mpegAddr);
                 for (const MpegRegisteredCallback &callback : event.callbacks)
                 {
-                    dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                    GuestInvocation invocation;
+                    const GuestInvocationKind kind =
+                        insideNodata ? GuestInvocationKind::HleCall : GuestInvocationKind::RpcCallback;
+                    if (!makeStreamCallbackInvocation(rdram, ctx, runtime, event, callback, kind, invocation))
+                    {
+                        continue;
+                    }
+                    if (insideNodata)
+                    {
+                        immediate.push_back(std::move(invocation));
+                    }
+                    else
+                    {
+                        scheduler.queueInvocation(std::move(invocation));
+                    }
                 }
             }
+            if (!immediate.empty())
+            {
+                scheduler.invokeCurrentSequence(std::move(immediate));
+            }
+        }
+
+        // The program's sceMpegCbNodata callback for a decoder, if it added
+        // one. g_mpeg_stub_mutex is held.
+        bool findNodataCallbackLocked(uint32_t mpegAddr, MpegRegisteredCallback &found)
+        {
+            const auto registered = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (registered == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return false;
+            }
+            for (const MpegRegisteredCallback &callback : registered->second)
+            {
+                if (!callback.stream && callback.type == kMpegCbNodata && callback.func != 0u)
+                {
+                    found = callback;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // The decoder has no picture and no bitstream to make one from. The
+        // library tells the program so and expects the callback to bring
+        // more before it returns; a program that reads and demultiplexes its
+        // stream only from there has nobody else to wait for.
+        // sceMpegGetPicture is entered again when the callback is done.
+        [[noreturn]] void invokeNodataCallback(uint8_t *rdram,
+                                               R5900Context *ctx,
+                                               PS2Runtime *runtime,
+                                               uint32_t mpegAddr,
+                                               const MpegRegisteredCallback &callback)
+        {
+            // sceMpegCbData: the type of the event comes first.
+            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            if (uint8_t *data = cbDataAddr != 0u ? getMemPtr(rdram, cbDataAddr) : nullptr)
+            {
+                std::memset(data, 0, kMpegCallbackDataSize);
+                std::memcpy(data, &kMpegCbNodata, sizeof(kMpegCbNodata));
+            }
+
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::HleCall;
+            invocation.tag = kMpegNodataInvocationTag | mpegAddr;
+            invocation.context = *ctx;
+            SET_GPR_U32(&invocation.context, 4, mpegAddr);
+            SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+            SET_GPR_U32(&invocation.context, 6, callback.data);
+            SET_GPR_U32(&invocation.context, 7, 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.context.pc = callback.func;
+            invocation.onComplete = [rdram, runtime, cbDataAddr](const R5900Context &, R5900Context &parent)
+            {
+                if (cbDataAddr != 0u)
+                {
+                    runtime->guestFree(cbDataAddr);
+                }
+                sceMpegGetPicture(rdram, &parent, runtime);
+            };
+            runtime->eeScheduler().invokeCurrent(std::move(invocation));
         }
 
         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
@@ -2143,8 +2240,8 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
+        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
     }
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2237,8 +2334,8 @@ namespace ps2_stubs
             });
         }
 
-        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
         setReturnS32(ctx, static_cast<int32_t>(consumed));
+        dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
     }
 
     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2299,6 +2396,12 @@ namespace ps2_stubs
                 !playback.streamEnded &&
                 !playback.decoderFailed)
             {
+                MpegRegisteredCallback nodata;
+                if (findNodataCallbackLocked(mpegAddr, nodata) && runtime->hasFunction(nodata.func))
+                {
+                    lock.unlock();
+                    invokeNodataCallback(rdram, ctx, runtime, mpegAddr, nodata);
+                }
                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({
