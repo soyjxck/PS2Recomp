@@ -173,13 +173,20 @@ namespace
         bool wrapped = false;
     };
 
-    thread_local DispatchHistory g_dispatchHistory;
-
-    // Set from the moment guest code starts handing control back to the
-    // scheduler (a checkpoint that is due, or a jump out of the function) until
-    // the scheduler enters guest code again. While it is set, ctx->pc is where
-    // to resume and says nothing about which call has returned.
-    thread_local bool t_guestUnwinding = false;
+    // What a thread running guest code keeps to itself. One object, so that
+    // a guest call, which needs both, finds the thread's storage once (on
+    // macOS each look is a call).
+    struct GuestThreadState
+    {
+        DispatchHistory history;
+        // Set from the moment guest code starts handing control back to the
+        // scheduler (a checkpoint that is due, or a jump out of the function)
+        // until the scheduler enters guest code again. While it is set,
+        // ctx->pc is where to resume and says nothing about which call has
+        // returned.
+        bool unwinding = false;
+    };
+    thread_local GuestThreadState t_guest;
 
     // PS2X_CALL_HISTORY=1: keep the last few thousand calls, jumps and
     // returns to a call site, with the stack pointer and return address at
@@ -273,9 +280,8 @@ namespace
         return true;
     }
 
-    void pushDispatchPc(uint32_t pc)
+    inline void pushDispatchPc(DispatchHistory &h, uint32_t pc)
     {
-        DispatchHistory &h = g_dispatchHistory;
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
         if (h.next == 0u)
@@ -286,7 +292,7 @@ namespace
 
     std::string formatDispatchHistory()
     {
-        const DispatchHistory &h = g_dispatchHistory;
+        const DispatchHistory &h = t_guest.history;
         const uint32_t count = h.wrapped ? static_cast<uint32_t>(h.pcs.size()) : h.next;
         if (count == 0u)
         {
@@ -1715,9 +1721,10 @@ const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
 
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
-    pushDispatchPc(address);
+    GuestThreadState &guest = t_guest;
+    pushDispatchPc(guest.history, address);
     // Guest code is about to be entered: whatever was unwinding has arrived.
-    t_guestUnwinding = false;
+    guest.unwinding = false;
 
     uint32_t slot = 0u;
     if (generatedFunctionTableSlot(address, slot))
@@ -1943,7 +1950,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
-        t_guestUnwinding = true;
+        t_guest.unwinding = true;
         return false;
     }
 
@@ -1959,12 +1966,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         // target; a return (strict diagnostics only) goes to the caller.
         if (kind != GuestBranchKind::Return)
         {
-            t_guestUnwinding = true;
+            t_guest.unwinding = true;
         }
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    // The table is looked in once for a call, and the thread's own state
+    // found once (see GuestThreadState).
+    uint32_t slot = 0u;
+    RecompiledFunction targetFn = generatedFunctionTableSlot(targetPc, slot) ? g_ps2RecompiledFunctionTable[slot] : nullptr;
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1986,7 +1997,10 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    GuestThreadState &guest = t_guest;
+    pushDispatchPc(guest.history, targetPc);
+    // Guest code is about to be entered: whatever was unwinding has arrived.
+    guest.unwinding = false;
     const uint32_t entryPc = ctx->pc;
     targetFn(rdram, ctx, this);
     if (g_callHistoryWanted) [[unlikely]]
@@ -2003,7 +2017,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // it calls itself comes back up through its own outer call with pc at
     // its own entry, and taking that for "the callee finished" (as below)
     // carried on in the outer caller with the inner call's stack.
-    if (t_guestUnwinding)
+    if (guest.unwinding)
     {
         return false;
     }
@@ -2827,7 +2841,7 @@ bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
     const bool due = m_eeScheduler->checkpointDue(cycles);
     if (due)
     {
-        t_guestUnwinding = true;
+        t_guest.unwinding = true;
     }
     return due;
 }
