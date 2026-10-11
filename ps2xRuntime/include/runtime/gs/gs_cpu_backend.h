@@ -89,6 +89,9 @@ private:
     // ps2x::setFlatLayer: the primitive made narrower (m_flatBatch), if it
     // is of that layer.
     bool NarrowFlat(const GSPrimitiveBatch &batch);
+    // The vertical blank the frame being presented is of: what NarrowFlat
+    // remembers from one frame to the next is forgotten by it.
+    static void NoteFlatFrame(uint64_t vsyncTick);
     bool PrepareTriangle(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareSprite(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
     bool PrepareLine(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive);
@@ -310,6 +313,19 @@ private:
         float about = 0.0f;
     };
     FlatCluster m_flatCluster, m_flatText;
+    // FlatLayer::pictures: the clusters and the runs of text there have
+    // been of late, with the vertical blank each was drawn in, for text to
+    // find a picture drawn some clusters before it and a picture the text
+    // it was in the frame before.
+    struct FlatSeen
+    {
+        FlatCluster box;
+        float line = 0.0f; // of a text: how tall its letters are
+        uint64_t tick = 0;
+    };
+    std::array<FlatSeen, 16> m_flatClusters{}, m_flatTexts{};
+    uint32_t m_flatClustersAt = 0, m_flatTextsAt = 0;
+    float m_flatLine = 0.0f; // m_flatText's letters
     std::array<uint8_t, kVramPages> m_cardAhead{};
     // The last image transfer that stored anything in each page, and what
     // kind of pixels it was (GpuAdopt).

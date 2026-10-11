@@ -3575,6 +3575,13 @@ namespace
     std::atomic<uint32_t> g_flatChanges{0u};
     std::mutex g_flatMutex;
     ps2x::FlatLayer g_flatLayer;
+    std::atomic<uint64_t> g_flatTick{0u};
+    constexpr uint64_t kFlatSeenFor = 16u; // vertical blanks
+}
+
+void GSCpuBackend::NoteFlatFrame(uint64_t vsyncTick)
+{
+    g_flatTick.store(vsyncTick, std::memory_order_relaxed);
 }
 
 void ps2x::setFlatLayer(const FlatLayer &layer)
@@ -3671,6 +3678,24 @@ bool GSCpuBackend::NarrowFlat(const GSPrimitiveBatch &batch)
             cluster.x1 = std::max(cluster.x1, right);
             cluster.y1 = std::max(cluster.y1, bottom);
         };
+        // (layer.pictures) What there has been of late, newest first.
+        const bool pictures = layer.pictures != 0u;
+        const uint64_t tick = g_flatTick.load(std::memory_order_relaxed);
+        const float tall = bottom - top;
+        auto note = [&](std::array<FlatSeen, 16> &seen, uint32_t &at, const FlatCluster &box, float line)
+        {
+            seen[at++ % seen.size()] = {box, line, tick};
+        };
+        auto find = [&](const std::array<FlatSeen, 16> &seen, uint32_t at, auto &&fits) -> const FlatSeen *
+        {
+            for (uint32_t i = 1u; i <= seen.size(); ++i)
+            {
+                const FlatSeen &one = seen[(at - i) % seen.size()];
+                if (one.box.set && tick - one.tick <= kFlatSeenFor && fits(one))
+                    return &one;
+            }
+            return nullptr;
+        };
         if (state.prim.tme && layer.text != 0u && ctx.tex0.tbp0 == layer.text)
         {
             // A letter: of the text it is near, which is where its first
@@ -3681,12 +3706,33 @@ bool GSCpuBackend::NarrowFlat(const GSPrimitiveBatch &batch)
             }
             else
             {
-                m_flatText = {true, left, top, right, bottom, touches(m_flatCluster, 24.0f) ? m_flatCluster.about : width * 0.5f};
+                if (pictures && m_flatText.set)
+                    note(m_flatTexts, m_flatTextsAt, m_flatText, m_flatLine);
+                float textAbout = width * 0.5f;
+                if (touches(m_flatCluster, 24.0f))
+                {
+                    textAbout = m_flatCluster.about;
+                }
+                else if (pictures)
+                {
+                    // A picture on this line that other clusters have been drawn since.
+                    const FlatSeen *picture = find(m_flatClusters, m_flatClustersAt, [&](const FlatSeen &one)
+                    {
+                        return touches(one.box, 24.0f) && one.box.y1 - one.box.y0 <= tall * 1.6f &&
+                               std::min(bottom, one.box.y1) - std::max(top, one.box.y0) >= tall * 0.5f;
+                    });
+                    if (picture)
+                        textAbout = picture->box.about;
+                }
+                m_flatText = {true, left, top, right, bottom, textAbout};
+                m_flatLine = tall;
             }
             about = m_flatText.about;
         }
         else
         {
+            if (pictures && m_flatText.set)
+                note(m_flatTexts, m_flatTextsAt, m_flatText, m_flatLine);
             m_flatText.set = false;
             if (touches(m_flatCluster, 8.0f))
             {
@@ -3694,13 +3740,29 @@ bool GSCpuBackend::NarrowFlat(const GSPrimitiveBatch &batch)
             }
             else
             {
+                if (pictures && m_flatCluster.set)
+                    note(m_flatClusters, m_flatClustersAt, m_flatCluster, 0.0f);
                 m_flatCluster = {true, left, top, right, bottom, (left + right) * 0.5f};
-                for (const ps2x::FlatLayer::Side &side : layer.sides)
+                // A picture set in a line of text is of that text, which is
+                // drawn after it: where the text was the frame before.
+                const FlatSeen *text = !pictures ? nullptr : find(m_flatTexts, m_flatTextsAt, [&](const FlatSeen &one)
                 {
-                    if (side.towards != 0 && left >= side.x0 && right <= side.x1 && top >= side.y0 && bottom <= side.y1)
+                    return tall <= one.line * 1.6f && left >= one.box.x0 - 6.0f && right <= one.box.x1 + 6.0f &&
+                           std::min(bottom, one.box.y1) - std::max(top, one.box.y0) >= tall * 0.5f;
+                });
+                if (text)
+                {
+                    m_flatCluster.about = text->box.about;
+                }
+                else
+                {
+                    for (const ps2x::FlatLayer::Side &side : layer.sides)
                     {
-                        m_flatCluster.about = side.towards < 0 ? 0.0f : width;
-                        break;
+                        if (side.towards != 0 && left >= side.x0 && right <= side.x1 && top >= side.y0 && bottom <= side.y1)
+                        {
+                            m_flatCluster.about = side.towards < 0 ? 0.0f : width;
+                            break;
+                        }
                     }
                 }
             }
