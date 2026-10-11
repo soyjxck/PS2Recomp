@@ -764,6 +764,83 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        tc.Run("a movie's sound goes to the callback registered for what the packet holds", [](TestCase &t)
+        {
+            // libmpeg's stream types: PCM is 2 and ADPCM 3, and a packet of
+            // private stream 1 says which it is in its first two bytes (ff a0,
+            // ff a1). A game whose movies carry ADPCM registers for 3 alone.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kCallbackEntry = 0x00124000u;
+            constexpr uint32_t kPcmUserData = 0x0000AA02u;
+            constexpr uint32_t kAdpcmUserData = 0x0000AA03u;
+            constexpr uint32_t kPacketAddr = 0x00129000u;
+
+            runtime.registerFunction(kCallbackEntry, &testRecordMpegStreamCallback);
+            runtime.registerFunction(kMpegCallbackStopPc, &testStopAfterMpegCallback);
+
+            auto registerStreamCallback = [&](uint32_t streamType, uint32_t userData)
+            {
+                R5900Context addCtx{};
+                setRegU32(addCtx, 4, kMpegAddr);
+                setRegU32(addCtx, 5, streamType);
+                setRegU32(addCtx, 6, 0u);
+                setRegU32(addCtx, 7, kCallbackEntry);
+                setRegU32(addCtx, 8, userData);
+                ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+            };
+
+            // One packet of private stream 1 through the demultiplexer; the
+            // user data of the callback it was given to, or 0 for none.
+            auto deliver = [&](uint8_t second) -> uint32_t
+            {
+                const std::vector<uint8_t> payload = {0xFFu, second, 0x00u, 0x00u, 0x11u, 0x22u};
+                const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+                std::vector<uint8_t> packet = {
+                    0x00u, 0x00u, 0x01u, 0xBDu,
+                    static_cast<uint8_t>(packetLen >> 8u),
+                    static_cast<uint8_t>(packetLen & 0xFFu),
+                    0x80u, 0x00u, 0x00u};
+                packet.insert(packet.end(), payload.begin(), payload.end());
+                std::memcpy(rdram.data() + kPacketAddr, packet.data(), packet.size());
+
+                gMpegStreamCallbackCount.store(0u, std::memory_order_release);
+                gMpegStreamCallbackUserData.store(0u, std::memory_order_release);
+                R5900Context idleContext{};
+                idleContext.pc = kMpegCallbackStopPc;
+                runtime.eeScheduler().reset(rdram.data(), idleContext);
+                R5900Context demuxCtx{};
+                setRegU32(demuxCtx, 4, kMpegAddr);
+                setRegU32(demuxCtx, 5, kPacketAddr);
+                setRegU32(demuxCtx, 6, static_cast<uint32_t>(packet.size()));
+                setRegU32(demuxCtx, 7, kPacketAddr);
+                setRegU32(demuxCtx, 8, static_cast<uint32_t>(packet.size()));
+                ps2_stubs::sceMpegDemuxPssRing(rdram.data(), &demuxCtx, &runtime);
+                runtime.eeScheduler().run();
+                return gMpegStreamCallbackCount.load(std::memory_order_acquire) != 0u
+                           ? gMpegStreamCallbackUserData.load(std::memory_order_acquire)
+                           : 0u;
+            };
+
+            ps2_stubs::resetMpegStubState();
+            registerStreamCallback(3u, kAdpcmUserData);
+            t.Equals(deliver(0xA1u), kAdpcmUserData, "ADPCM alone registered: its packets reach it");
+            t.Equals(gMpegStreamCallbackType.load(std::memory_order_acquire), 3u,
+                     "and the callback is told the type it registered for");
+
+            ps2_stubs::resetMpegStubState();
+            registerStreamCallback(2u, kPcmUserData);
+            registerStreamCallback(3u, kAdpcmUserData);
+            t.Equals(deliver(0xA0u), kPcmUserData, "both registered: a PCM packet goes to the PCM callback");
+
+            ps2_stubs::resetMpegStubState();
+            registerStreamCallback(2u, kPcmUserData);
+            registerStreamCallback(3u, kAdpcmUserData);
+            t.Equals(deliver(0xA1u), kAdpcmUserData, "both registered: an ADPCM packet goes to the ADPCM callback");
+        });
+
         tc.Run("a sound packet the game has no room for is offered again until it is taken", [](TestCase &t)
         {
             // A game's sound callback answers 0 while its own buffer is

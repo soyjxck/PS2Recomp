@@ -566,9 +566,12 @@ namespace ps2_stubs
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
         constexpr uint32_t kStubMovieHeight = 240u;
+        // sceMpegStrType, as libmpeg numbers the streams a callback is
+        // registered for.
         constexpr uint32_t kMpegStrM2V = 0u;
-        constexpr uint32_t kMpegStrPCM = 1u;
-        constexpr uint32_t kMpegStrADPCM = 2u;
+        constexpr uint32_t kMpegStrIPU = 1u;
+        constexpr uint32_t kMpegStrPCM = 2u;
+        constexpr uint32_t kMpegStrADPCM = 3u;
         constexpr uint8_t kMpegPackHeader = 0xBAu;
         constexpr uint8_t kMpegSystemHeader = 0xBBu;
         constexpr uint8_t kMpegProgramEnd = 0xB9u;
@@ -1167,16 +1170,29 @@ namespace ps2_stubs
             return out;
         }
 
+        // What a packet of private stream 1 holds, by the two bytes it
+        // starts with: ff a0 is PCM, ff a1 ADPCM. 0: neither.
+        uint32_t audioStreamType(const uint8_t *payload, size_t size)
+        {
+            if (size < 2u || payload[0] != 0xFFu)
+            {
+                return 0u;
+            }
+            return payload[1] == 0xA0u ? kMpegStrPCM : (payload[1] == 0xA1u ? kMpegStrADPCM : 0u);
+        }
+
         // The callback a game's sound goes to: the one it registered for
-        // PCM, else the others these packets have been given to.
-        std::optional<MpegRegisteredCallback> audioCallback(uint32_t mpegAddr)
+        // what the packet holds (a game whose movies carry ADPCM registers
+        // for that and for nothing else), else the one for PCM, else the
+        // others these packets have been given to.
+        std::optional<MpegRegisteredCallback> audioCallback(uint32_t mpegAddr, uint32_t packetType = 0u)
         {
             const auto registered = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
             if (registered == g_mpeg_stub_state.callbacksByMpeg.end())
             {
                 return std::nullopt;
             }
-            for (const uint32_t type : {kMpegStrADPCM, kMpegStrPCM})
+            for (const uint32_t type : {packetType != 0u ? packetType : kMpegStrPCM, kMpegStrPCM, kMpegStrADPCM, kMpegStrIPU})
             {
                 for (const MpegRegisteredCallback &callback : registered->second)
                 {
@@ -1398,7 +1414,8 @@ namespace ps2_stubs
                 {
                     const MpegPesHeader pes = parsePesHeader(buffer.data(), packetEnd);
                     const size_t payloadStart = pes.payloadOffset;
-                    if (payloadStart < packetEnd && audioCallback(mpegAddr))
+                    if (payloadStart < packetEnd &&
+                        audioCallback(mpegAddr, audioStreamType(buffer.data() + payloadStart, packetEnd - payloadStart)))
                     {
                         keepAudioPacket(playback, buffer.data() + payloadStart, packetEnd - payloadStart, pes.pts90k, pes.dts90k);
                     }
@@ -1696,7 +1713,9 @@ namespace ps2_stubs
                 {
                     return;
                 }
-                const std::optional<MpegRegisteredCallback> registered = audioCallback(mpegAddr);
+                const MpegAudioPacket &first = playback.audioPackets.front();
+                const std::optional<MpegRegisteredCallback> registered =
+                    audioCallback(mpegAddr, audioStreamType(first.bytes.data(), first.bytes.size()));
                 if (!registered || !runtime->hasFunction(registered->func))
                 {
                     playback.audioPackets.clear();
