@@ -176,6 +176,13 @@ namespace ps2x
     //   `depth` and `ceiling`, are marks and labels set over things in the
     //   scene, each a run of primitives at one depth: narrowed about the
     //   first of the run.
+    // - `pictures` (1 for on) is for a game that sets small pictures in
+    //   its lines of text (a button's, in "press X to jump") and draws
+    //   them before the text, as clusters of their own. A cluster no
+    //   taller than a line and a half that starts inside the text of the
+    //   frame before goes with that text, wherever `sides` would have put
+    //   it; and text goes with a cluster that small on its line that it
+    //   starts against, even if other clusters were drawn in between.
     struct FlatLayer
     {
         float narrow = 1.0f;
@@ -188,6 +195,7 @@ namespace ps2x
             float x0 = 0.0f, y0 = 0.0f, x1 = 0.0f, y1 = 0.0f;
             int towards = 0; // -1 the left of the frame, 1 the right, 0 unused
         } sides[4]{};
+        uint32_t pictures = 0;
     };
     // Any thread may call it.
     void setFlatLayer(const FlatLayer &layer);
