@@ -27,5 +27,13 @@ generator, so every run writes the same programs. Build the runtime with
 each program compiled and interpreted at several cycle budgets.
 `PS2_VU_REQUIRE_PROGRAMS=1` makes a program without a compiled routine fail.
 
+A game's own programs are checked on the states the game runs them from: play
+with `PS2_VU_CAPTURE_DIR=<dir>` (and `PS2_VU_CAPTURE_PC=<entry>` to keep one
+entry point), then give the tests `PS2_VU_CAPTURE_FIXTURES=<dir>`. Each captured
+program start is run compiled and interpreted from its own registers, data
+memory, TOP and ITOP, and the two must end alike. The synthetic state above does
+not suit recorded programs: they kick its floats as GIF packets, the transfer
+is refused part-way, and the two sides stop two pairs apart.
+
 Runtime captures, game code images, snapshots, and native sources generated from
 game inputs remain local build artifacts. Do not add them to this directory.

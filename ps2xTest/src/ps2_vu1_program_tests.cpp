@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -326,6 +328,71 @@ void register_ps2_vu1_program_tests()
                 t.IsTrue(!entries.empty(), "PS2_VU_PROGRAM_FIXTURES names the compiled programs");
             for (const auto &entry : entries)
                 checkEntry(t, entry, require);
+        });
+
+        tc.Run("captured program starts run the same compiled and interpreted", [](TestCase &t)
+        {
+            // PS2_VU_CAPTURE_FIXTURES names a PS2_VU_CAPTURE_DIR directory: real
+            // program starts, each replayed from its own state and data.
+            const char *directory = std::getenv("PS2_VU_CAPTURE_FIXTURES");
+            if (!directory || !*directory)
+                return;
+            const auto readFile = [](const std::string &name, std::vector<uint8_t> &bytes) {
+                std::ifstream input(name, std::ios::binary);
+                if (!input)
+                    return false;
+                bytes.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+                return true;
+            };
+            std::vector<std::string> stems;
+            for (const auto &item : std::filesystem::directory_iterator(directory))
+            {
+                const std::string name = item.path().filename().string();
+                if (item.path().extension() == ".state" && name.rfind("vu1-", 0) == 0)
+                    stems.push_back(item.path().string().substr(0, item.path().string().size() - 6u));
+            }
+            std::sort(stems.begin(), stems.end());
+            uint32_t replayed = 0u, compiled = 0u, mismatched = 0u, unfinished = 0u;
+            for (const std::string &stem : stems)
+            {
+                std::vector<uint8_t> code, data, stateBytes;
+                if (!readFile(stem + ".state", stateBytes) || !readFile(stem + ".code", code) ||
+                    !readFile(stem + ".data", data) || stateBytes.size() != sizeof(VU1State) ||
+                    code.size() != PS2_VU1_CODE_SIZE || data.size() != PS2_VU1_DATA_SIZE)
+                {
+                    t.Fail("unreadable capture " + stem);
+                    continue;
+                }
+                VU1State initial;
+                std::memcpy(&initial, stateBytes.data(), sizeof(initial));
+                Side native, oracle;
+                if (!native.initialize(code, true) || !oracle.initialize(code, false))
+                {
+                    t.Fail("VU1 fixtures should initialize");
+                    return;
+                }
+                for (Side *side : {&oracle, &native})
+                {
+                    side->reset(initial, data);
+                    side->vu.execute(side->mem.getVU1Code(), PS2_VU1_CODE_SIZE, side->mem.getVU1Data(),
+                                     PS2_VU1_DATA_SIZE, side->gs, &side->mem, initial.pc, initial.top, initial.itop,
+                                     kWideBudget);
+                }
+                ++replayed;
+                if (native.vu.compiledPairsExecuted() != 0u)
+                    ++compiled;
+                if (oracle.cycles() >= kWideBudget)
+                    ++unfinished;
+                if (!same(native, oracle))
+                {
+                    if (++mismatched <= 12u)
+                        t.Fail(stem.substr(stem.find_last_of("/\\") + 1u) + ", cycle " + std::to_string(oracle.cycles()) +
+                               " (compiled/interpreted:" + difference(native, oracle) + ")");
+                }
+            }
+            std::printf("[capture replay] %u captures, %u ran compiled, %u differ, %u did not end\n", replayed, compiled,
+                        mismatched, unfinished);
+            t.IsTrue(mismatched == 0u, "captures replay the same compiled and interpreted");
         });
 
         tc.Run("a recording notes where register jumps land", [](TestCase &t)
