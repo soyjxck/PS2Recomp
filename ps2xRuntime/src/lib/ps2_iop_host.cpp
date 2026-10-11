@@ -3,6 +3,7 @@
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
+#include "runtime/ps2_audio_output.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
@@ -265,6 +266,11 @@ void PS2IopHostAdapter::audioCommand(uint32_t sid,
                                             send.size,
                                             receivePointer,
                                             receive.size);
+}
+
+void PS2IopHostAdapter::audioSamples(const int16_t *samples, size_t frames)
+{
+    ps2x::audio::pushOutput(samples, frames);
 }
 
 std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const

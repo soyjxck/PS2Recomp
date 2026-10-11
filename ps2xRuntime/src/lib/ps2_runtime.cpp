@@ -8,6 +8,7 @@
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_audio_output.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_settings_menu.h"
 #include "runtime/gs/gs_gpu_renderer.h"
@@ -1083,6 +1084,7 @@ PS2Runtime::~PS2Runtime()
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
 #else
+        ps2x::audio::stopOutput();
         if (IsAudioDeviceReady())
         {
             CloseAudioDevice();
@@ -1325,6 +1327,7 @@ bool PS2Runtime::initialize(const char *title)
             GSGpu::PrepareContext();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        ps2x::audio::startOutput();
         // [audio] volume (PS2X_VOLUME): 0 to 100, of everything that is played.
         if (const char *volume = ps2x::setting("PS2X_VOLUME", "audio.volume"))
             SetMasterVolume(std::clamp(static_cast<float>(std::atof(volume)), 0.0f, 100.0f) / 100.0f);
@@ -3106,8 +3109,7 @@ void PS2Runtime::run()
             {
                 std::fprintf(stderr, "[run] PS2X_EXIT_AT reached at emu=%.2fs\n",
                              static_cast<double>(emulatedTick) / kTestVBlanksPerSecond);
-                std::fflush(stdout);
-                std::fflush(stderr);
+                std::fflush(nullptr); // the log, and PS2X_AUDIO_DUMP
                 std::_Exit(0);
             }
         }
