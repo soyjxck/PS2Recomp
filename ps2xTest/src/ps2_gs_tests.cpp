@@ -1092,6 +1092,67 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("FST sprite corners between pixels cover from the first whole pixel to the last before the far corner", [](TestCase &t)
+        {
+            // A strip of a frame buffer drawn the way that samples texel
+            // centres on the GS: texels from +0.5, the far corner half a
+            // pixel short of the next strip. It still fills its last column.
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint64_t kFrame = (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf = (1ull << 32);
+            constexpr uint64_t kScissor = (0ull << 0) | (7ull << 16) | (0ull << 32) | (3ull << 48);
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kTexTbp) << 0) | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                (2ull << 26) | (2ull << 30) | (1ull << 34);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8);
+            constexpr uint32_t kSourcePixels[4] = {0x800000FFu, 0x8000FF00u, 0x80FF0000u, 0x80FFFFFFu};
+
+            const auto draw = [&](uint32_t x0, uint32_t x1, uint32_t u0, uint32_t u1, std::vector<uint8_t> &vram)
+            {
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                for (uint32_t y = 0u; y < 4u; ++y)
+                    for (uint32_t x = 0u; x < 4u; ++x)
+                        writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, kSourcePixels[x]);
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+                gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+                gs.writeRegister(GS_REG_TEX0_1, kTex0);
+                gs.writeRegister(GS_REG_TEX1_1, 0ull);
+                gs.writeRegister(GS_REG_PRIM, kPrim);
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(u0));
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x0));
+                gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(u1) | ((4ull * 16ull) << 16));
+                gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(x1) | (static_cast<uint64_t>(4u << 4) << 16));
+            };
+
+            // x from 0 to 3.5, u from 0.5 to 4: four columns, a texel each.
+            std::vector<uint8_t> strip(PS2_GS_VRAM_SIZE, 0u);
+            draw(0u, 3u * 16u + 8u, 8u, 4u * 16u, strip);
+            for (uint32_t x = 0u; x < 4u; ++x)
+            {
+                t.Equals(readReferenceFramePSMCT32Pixel(strip, 150u, 1u, x, 2u), kSourcePixels[x],
+                         "a sprite that ends half a pixel short of the next should fill its last column with the last texel");
+            }
+            t.Equals(readReferenceFramePSMCT32Pixel(strip, 150u, 1u, 4u, 2u), 0u,
+                     "and nothing beyond it");
+
+            // x from 0.5 to 4: the pixel at 0 is before the near corner.
+            std::vector<uint8_t> late(PS2_GS_VRAM_SIZE, 0u);
+            draw(8u, 4u * 16u, 0u, 4u * 16u, late);
+            t.Equals(readReferenceFramePSMCT32Pixel(late, 150u, 1u, 0u, 2u), 0u,
+                     "a sprite that starts half a pixel in should leave the pixel before its corner alone");
+            for (uint32_t x = 1u; x < 4u; ++x)
+            {
+                t.IsTrue(readReferenceFramePSMCT32Pixel(late, 150u, 1u, x, 2u) != 0u,
+                         "and draw the pixels from the first whole one on");
+            }
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

@@ -57,6 +57,17 @@ static inline uint8_t clampU8(int v)
     if (v > 255) return 255;
     return static_cast<uint8_t>(v);
 }
+
+// The first whole pixel at or after a sprite corner: a vertex coordinate (in
+// pixels, with its sixteenths) less the drawing offset (in sixteenths). The
+// GS draws a sprite from that pixel at its smaller corner up to, not
+// including, that pixel at its larger one. A strip from 0 to 63.5 fills 64
+// columns; one from 0.5 to 64 leaves column 0 alone.
+static inline int gsSpriteEdge(float vertexCoordinate, uint32_t offsetSixteenths)
+{
+    const int sixteenths = static_cast<int>(vertexCoordinate * 16.0f + 0.5f) - static_cast<int>(offsetSixteenths);
+    return (sixteenths + 15) >> 4;
+}
 }
 
 #endif

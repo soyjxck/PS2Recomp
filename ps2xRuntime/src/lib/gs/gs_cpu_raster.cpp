@@ -2398,71 +2398,77 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     // One way of the sprite: the pixels it covers, and how its texture is
     // laid over them.
     //
-    // The sprite goes on whole pixels: where its first corner lies part of
-    // a pixel along, that part is dropped (so a frame a game sets half a
-    // line down for the other field stays where it was), and it covers as
-    // many pixels as reach its second corner. Most sprites are a whole
-    // number of pixels with their texture texel for texel, or with the
-    // half texel a game adds for the GS's filtering at both corners; those
-    // have the texture's fractions dropped as well, and each pixel reads
-    // the middle of what it covers.
+    // It covers what the GS covers: from the first whole pixel at or after
+    // its smaller corner up to, not including, that pixel at its larger
+    // one. A strip from 0 to 63.5 fills 64 columns; one from 0.5 to 64
+    // leaves column 0 alone; one whose two corners round up to the same
+    // pixel draws nothing.
+    // Except at the top of a field buffer that is shown as whole frames
+    // (m_fieldFbp): a game that draws for interlace sets the frame half a
+    // line down for the other field, and there the half line is what the
+    // whole frames are kept to be rid of. A sprite whose top lies part of
+    // the way into row 0 starts at row 0, the rest of it moved up by as
+    // much.
+    //
+    // Most sprites are a whole number of pixels with their texture texel
+    // for texel, or with the half texel a game adds for the GS's filtering
+    // at both corners; those have the texture's fractions dropped, and
+    // each pixel reads the middle of its share of the texels.
     // The rest read what the GS reads: the texel coordinate of the pixel's
     // own place between the corners. (A game that halves its picture in
-    // strips 15.75 pixels wide, to blur it, relies on that: the strips
-    // leave a column out of every sixteen otherwise, and the picture
-    // comes back from each halving a texel off.)
+    // strips 15.75 pixels wide, to blur it, relies on that: the picture
+    // comes back from each halving a texel off otherwise.)
     struct Way
     {
         int first = 0;        // the first pixel
-        int count = 1;        // how many
+        int count = 0;        // how many; none if the corners round to one pixel
         bool flipped = false; // the second vertex comes first
         bool exact = false;   // texel coordinates as the GS has them
         float inset = 0.0f;   // exact: from the first corner to the first pixel
         float extent = 1.0f;  // exact: pixels from corner to corner
     };
-    auto wayOf = [&p](float from, float to, int offset, uint32_t texelFrom, uint32_t texelTo, bool across)
+    auto wayOf = [&p](float from, float to, int offset, uint32_t texelFrom, uint32_t texelTo, bool across, bool intoWholeField)
     {
         Way way;
-        // Sixteenths of a pixel, as the GS has them.
-        int a = static_cast<int>(std::lround(from * 16.0f)), b = static_cast<int>(std::lround(to * 16.0f));
+        // The corners in sixteenths of a pixel, as the GS has them.
+        int a = static_cast<int>(std::lround(from * 16.0f)) - offset, b = static_cast<int>(std::lround(to * 16.0f)) - offset;
         way.flipped = a > b;
         if (way.flipped)
         {
             std::swap(a, b);
             std::swap(texelFrom, texelTo);
         }
-        const int extent = b - a;
-        way.first = (a >> 4) - (offset >> 4);
-        way.count = std::max(1, (extent + 15) >> 4);
-        if (extent <= 0 || !p.tme)
+        if (intoWholeField && !way.flipped && a > 0 && a < 16)
+        {
+            b -= a;
+            a = 0;
+        }
+        way.first = (a + 15) >> 4;
+        // (Both corners at one place has always drawn its one pixel here,
+        // and tests draw single pixels that way.)
+        way.count = a == b ? 1 : ((b + 15) >> 4) - way.first;
+        if (way.count <= 0 || a == b || !p.tme)
             return way;
+        const int extent = b - a;
         way.extent = static_cast<float>(extent) * 0.0625f;
+        way.inset = static_cast<float>((way.first << 4) - a) * 0.0625f;
         const bool whole = (extent & 15) == 0;
         if (!p.fst)
         {
             way.exact = !whole;
             return way;
         }
+        // Texel for texel but part of a pixel across, and filtered, is a
+        // blur, which is that part of a pixel and nothing else: as the GS
+        // has it, then.
         const bool level = whole && static_cast<int>(texelTo) - static_cast<int>(texelFrom) == extent;
-        if (level && across && p.linear && ((a - offset) & 15) != 0)
-        {
-            // Texel for texel but part of a pixel across, and filtered: a
-            // blur, which is that part of a pixel and nothing else. Where
-            // the GS has it, then.
-            const int corner = a - offset;
-            way.first = (corner + 15) >> 4;
-            way.count = std::max(1, ((b - offset + 15) >> 4) - way.first);
-            way.inset = static_cast<float>((way.first << 4) - corner) * 0.0625f;
-            way.exact = true;
-        }
-        else
-        {
-            way.exact = !(whole && (level || ((texelFrom & 15u) == 8u && (texelTo & 15u) == 8u)));
-        }
+        const bool blur = level && across && p.linear && (a & 15) != 0;
+        way.exact = blur || !(whole && (level || ((texelFrom & 15u) == 8u && (texelTo & 15u) == 8u)));
         return way;
     };
-    Way across = wayOf(v0.x, v1.x, ctx.xyoffset.ofx, v0.u, v1.u, true);
-    const Way down = wayOf(v0.y, v1.y, ctx.xyoffset.ofy, v0.v, v1.v, false);
+    const bool intoWholeField = ctx.frame.fbp == m_fieldFbp && ctx.frame.fbw == m_fieldFbw;
+    Way across = wayOf(v0.x, v1.x, static_cast<int>(ctx.xyoffset.ofx), v0.u, v1.u, true, false);
+    const Way down = wayOf(v0.y, v1.y, static_cast<int>(ctx.xyoffset.ofy), v0.v, v1.v, false, intoWholeField);
     // A sprite of the flat layer made narrower: the same picture over fewer
     // pixels, so its sides stay where they fall, between pixels, and it
     // covers the pixels whose middles lie between them.
@@ -2486,6 +2492,8 @@ void GSCpuBackend::SubmitPrimitivesWriting(const GSMem::SurfaceLayout &layout, i
     const int x0 = across.first, y0 = down.first;
     const int spanX = across.count;
     const int spanY = down.count;
+    if (spanX <= 0 || spanY <= 0)
+        return true;
     const int lastX = x0 + spanX - 1;
     const int lastY = y0 + spanY - 1;
     if (lastX < p.scissorX0 || x0 > p.scissorX1 || lastY < p.scissorY0 || y0 > p.scissorY1)
