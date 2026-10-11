@@ -1472,8 +1472,9 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
 // A decoded RGBA copy of the texture, if it is exactly the image one transfer
 // wrote and still there. Such a texture is known by the hash of that image:
 // the same image sent again, anywhere, is the same copy, nothing is read back
-// from VRAM to tell, and the copy never changes. Anything else (an image
-// partly overwritten, texels beyond the image, something that was drawn) is
+// from VRAM to tell, and the copy never changes. A texture that is not one
+// image may still be nothing but uploaded images (DecodedFromBlocks).
+// Anything else (something that was drawn, an image stored in pieces) is
 // sampled from VRAM as the primitive is drawn.
 [[gnu::noinline]] const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedTextureFor(FastPipeline &p)
 {
@@ -1483,26 +1484,36 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     static uint64_t statLookups = 0, statCopies = 0, statDecodes = 0, statNoRecord = 0, statOutside = 0, statStale = 0;
+    static uint64_t statBlocks = 0, statBlockDecodes = 0;
     if (wantStats && ++statLookups % 2000000u == 0u)
-        std::fprintf(stderr, "[gs-textures] %llu lookups: %llu from a copy of the uploaded image (%llu decoded); from VRAM: %llu not uploaded as such, %llu reach beyond the image, %llu overwritten since; %zu copies, %llu MB\n",
+        std::fprintf(stderr, "[gs-textures] %llu lookups: %llu from a copy of the uploaded image (%llu decoded), %llu from a copy of uploaded blocks (%llu decoded); from VRAM: %llu not uploaded as such, %llu reach beyond the image, %llu overwritten since; %zu copies, %llu MB\n",
                      (unsigned long long)statLookups, (unsigned long long)statCopies, (unsigned long long)statDecodes,
+                     (unsigned long long)statBlocks, (unsigned long long)statBlockDecodes,
                      (unsigned long long)statNoRecord, (unsigned long long)statOutside, (unsigned long long)statStale,
                      m_decodedTextures.size(), (unsigned long long)(m_decodedBytes >> 20));
+    // Not one image: its blocks may say what it is all the same.
+    const auto fromBlocks = [&](uint64_t &otherwise) -> const DecodedTexture *
+    {
+        bool decodedNow = false;
+        const DecodedTexture *copy = DecodedFromBlocks(p, decodedNow);
+        if (copy == nullptr)
+            ++otherwise;
+        else
+        {
+            ++statBlocks;
+            statBlockDecodes += decodedNow ? 1u : 0u;
+        }
+        return copy;
+    };
 
     const auto found = m_uploadAt.find((static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm);
     if (found == m_uploadAt.end())
-    {
-        ++statNoRecord;
-        return nullptr;
-    }
+        return fromBlocks(statNoRecord);
     UploadRecord &record = found->second;
     const int imageW = std::min(static_cast<int>((record.rect >> 16) & 0xFFFFu), p.texW);
     const int imageH = std::min(static_cast<int>(record.rect & 0xFFFFu), p.texH);
     if (!(p.sampledU0 >= 0 && p.sampledV0 >= 0 && p.sampledU1 < imageW && p.sampledV1 < imageH))
-    {
-        ++statOutside;
-        return nullptr;
-    }
+        return fromBlocks(statOutside);
     // Its blocks are looked at again only after another transfer.
     bool intact = !DrawnSince(p.texture, 0, 0, imageW - 1, imageH - 1, record.serial);
     if (intact && record.checkedUpload != m_lastUploadSerial)
@@ -1512,10 +1523,7 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
             record.checkedUpload = m_lastUploadSerial;
     }
     if (!intact)
-    {
-        ++statStale;
-        return nullptr;
-    }
+        return fromBlocks(statStale);
 
     ++statCopies;
     uint64_t key = mixKey(ConversionKey(p), record.hash);
@@ -1536,6 +1544,129 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
         {
             uint32_t *out = copy.pixels.data() + static_cast<size_t>(v) * static_cast<size_t>(p.texW);
             for (int u = 0; u < imageW; ++u)
+                out[u] = p.fetch(u, v);
+        }
+        m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);
+        ForgetOldDecodedTextures();
+    }
+    return &copy;
+}
+
+// A decoded copy of the whole texture when every block of it holds uploaded
+// images and nothing drawn: several images side by side, a part of a larger
+// one addressed by a base of its own, an image stored as one format and
+// looked at as another (a page of 8-bit texels sent as 32-bit pixels). What
+// the blocks hold is known by number (MarkUploaded), so the copy is found by
+// those numbers and how the texture is looked at, and the same images stored
+// again the same way are the same copy without a texel being read: a game
+// that swaps whole pages of textures in and out during a frame decodes each
+// page once.
+//
+// The numbers are put together again only when one of the texture's pages
+// has been written since they last were.
+//
+// PS2X_GS_BLOCK_COPIES=0 turns this off, to compare.
+const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline &p, bool &decodedNow)
+{
+    static const bool enabled = []
+    {
+        const char *value = std::getenv("PS2X_GS_BLOCK_COPIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    constexpr int kMostTexels = 1024 * 1024;
+    if (!enabled || !p.texture.table || p.texW <= 0 || p.texH <= 0 || p.texW * p.texH > kMostTexels)
+        return nullptr;
+    const uint64_t viewKey = mixKey((static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm,
+                                    (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
+    if (m_blocksViews.size() > 4096u)
+        m_blocksViews.clear();
+    BlocksView &view = m_blocksViews[viewKey];
+    if (view.serial == 0u || PagesWrittenSince(p.texture, 0, 0, p.texW - 1, p.texH - 1, view.serial))
+    {
+        view.serial = m_writeSerial;
+        view.key = BlocksKey(p.texture, p.texW, p.texH);
+    }
+    if (view.key == 0u)
+    {
+        // PS2X_GS_BLOCKS_WHY=1: the textures most often turned away here,
+        // and what their blocks are.
+        static const bool wantWhy = []
+        {
+            const char *value = std::getenv("PS2X_GS_BLOCKS_WHY");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (wantWhy)
+        {
+            struct Why
+            {
+                uint64_t count = 0;
+                uint32_t tbp0 = 0, tbw = 0, psm = 0;
+                int width = 0, height = 0, blocks = 0, never = 0, drawn = 0, pieces = 0;
+            };
+            static std::unordered_map<uint64_t, Why> whys;
+            static uint64_t turnedAway = 0;
+            Why &why = whys[viewKey];
+            if (why.count++ % 65536u == 0u)
+            {
+                why.tbp0 = p.tbp0;
+                why.tbw = p.tbw;
+                why.psm = p.texPsm;
+                why.width = p.texW;
+                why.height = p.texH;
+                why.blocks = why.never = why.drawn = why.pieces = 0;
+                const int tileW = p.texture.unitBits == 32u ? 8 : (p.texture.unitBits == 4u ? 32 : 16);
+                const int tileH = p.texture.unitBits >= 16u ? 8 : 16;
+                for (int y = 0; y < p.texH; y += tileH)
+                {
+                    for (int x = 0; x < p.texW; x += tileW)
+                    {
+                        const uint32_t block = ((p.texture.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * p.texture.unitBits) >> 11) & 0x3FFFu;
+                        ++why.blocks;
+                        if (m_blockUploadSerial[block] == 0u)
+                            ++why.never;
+                        else if (m_blockUploadSerial[block] <= m_pageVramDrawSerial[block >> 5])
+                            ++why.drawn;
+                        else if (m_blockContent[block] == 0u)
+                            ++why.pieces;
+                    }
+                }
+            }
+            if (++turnedAway % 2000000u == 0u)
+            {
+                std::vector<const Why *> most;
+                for (const auto &entry : whys)
+                    most.push_back(&entry.second);
+                std::sort(most.begin(), most.end(), [](const Why *left, const Why *right)
+                          { return left->count > right->count; });
+                std::fprintf(stderr, "[gs-blocks] %llu lookups of %zu textures that are not all uploaded images:\n",
+                             static_cast<unsigned long long>(turnedAway), most.size());
+                for (size_t i = 0; i < most.size() && i < 12u; ++i)
+                    std::fprintf(stderr, "[gs-blocks]   %9llu  tbp0=%04x tbw=%u psm=%02x %dx%d: of %d blocks %d never uploaded, %d drawn over, %d not known (cut short, or part of a block)\n",
+                                 static_cast<unsigned long long>(most[i]->count), most[i]->tbp0, most[i]->tbw, most[i]->psm,
+                                 most[i]->width, most[i]->height, most[i]->blocks, most[i]->never, most[i]->drawn, most[i]->pieces);
+            }
+        }
+        return nullptr;
+    }
+
+    uint64_t key = mixKey(ConversionKey(p), view.key);
+    key = mixKey(key, (1ull << 63) | (static_cast<uint64_t>(p.texPsm) << 48) | (static_cast<uint64_t>(p.tbw) << 32) |
+                          (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
+    const auto [it, inserted] = m_decodedTextures.try_emplace(key);
+    DecodedTexture &copy = it->second;
+    copy.lastUsed = ++m_decodedUseClock;
+    if (inserted)
+    {
+        decodedNow = true;
+        // The images are on their way into VRAM, if they are not there yet.
+        FlushPrimitivesTouching(p.texture, 0, 0, p.texW - 1, p.texH - 1, false, "texture");
+        copy.width = p.texW;
+        copy.height = p.texH;
+        copy.pixels.assign(static_cast<size_t>(p.texW) * static_cast<size_t>(p.texH), 0u);
+        for (int v = 0; v < p.texH; ++v)
+        {
+            uint32_t *out = copy.pixels.data() + static_cast<size_t>(v) * static_cast<size_t>(p.texW);
+            for (int u = 0; u < p.texW; ++u)
                 out[u] = p.fetch(u, v);
         }
         m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);

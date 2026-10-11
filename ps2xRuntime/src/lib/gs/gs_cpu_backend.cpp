@@ -596,6 +596,8 @@ void GSCpuBackend::ResetUnlocked()
     m_decodedBytes = 0;
     m_uploads.clear();
     m_uploadAt.clear();
+    m_blockContent.fill(0u);
+    m_blocksViews.clear();
     m_clutSnapshots.clear();
     MarkAllWritten();
     m_texturePageCache.Invalidate();
@@ -1670,6 +1672,7 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
     m_transferState.copiedPixels = 0u;
     m_transferState.direction = command.direction;
     m_transferState.localToHostPendingBytes = 0u;
+    m_piecesFromStart = false;
 
     if (command.direction == 2u || command.direction == 1u)
         FlushForVram("move");
@@ -1726,12 +1729,28 @@ namespace
             for (uint32_t x = firstX; x <= static_cast<uint32_t>(std::max(x1, 0)); x += tileW)
                 fn(((layout.unit(x, y) * layout.unitBits) >> 11) & 0x3FFFu);
     }
+
+    inline uint64_t mixContent(uint64_t hash, uint64_t value)
+    {
+        hash = (hash ^ value) * 0x9E3779B97F4A7C15ull;
+        return hash ^ (hash >> 32);
+    }
 }
 
 // As MarkWritten, for an image stored by a host-to-local transfer, which is
 // known to the block: a texture and the CLUT uploaded next to it share a page
 // more often than not, and neither changes the other.
-void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+//
+// It also keeps a number for what each block now holds. A block the image
+// covers whole holds a part of the image and nothing else: the image's
+// number and where in it the block is. A block it covers in part holds what
+// it held with a piece of the image over it: the number it had, the image's,
+// and where the image lies. Either is the same number again whenever the
+// same images are stored the same way, at this address or another, so a
+// texture's blocks say what its texels are without their being read
+// (BlocksKey). A block that was drawn into, or stored in pieces, is not
+// known until an image covers it whole.
+void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t content, bool everyBit)
 {
     if (!layout.table || x1 < x0 || y1 < y0)
         return;
@@ -1753,11 +1772,81 @@ void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int 
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
         }
     }
-    forEachBlock(layout, x0, y0, x1, y1, [this, &layout](uint32_t block)
-                 {
-                     m_blockUploadSerial[block] = m_writeSerial;
-                     NoteUploadShape(layout, block);
-                 });
+    const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
+    const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    for (int y = y0 & ~(tileH - 1); y <= y1; y += tileH)
+    {
+        for (int x = x0 & ~(tileW - 1); x <= x1; x += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
+            uint64_t now = 0;
+            if (content != 0u)
+            {
+                const uint64_t place = (static_cast<uint64_t>(static_cast<uint32_t>(x - x0)) << 32) | static_cast<uint32_t>(y - y0);
+                const bool whole = everyBit && x >= x0 && y >= y0 && x + tileW - 1 <= x1 && y + tileH - 1 <= y1;
+                // What it held is known if an image put it there and nothing
+                // has been drawn in its page since.
+                const uint64_t held = m_blockUploadSerial[block] > m_pageVramDrawSerial[block >> 5] ? m_blockContent[block] : 0u;
+                if (whole)
+                    now = mixContent(content, place);
+                else if (held != 0u)
+                    now = mixContent(mixContent(held, content),
+                                     mixContent(place, (static_cast<uint64_t>(static_cast<uint32_t>(x1 - x)) << 32) | static_cast<uint32_t>(y1 - y)));
+                if ((whole || held != 0u) && now == 0u)
+                    now = 1u;
+            }
+            m_blockContent[block] = now;
+            m_blockUploadSerial[block] = m_writeSerial;
+            NoteUploadShape(layout, block);
+        }
+    }
+}
+
+// An image that arrived in pieces is known once the last has: MarkUploaded
+// left its blocks unknown as each piece was stored. The ones it covers whole
+// hold a part of it and nothing else, unless something was drawn in their
+// page meanwhile.
+void GSCpuBackend::NoteBlocksOfPieces(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t content)
+{
+    if (!layout.table || x1 < x0 || y1 < y0 || x0 < 0 || y0 < 0 || content == 0u)
+        return;
+    const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
+    const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    for (int y = (y0 + tileH - 1) & ~(tileH - 1); y + tileH - 1 <= y1; y += tileH)
+    {
+        for (int x = (x0 + tileW - 1) & ~(tileW - 1); x + tileW - 1 <= x1; x += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
+            if (m_blockUploadSerial[block] <= m_pageVramDrawSerial[block >> 5])
+                continue;
+            const uint64_t now = mixContent(content, (static_cast<uint64_t>(static_cast<uint32_t>(x - x0)) << 32) | static_cast<uint32_t>(y - y0));
+            m_blockContent[block] = now != 0u ? now : 1u;
+        }
+    }
+}
+
+// The blocks a texture of that size is made of, as one number: the same
+// whenever they hold the same bytes, 0 unless every one of them holds
+// uploaded images that nothing was drawn over.
+uint64_t GSCpuBackend::BlocksKey(const GSMem::SurfaceLayout &layout, int width, int height) const
+{
+    if (!layout.table || width <= 0 || height <= 0)
+        return 0u;
+    const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
+    const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    uint64_t key = 0x6A09E667F3BCC908ull;
+    for (int y = 0; y < height; y += tileH)
+    {
+        for (int x = 0; x < width; x += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
+            const uint64_t content = m_blockContent[block];
+            if (content == 0u || m_blockUploadSerial[block] <= m_pageVramDrawSerial[block >> 5])
+                return 0u;
+            key = mixContent(key, content);
+        }
+    }
+    return key != 0u ? key : 1u;
 }
 
 // Whether any of those pixels of VRAM may have been written since `serial`
@@ -2096,6 +2185,16 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
     {
         ++statPartial;
     }
+    // In pieces, the image is its pieces in the order they come.
+    if (whole)
+        m_piecesFromStart = false;
+    else if (firstPixel == 0u)
+    {
+        m_piecesFromStart = true;
+        m_piecesHash = 0xBB67AE8584CAA73Bull;
+    }
+    if (m_piecesFromStart)
+        m_piecesHash = mixContent(mixContent(m_piecesHash, hashImage(data, sizeBytes)), sizeBytes);
 
     GpuUploading(layout, left, top, right, bottom);
 
@@ -2118,7 +2217,11 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
 
     if (pixel > firstPixel)
     {
-        MarkUploaded(layout, left, static_cast<int>(dsay + firstPixel / rrw), right, static_cast<int>(dsay + (pixel - 1u) / rrw));
+        // The image's number says what pixels it is and how they are laid
+        // out: its bytes, how wide its rows are and what they are stored as.
+        const uint64_t content = whole ? mixContent(uploadHash | 1u, (static_cast<uint64_t>(rrw) << 32) | (static_cast<uint64_t>(dpsm) << 8) | streamBits) | 1u : 0u;
+        MarkUploaded(layout, left, static_cast<int>(dsay + firstPixel / rrw), right, static_cast<int>(dsay + (pixel - 1u) / rrw), content,
+                     streamBits == layout.unitBits);
     }
 
     m_transferState.copiedPixels = pixel;
@@ -2148,6 +2251,12 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
                 m_uploadAt[record.target] = record;
             }
         }
+        else if (m_piecesFromStart && streamBits == layout.unitBits)
+        {
+            NoteBlocksOfPieces(layout, left, top, right, bottom,
+                               mixContent(m_piecesHash | 1u, (static_cast<uint64_t>(rrw) << 32) | (static_cast<uint64_t>(dpsm) << 8) | streamBits) | 1u);
+        }
+        m_piecesFromStart = false;
     }
     else
     {

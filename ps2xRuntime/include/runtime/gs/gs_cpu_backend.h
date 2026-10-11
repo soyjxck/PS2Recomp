@@ -114,6 +114,8 @@ private:
                                  const char *why = "upload");
     bool HasQueuedPrimitives() const;
     const DecodedTexture *DecodedTextureFor(FastPipeline &pipeline);
+    const DecodedTexture *DecodedFromBlocks(FastPipeline &pipeline, bool &decodedNow);
+    uint64_t BlocksKey(const GSMem::SurfaceLayout &layout, int width, int height) const;
     void ForgetOldDecodedTextures();
     uint64_t ConversionKey(const FastPipeline &pipeline);
     const uint32_t *ClutSnapshotFor(FastPipeline &pipeline);
@@ -123,7 +125,12 @@ private:
     static constexpr uint32_t kVramPages = 512u;
     // `inVram` false: drawn by the graphics card alone (see m_cardOnly).
     void MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, bool inVram = true);
-    void MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    // `content`: a number for the whole image (its hash, with what places
+    // its pixels), 0 when only part of it is being stored. `everyBit`: the
+    // image has all the bits of the pixels it writes.
+    void MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t content = 0,
+                      bool everyBit = false);
+    void NoteBlocksOfPieces(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t content);
     bool DrawnSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
     bool UploadedSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const;
     void MarkAllWritten();
@@ -185,6 +192,22 @@ private:
     // Image transfers, by 256-byte block.
     std::array<uint64_t, 16384> m_blockUploadSerial{};
     uint64_t m_lastUploadSerial = 0;
+    // What the transfers left in each block, as a number that comes out the
+    // same whenever the same images are stored the same way (0: not known).
+    // It stands for the block's bytes while nothing has been drawn there
+    // since (see BlocksKey).
+    std::array<uint64_t, 16384> m_blockContent{};
+    // The blocks of a texture as one number, by where and how the texture
+    // is looked at, and when that was worked out.
+    struct BlocksView
+    {
+        uint64_t key = 0; // 0: not all of it is uploaded images
+        uint64_t serial = 0;
+    };
+    std::unordered_map<uint64_t, BlocksView> m_blocksViews;
+    // An image that arrives in pieces: the pieces so far as one number.
+    uint64_t m_piecesHash = 0;
+    bool m_piecesFromStart = false;
     // The last image each host-to-local transfer wrote, to recognise one
     // that would write what VRAM already holds.
     struct UploadRecord

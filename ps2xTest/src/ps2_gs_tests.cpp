@@ -1234,6 +1234,195 @@ void register_ps2_gs_tests()
             t.Equals(kept, 640u * 480u / 2u, "and the other half are left alone");
         });
 
+        tc.Run("a texture made of several uploaded images is drawn from one copy of them, found again by what they are", [](TestCase &t)
+        {
+            // A page of 8-bit texels sent as two images of 32-bit pixels, the
+            // way a game that swaps whole pages of textures does it, and
+            // looked at as one 128x128 texture: no single transfer wrote it
+            // "as such". What its blocks hold is known all the same, so it
+            // is decoded once, and the same images stored again are the same
+            // copy without a texel being read.
+            //
+            // The copy is seen by changing VRAM where the GS cannot know (the
+            // test owns the memory): what is drawn from a copy stays as it
+            // was, what is sampled from VRAM follows.
+            constexpr uint32_t kTexturePage = 100u, kClutPage = 120u, kWidth = 2u;
+            constexpr uint32_t kTbp = kTexturePage * 32u, kCbp = kClutPage * 32u;
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            const auto upload = [&](uint32_t dbp, uint32_t dbw, uint32_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                    const std::vector<uint8_t> &bytes, size_t pieces = 1u)
+            {
+                gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(dbp) << 32) | (static_cast<uint64_t>(dbw) << 48) |
+                                                       (static_cast<uint64_t>(psm) << 56));
+                gs.writeRegister(GS_REG_TRXPOS, (static_cast<uint64_t>(x) << 32) | (static_cast<uint64_t>(y) << 48));
+                gs.writeRegister(GS_REG_TRXREG, static_cast<uint64_t>(w) | (static_cast<uint64_t>(h) << 32));
+                gs.writeRegister(GS_REG_TRXDIR, 0ull);
+                const size_t each = bytes.size() / pieces;
+                for (size_t piece = 0; piece < pieces; ++piece)
+                {
+                    std::vector<uint8_t> packet;
+                    appendU64(packet, makeGifTag(static_cast<uint16_t>(each / 16u), GIF_FMT_IMAGE, 0u, true));
+                    appendU64(packet, 0ull);
+                    packet.insert(packet.end(), bytes.begin() + static_cast<std::ptrdiff_t>(piece * each),
+                                  bytes.begin() + static_cast<std::ptrdiff_t>((piece + 1u) * each));
+                    gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+                }
+            };
+            const auto image = [](size_t size, uint32_t seed)
+            {
+                std::vector<uint8_t> bytes(size);
+                for (size_t i = 0; i < size; ++i)
+                {
+                    seed = seed * 1664525u + 1013904223u;
+                    bytes[i] = static_cast<uint8_t>(seed >> 24);
+                }
+                return bytes;
+            };
+            // The texture at `tbp`, 128 texels wide and `rows` high, drawn
+            // one texel a pixel into the frame at `fbp`; returns the frame.
+            const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp)
+            {
+                const uint32_t rows = 1u << rowsLog2;
+                gs.writeRegister(GS_REG_FRAME_1, static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(kWidth) << 16) |
+                                                     (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (127ull << 16) | (127ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+                gs.writeRegister(GS_REG_TEX1_1, 0ull);
+                gs.writeRegister(GS_REG_CLAMP_1, 0ull);
+                gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(tbp) | (static_cast<uint64_t>(kWidth) << 14) |
+                                                    (static_cast<uint64_t>(GS_PSM_T8) << 20) | (7ull << 26) |
+                                                    (static_cast<uint64_t>(rowsLog2) << 30) | (1ull << 34) | (1ull << 35) |
+                                                    (static_cast<uint64_t>(kCbp) << 37) | (1ull << 61));
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                gs.writeRegister(GS_REG_UV, 8ull | (8ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_UV, (128ull * 16ull + 8ull) | ((static_cast<uint64_t>(rows) * 16ull + 8ull) << 16));
+                gs.writeRegister(GS_REG_XYZ2, (128ull * 16ull) | ((static_cast<uint64_t>(rows) * 16ull) << 16));
+                std::vector<uint32_t> frame(128u * rows);
+                for (uint32_t y = 0u; y < rows; ++y)
+                    for (uint32_t x = 0u; x < 128u; ++x)
+                        frame[y * 128u + x] = readReferenceFramePSMCT32Pixel(vram, fbp, kWidth, x, y);
+                return frame;
+            };
+            // Changes every byte of those pages behind the GS's back; twice
+            // puts them back.
+            const auto poke = [&](uint32_t page, uint32_t pages)
+            {
+                for (size_t i = static_cast<size_t>(page) * 8192u; i < static_cast<size_t>(page + pages) * 8192u; ++i)
+                    vram[i] ^= 0xFFu;
+            };
+            // Draws one pixel of the page as the colour it has: nothing
+            // changes, but the page has now been drawn into.
+            const auto drawInto = [&](uint32_t page)
+            {
+                uint32_t pixel = 0u;
+                std::memcpy(&pixel, vram.data() + static_cast<size_t>(page) * 8192u, sizeof(pixel));
+                gs.writeRegister(GS_REG_FRAME_1, static_cast<uint64_t>(page) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
+                gs.writeRegister(GS_REG_SCISSOR_1, (63ull << 16) | (31ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+                gs.writeRegister(GS_REG_RGBAQ, static_cast<uint64_t>(pixel));
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+            };
+
+            upload(kCbp, 1u, GS_PSM_CT32, 0u, 0u, 16u, 16u, image(1024u, 7u));
+            const std::vector<uint8_t> top = image(8192u, 1u), bottom = image(8192u, 2u), other = image(8192u, 3u);
+
+            // --- Two images, one texture.
+            upload(kTbp, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, top);
+            upload(kTbp + 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, bottom);
+            const std::vector<uint32_t> first = draw(kTbp, 7u, 0u);
+            uint32_t colours = 0u;
+            for (size_t i = 1; i < first.size(); ++i)
+                colours += first[i] != first[0] ? 1u : 0u;
+            t.IsTrue(colours > 1000u, "sanity: the texture should be drawn, and be many colours");
+
+            poke(kTexturePage, 2u);
+            t.IsTrue(draw(kTbp, 7u, 16u) == first, "drawn from the copy: what VRAM holds by now does not matter");
+            poke(kTexturePage, 2u);
+
+            // --- Drawn into, it is not known any more and is sampled.
+            drawInto(kTexturePage);
+            t.IsTrue(draw(kTbp, 7u, 32u) == first, "sampled from VRAM it is the same picture as from the copy");
+            poke(kTexturePage, 2u);
+            t.IsTrue(draw(kTbp, 7u, 48u) != first, "and follows VRAM: a page that was drawn into is not known by its uploads");
+            poke(kTexturePage, 2u);
+
+            // --- The same images again are the same copy.
+            upload(kTbp, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, top);
+            upload(kTbp + 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, bottom);
+            poke(kTexturePage, 2u);
+            t.IsTrue(draw(kTbp, 7u, 64u) == first, "the same images stored again are found by what they are, not decoded again");
+            poke(kTexturePage, 2u);
+
+            // --- Another image in one half is another texture.
+            upload(kTbp, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, other);
+            const std::vector<uint32_t> second = draw(kTbp, 7u, 80u);
+            t.IsTrue(second != first, "another image in the top half is another picture");
+            t.IsTrue(std::equal(second.begin() + 64 * 128, second.end(), first.begin() + 64 * 128), "with the bottom half as it was");
+            drawInto(kTexturePage);
+            t.IsTrue(draw(kTbp, 7u, 112u) == second, "and the picture VRAM gives");
+
+            // --- A small image over part of a block: the block is what it
+            // was with that over it.
+            constexpr uint32_t kPatchedPage = 140u;
+            const std::vector<uint8_t> small = image(64u, 4u), smallOther = image(64u, 5u);
+            upload(kPatchedPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, top);
+            upload(kPatchedPage * 32u, 1u, GS_PSM_CT32, 2u, 2u, 4u, 4u, small);
+            const std::vector<uint32_t> patched = draw(kPatchedPage * 32u, 6u, 160u);
+            poke(kPatchedPage, 1u);
+            t.IsTrue(draw(kPatchedPage * 32u, 6u, 176u) == patched, "a block with a small image over part of it is still known");
+            poke(kPatchedPage, 1u);
+            upload(kPatchedPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, top);
+            upload(kPatchedPage * 32u, 1u, GS_PSM_CT32, 2u, 2u, 4u, 4u, smallOther);
+            const std::vector<uint32_t> patchedOther = draw(kPatchedPage * 32u, 6u, 192u);
+            t.IsTrue(patchedOther != patched, "and another small image over it is another picture");
+            drawInto(kPatchedPage);
+            t.IsTrue(draw(kPatchedPage * 32u, 6u, 208u) == patchedOther, "the one VRAM gives");
+
+            // --- An image that arrives in pieces is known once all of it
+            // has, by its pieces.
+            constexpr uint32_t kPiecesPage = 150u;
+            const std::vector<uint8_t> texels = image(8192u, 6u);
+            gs.writeRegister(GS_REG_BITBLTBUF, (static_cast<uint64_t>(kPiecesPage * 32u) << 32) | (2ull << 48) |
+                                                   (static_cast<uint64_t>(GS_PSM_T8) << 56));
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, 128ull | (64ull << 32));
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+            const auto sendHalf = [&](size_t half)
+            {
+                std::vector<uint8_t> packet;
+                appendU64(packet, makeGifTag(static_cast<uint16_t>(4096u / 16u), GIF_FMT_IMAGE, 0u, true));
+                appendU64(packet, 0ull);
+                packet.insert(packet.end(), texels.begin() + static_cast<std::ptrdiff_t>(half * 4096u),
+                              texels.begin() + static_cast<std::ptrdiff_t>((half + 1u) * 4096u));
+                gs.processGIFPacket(packet.data(), static_cast<uint32_t>(packet.size()));
+            };
+            sendHalf(0u);
+            const std::vector<uint32_t> half = draw(kPiecesPage * 32u, 6u, 224u);
+            poke(kPiecesPage, 1u);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 240u) != half, "half an image is not known: it is sampled from VRAM");
+            poke(kPiecesPage, 1u);
+            sendHalf(1u);
+            const std::vector<uint32_t> whole = draw(kPiecesPage * 32u, 6u, 256u);
+            t.IsTrue(whole != half, "sanity: the second half arrived");
+            poke(kPiecesPage, 1u);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 272u) == whole, "all of it is: drawn from a copy");
+            poke(kPiecesPage, 1u);
+            drawInto(kPiecesPage);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 288u) == whole, "the picture VRAM gives");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
