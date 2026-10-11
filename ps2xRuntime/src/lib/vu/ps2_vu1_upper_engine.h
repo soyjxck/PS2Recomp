@@ -722,9 +722,9 @@ PS2_VU_FORCE_INLINE void computeUpper(uint32_t instr, const Inputs &in, Sink &si
         sink.vf(fd, dest, result);
         return;
     case 0x2E: // OPMSUB
-        result[0] = acc(0) - vs(1) * vt(2);
-        result[1] = acc(1) - vs(2) * vt(0);
-        result[2] = acc(2) - vs(0) * vt(1);
+        result[0] = std::fma(-vs(1), vt(2), acc(0));
+        result[1] = std::fma(-vs(2), vt(0), acc(1));
+        result[2] = std::fma(-vs(0), vt(1), acc(2));
         result[3] = 0.0f;
         publishFmac(result, dest);
         sink.vf(fd, dest, result);
