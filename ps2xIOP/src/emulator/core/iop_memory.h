@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -10,7 +12,7 @@
 
 namespace ps2x::iop::detail
 {
-    class IopMemory
+    class IopMemory final : private IopSpu2Host
     {
     public:
         static constexpr uint32_t RamSize = 2u * 1024u * 1024u;
@@ -36,7 +38,9 @@ namespace ps2x::iop::detail
             uint32_t size = 0;
         };
 
-        struct DmaStart
+        // An interrupt a device has raised, for the emulator to deliver
+        // that many cycles from now.
+        struct RaisedInterrupt
         {
             int irq = 0;
             uint64_t delayCycles = 0;
@@ -72,15 +76,41 @@ namespace ps2x::iop::detail
         void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
-        [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        [[nodiscard]] bool interruptsRaised() const noexcept { return !m_raised.empty(); }
+        template <typename Deliver>
+        void takeRaisedInterrupts(Deliver &&deliver)
+        {
+            for (const RaisedInterrupt &raised : m_raised)
+                deliver(raised);
+            m_raised.clear();
+        }
+        [[nodiscard]] IopSpu2 &spu2() noexcept { return m_spu2; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
     private:
+        // One of the two DMA channels that feed the SPU2: 4 for the first
+        // core, 7 for the second.
+        struct SpuDma
+        {
+            uint32_t madr = 0;
+            uint32_t bcr = 0;
+            uint32_t chcr = 0;
+            uint32_t remaining = 0; // bytes AutoDMA has still to take
+
+            // The register `offset` bytes into the channel's three.
+            [[nodiscard]] uint32_t &at(uint32_t offset) { return offset < 4u ? madr : offset < 8u ? bcr : chcr; }
+            [[nodiscard]] uint32_t at(uint32_t offset) const { return offset < 4u ? madr : offset < 8u ? bcr : chcr; }
+        };
+
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
-        void writeHardware32(uint32_t address, uint32_t value);
+        // `written`: the bits of the register this write carries.
+        void writeHardware32(uint32_t address, uint32_t value, uint32_t written = 0xFFFFFFFFu);
         void markOwned(uint32_t address, size_t size);
+        void startSpuDma(int channel);
+        bool fetchAutoDma(int core, uint16_t *block) override;
+        void raiseSpuInterrupt() override;
 
         std::vector<uint8_t> m_ram;
         std::vector<uint8_t> m_owned;
@@ -91,6 +121,9 @@ namespace ps2x::iop::detail
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
-        std::optional<DmaStart> m_dmaStart;
+        mutable IopSpu2 m_spu2{*this};
+        SpuDma m_spuDma[2];
+        std::vector<uint16_t> m_dmaWords;
+        std::vector<RaisedInterrupt> m_raised;
     };
 }

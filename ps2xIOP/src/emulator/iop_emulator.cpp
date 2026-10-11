@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -126,6 +127,9 @@ namespace ps2x::iop::detail
             ioman.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
+            spuCycles = 0;
+            spuSeenCycles = 0;
+            sampleBatchFrames = 0;
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
@@ -177,8 +181,40 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
-            if (const auto dma = memory.takeDmaStart())
-                pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+            if (!memory.interruptsRaised())
+                return;
+            memory.takeRaisedInterrupts([this](const IopMemory::RaisedInterrupt &raised)
+                                        { pendingDmaInterrupts[raised.irq] = totalCycles + raised.delayCycles; });
+        }
+
+        // The SPU2 makes a sample every 768 cycles of the IOP's 36.864 MHz.
+        // Only the cycles the EE reports are its clock (runCycles): what the
+        // IOP runs besides, answering an RPC or loading a module, takes no
+        // time on the EE's side, and sound made for it would run ahead of
+        // the picture.
+        static constexpr uint64_t kCyclesPerSample = 768u;
+        static constexpr size_t kSampleBatchFrames = 64u;
+
+        void advanceSpu()
+        {
+            spuCycles += totalCycles - spuSeenCycles;
+            spuSeenCycles = totalCycles;
+            if (spuCycles < kCyclesPerSample)
+                return;
+            do
+            {
+                spuCycles -= kCyclesPerSample;
+                int16_t left = 0, right = 0;
+                memory.spu2().tick(left, right);
+                sampleBatch[sampleBatchFrames * 2u] = left;
+                sampleBatch[sampleBatchFrames * 2u + 1u] = right;
+                if (++sampleBatchFrames == kSampleBatchFrames)
+                {
+                    host.audioSamples(sampleBatch.data(), sampleBatchFrames);
+                    sampleBatchFrames = 0u;
+                }
+            } while (spuCycles >= kCyclesPerSample);
+            schedulePendingDma();
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -580,8 +616,10 @@ namespace ps2x::iop::detail
             try
             {
                 const uint64_t target = totalCycles + cycles;
+                spuSeenCycles = totalCycles;
                 while (totalCycles < target)
                 {
+                    advanceSpu();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -603,6 +641,7 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                advanceSpu();
             }
             catch (...)
             {
@@ -725,6 +764,10 @@ namespace ps2x::iop::detail
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         bool flushingEeCycles = false;
+        uint64_t spuCycles = 0;     // on the SPU2's clock, not yet made into samples
+        uint64_t spuSeenCycles = 0; // totalCycles when the SPU2's clock last took its share
+        std::array<int16_t, kSampleBatchFrames * 2u> sampleBatch{};
+        size_t sampleBatchFrames = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
