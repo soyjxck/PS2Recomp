@@ -149,6 +149,11 @@ namespace ps2x
     // widened, its movies and menus not). Any thread may call it.
     void setPresentationAspect(float widthOverHeight);
 
+    // How the picture is drawn to the window from now on, in place of the
+    // [display] filter: smooth (linear) or each pixel as it is (nearest).
+    // Any thread may call it.
+    void setDisplayFilter(bool smooth);
+
     // What a game draws flat over its scenes (gauges, maps, text) is laid
     // out for a 4:3 picture. Once the scenes are made for a wider one and
     // shown stretched out to it, that layer is stretched with them. This

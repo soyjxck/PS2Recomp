@@ -115,6 +115,20 @@ void ps2x::setPresentationAspect(float widthOverHeight)
     g_presentationAspect.store(widthOverHeight > 0.0f ? widthOverHeight : 0.0f, std::memory_order_relaxed);
 }
 
+// -1 for what [display] filter says.
+static std::atomic<int> g_displayFilter{-1};
+
+void ps2x::setDisplayFilter(bool smooth)
+{
+    g_displayFilter.store(smooth ? 1 : 0, std::memory_order_relaxed);
+}
+
+static bool displaySmooth()
+{
+    const int asked = g_displayFilter.load(std::memory_order_relaxed);
+    return asked < 0 ? hostDisplay().smooth : asked != 0;
+}
+
 struct ElfHeader
 {
     uint32_t magic;
@@ -839,7 +853,7 @@ static void resizeFrameTexture(Texture2D &tex, int width, int height)
     Image blank = GenImageColor(width, height, BLANK);
     tex = LoadTextureFromImage(blank);
     UnloadImage(blank);
-    SetTextureFilter(tex, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+    SetTextureFilter(tex, displaySmooth() ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
 }
 
 // The picture when the graphics card has kept it (GSGpu::LatestShown): its
@@ -891,7 +905,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                 g_cardTexture.height = static_cast<int>(shown.height);
                 g_cardTexture.mipmaps = 1;
                 g_cardTexture.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-                SetTextureFilter(g_cardTexture, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+                SetTextureFilter(g_cardTexture, displaySmooth() ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
             }
             if (frameDumpDue(currentTick))
             {
@@ -2993,7 +3007,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
-    SetTextureFilter(frameTex, hostDisplay().smooth ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+    SetTextureFilter(frameTex, displaySmooth() ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3123,6 +3137,18 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
+        // (The filter may have been changed since the textures were made.)
+        {
+            static int filterInForce = -1;
+            const int filter = displaySmooth() ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT;
+            if (filter != filterInForce)
+            {
+                filterInForce = filter;
+                SetTextureFilter(frameTex, filter);
+                if (g_cardTexture.id != 0u)
+                    SetTextureFilter(g_cardTexture, filter);
+            }
+        }
         DrawTexturePro(g_cardPicture ? g_cardTexture : frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
