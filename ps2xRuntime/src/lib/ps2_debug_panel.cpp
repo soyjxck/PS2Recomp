@@ -2217,6 +2217,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         toggleVisible();
     }
 
+    ps2xInputSetUiOpen(m_visible); // the panel needs the mouse
     if (!m_visible)
     {
         return;

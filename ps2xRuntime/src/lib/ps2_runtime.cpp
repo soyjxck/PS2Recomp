@@ -3023,6 +3023,7 @@ void PS2Runtime::run()
         if (IsKeyPressed(KEY_F11))
             ToggleBorderlessWindowed();
 #endif
+        ps2xInputFrame();
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
