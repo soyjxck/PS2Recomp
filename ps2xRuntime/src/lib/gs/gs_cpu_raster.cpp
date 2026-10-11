@@ -1648,12 +1648,13 @@ namespace
             const Line &line = lines[i];
             const uint32_t k = line.key;
             char text[160];
-            std::snprintf(text, sizeof(text), "%s%s%s%s%s%s%s ztst=%u%s%s%s tfx=%u%s tex=%s frame=%u depth=%u%s%s",
+            std::snprintf(text, sizeof(text), "%s%s%s%s%s%s%s ztst=%u%s%s%s tfx=%u%s tex=%s frame=%u depth=%u%s%s%s",
                           (k & 1u) ? "sprite" : "tri", (k & 2u) ? " tme" : "", (k & 4u) ? " linear" : "", (k & 8u) ? " decoded" : "",
                           (k & 16u) ? " fge" : "", (k & 32u) ? " abe" : "", (k & 64u) ? " atest" : "", (k >> 7) & 3u,
                           (k & 0x200u) ? " zmask" : "", (k & 0x400u) ? " fst" : "", (k & 0x800u) ? " gouraud" : "", (k >> 12) & 3u,
                           (k & 0x4000u) ? " tcc" : "", kTexKinds[(k >> 15) & 7u], (k >> 18) & 3u, (k >> 20) & 3u,
-                          (k & 0x400000u) ? " date" : "", (k & 0x800000u) ? " fbmsk" : "");
+                          (k & 0x400000u) ? " date" : "", (k & 0x800000u) ? " fbmsk" : "",
+                          (k & 0x1000000u) ? " samples-its-target" : "");
             std::fprintf(stderr, "[gs-classes] %5.1f%% %6.1f ns/px %8.2fM px %8llu calls %5.1f rows/call %5.1f px/row %4.1f px/block  %s\n",
                          100.0 * static_cast<double>(line.nanoseconds) / static_cast<double>(std::max<uint64_t>(total, 1u)),
                          static_cast<double>(line.nanoseconds) / static_cast<double>(std::max<uint64_t>(line.pixels, 1u)),
@@ -2673,7 +2674,8 @@ void GSCpuBackend::Rasterise(const PreparedPrimitive &primitive, int yFirst, int
                              (p.zmask ? 0x200u : 0u) | (p.tme && p.fst ? 0x400u : 0u) | (primitive.gouraud ? 0x800u : 0u) |
                              (p.tme ? static_cast<uint32_t>(p.tfx & 3u) << 12 : 0u) | (p.tme && p.tcc ? 0x4000u : 0u) |
                              (p.tme ? static_cast<uint32_t>(p.texKind) << 15 : 0u) | (static_cast<uint32_t>(p.frameKind) << 18) |
-                             (static_cast<uint32_t>(p.depthKind) << 20) | (p.date ? 0x400000u : 0u) | (p.fbmsk != 0u ? 0x800000u : 0u);
+                             (static_cast<uint32_t>(p.depthKind) << 20) | (p.date ? 0x400000u : 0u) | (p.fbmsk != 0u ? 0x800000u : 0u) |
+                             (p.tme && p.textureIsTarget ? 0x1000000u : 0u);
         RasterTally tally;
         const auto start = std::chrono::steady_clock::now();
         RasteriseRows(primitive, yFirst, yLast, &tally);
