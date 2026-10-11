@@ -140,6 +140,7 @@ uniform ivec2 uTexOrigin;
 uniform ivec2 uTexExtent;
 uniform vec2 uSurfaceTexel; // one over the surface's size
 uniform int uTexAlphaFixed;
+uniform int uShuffle;       // 1 both halves of the texel are its red and green, 2 its blue and alpha
 uniform float uTa0;
 uniform int uAem;
 uniform int uFog;
@@ -225,6 +226,10 @@ void main()
         }
         if (uTexAlphaFixed != 0)
             t.a = (uAem != 0 && t.rgb == vec3(0.0)) ? 0.0 : uTa0;
+        if (uShuffle == 1)
+            t = t.rgrg;
+        else if (uShuffle == 2)
+            t = t.baba;
         float va = a;
         if (uTfx == 0)
         {
@@ -459,7 +464,7 @@ void main()
         {
             GLint toClip, texture, textureMode, linear, tfx, tcc, wrap, region, texSize, texOrigin, texExtent, surfaceTexel,
                 texAlphaFixed, ta0, aem, fog, fogColour, alphaTest, atst, aref, output, blendSource, blendDest, blendAlpha, fix,
-                pabe, fba, frame, date, alphaSplit;
+                pabe, fba, frame, date, alphaSplit, shuffle;
         } at{};
         struct
         {
@@ -819,6 +824,7 @@ void main()
         PS2X_UNIFORM(frame, "uFrame");
         PS2X_UNIFORM(date, "uDate");
         PS2X_UNIFORM(alphaSplit, "uAlphaSplit");
+        PS2X_UNIFORM(shuffle, "uShuffle");
 #undef PS2X_UNIFORM
         fillAt.rect = glGetUniformLocation(fillProgram, "uRect");
         fillAt.size = glGetUniformLocation(fillProgram, "uSize");
@@ -1224,6 +1230,7 @@ void main()
             glUniform1i(at.linear, p.linear);
             glUniform1i(at.tfx, p.tfx);
             glUniform1i(at.tcc, p.tcc);
+            glUniform1i(at.shuffle, p.shuffle == 0u ? 0 : 1 + static_cast<int>((p.shuffle - 1u) & 1u));
             glUniform2i(at.wrap, p.wrapU, p.wrapV);
             glUniform4i(at.region, p.region[0], p.region[1], p.region[2], p.region[3]);
             glUniform2i(at.texSize, p.texSize[0], p.texSize[1]);
@@ -1285,7 +1292,12 @@ void main()
             glUniform1i(at.alphaTest, pass.alphaTest);
             auto draw = [&](bool writeRgb, bool writeAlpha, bool writeDepth)
             {
-                glColorMask(writeRgb, writeRgb, writeRgb, writeAlpha);
+                // A channel shuffle writes one half of the pixel.
+                const bool half = p.shuffle != 0u, high = half && ((p.shuffle - 1u) & 2u) != 0u;
+                if (half)
+                    glColorMask(!high, !high, high, high);
+                else
+                    glColorMask(writeRgb, writeRgb, writeRgb, writeAlpha);
                 glDepthMask(writeDepth ? GL_TRUE : GL_FALSE);
                 glDrawArrays(GL_TRIANGLES, static_cast<GLint>(first), static_cast<GLsizei>(count));
                 ++passes;

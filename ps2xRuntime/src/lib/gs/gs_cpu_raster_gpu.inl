@@ -103,7 +103,7 @@ struct GSCpuBackend::GpuState
     uint64_t statWhy[WhyCount]{};
 
     uint64_t statDraws = 0, statSurfaceTextures = 0, statCopyTextures = 0, statVramTextures = 0, statDecodes = 0, statUploads = 0,
-             statFills = 0, statFilledPages = 0, statDownloads = 0, statDownloadedPages = 0, statDropped = 0, statAdopted = 0;
+             statFills = 0, statFilledPages = 0, statDownloads = 0, statDownloadedPages = 0, statDropped = 0, statAdopted = 0, statShuffled = 0;
 };
 
 void GSCpuBackend::GpuStateDeleter::operator()(GpuState *state) const
@@ -947,6 +947,7 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
     // FBMSK a channel at a time, which is how games use it.
     state.writeRgb = (p.fbmsk & 0x00FFFFFFu) != 0x00FFFFFFu ? 1u : 0u;
     state.writeAlpha = (p.fbmsk & 0xFF000000u) != 0xFF000000u && p.frameKind != FrameKind::C24 ? 1u : 0u;
+    state.shuffle = m_shuffle;
     if (p.tme)
         GpuTexture(q, ctx, state);
 
@@ -1080,7 +1081,7 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     if (wantStats && ++gpu.statDraws % 2000000u == 0u)
-        std::fprintf(stderr, "[gs-gpu] %llu primitives: textures %llu from a surface, %llu from a decoded copy, %llu from VRAM (%llu decoded, %llu sent); %llu fills of %llu pages; back to VRAM %llu times, %llu pages (for a texture %llu, a CLUT %llu, software drawing %llu, another surface %llu, an image %llu, the display %llu, everything %llu); %llu pages changed hands, %llu given up to images; %zu surfaces, %zu VRAM textures\n",
+        std::fprintf(stderr, "[gs-gpu] %llu primitives: textures %llu from a surface, %llu from a decoded copy, %llu from VRAM (%llu decoded, %llu sent); %llu fills of %llu pages; back to VRAM %llu times, %llu pages (for a texture %llu, a CLUT %llu, software drawing %llu, another surface %llu, an image %llu, the display %llu, everything %llu); %llu pages changed hands, %llu given up to images; %llu pieces of channel shuffles; %zu surfaces, %zu VRAM textures\n",
                      static_cast<unsigned long long>(gpu.statDraws), static_cast<unsigned long long>(gpu.statSurfaceTextures),
                      static_cast<unsigned long long>(gpu.statCopyTextures), static_cast<unsigned long long>(gpu.statVramTextures),
                      static_cast<unsigned long long>(gpu.statDecodes), static_cast<unsigned long long>(gpu.statUploads),
@@ -1092,7 +1093,178 @@ void GSCpuBackend::GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &q, 
                      static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyImage]), static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyDisplay]),
                      static_cast<unsigned long long>(gpu.statWhy[GpuState::WhyEverything]),
                      static_cast<unsigned long long>(gpu.statAdopted), static_cast<unsigned long long>(gpu.statDropped),
-                     gpu.surfaces.size(), gpu.textures.size());
+                     static_cast<unsigned long long>(gpu.statShuffled), gpu.surfaces.size(), gpu.textures.size());
+}
+
+// A channel shuffle. A buffer of 32-bit pixels read as 16-bit ones is twice
+// as tall, and in every 16 columns of that view the left 8 are the low
+// halves of 8 pixels (their red and green) and the right 8 the high halves
+// (blue and alpha) of the same 8. A game that wants one channel where
+// another is draws strips of the one view over the other columns, texel for
+// texel: a 16-bit frame from a 16-bit texture, 8 columns at a time.
+// Drakengard 2 dims the scene behind its text that way, every frame it
+// does: the left columns of its frame onto the right columns of a second
+// buffer, whose alpha (the frame's green) it then blends the frame by.
+//
+// The card has both buffers as the 32-bit surfaces they are, and a 16-bit
+// view of either is no surface of its: drawn the general way, each strip
+// brings its pages back to VRAM for the software path. Here each strip is
+// drawn on the card instead, as the pixels it is the halves of: for every
+// 8 by 8 block of the 16-bit view it covers, the block of 32-bit pixels
+// that is, read from the texture's surface with one half of the texel in
+// the place of both and written to that half alone (m_shuffle). Blocks side
+// by side in both buffers go as one sprite: a column of the 16-bit view is
+// a row of blocks of the other.
+//
+// False for a sprite that is not that (and it is drawn as before).
+bool GSCpuBackend::GpuShuffle(const GSPrimitiveBatch &batch, const PreparedPrimitive &q)
+{
+    const FastPipeline &p = q.pipeline;
+    if (!m_cardOnly || !GpuReady() || !q.sprite || q.placed || !p.tme || !p.fst || p.linear || !p.tcc)
+        return false;
+    if (p.texKind != TextureKind::Direct16 || p.abe || p.fge || p.date || p.fba || p.fbmsk != 0u || p.ztst != 1u)
+        return false;
+    // Written whatever is there, and the frame alone.
+    const bool frameOnly = p.alphaTest && p.atst == 0u && p.afail == 1u;
+    if ((p.alphaTest && p.atst != 1u && !frameOnly) || (!p.zmask && !frameOnly))
+        return false;
+    // The texel as it is: its colours unchanged, and its one bit of alpha.
+    const GSVertex &colour = q.v[1];
+    if (p.tfx != 1u && !(p.tfx == 0u && colour.r == 0x80u && colour.g == 0x80u && colour.b == 0x80u && colour.a == 0x80u))
+        return false;
+    if ((p.texa.ta1 & 0x80u) == 0u || (p.texa.ta0 & 0x80u) != 0u)
+        return false;
+    if (p.frame.spillsIntoNextPage || p.texture.spillsIntoNextPage || p.frame.unitBits != 16u || p.texture.unitBits != 16u)
+        return false;
+
+    // Texel for texel, in whole blocks of 8 by 8.
+    const int width = static_cast<int>(q.spanX), height = static_cast<int>(q.spanY);
+    const int u0 = static_cast<int>(std::lround(q.tu0)), v0 = static_cast<int>(std::lround(q.tv0));
+    if (std::fabs(q.tu0 - static_cast<float>(u0)) > 0.01f || std::fabs(q.tv0 - static_cast<float>(v0)) > 0.01f ||
+        std::fabs(q.tu1 - q.tu0 - q.spanX) > 0.01f || std::fabs(q.tv1 - q.tv0 - q.spanY) > 0.01f)
+        return false;
+    const int x0 = q.minX, x1 = q.maxX + 1, y0 = q.minY, y1 = q.maxY + 1;
+    const int du = u0 - q.originX, dv = v0 - q.originY;
+    if (x0 < q.originX || x1 > q.originX + width || y0 < q.originY || y1 > q.originY + height)
+        return false;
+    if (((x0 | x1 | y0 | y1 | du | dv) & 7) != 0 || x0 + du < 0 || y0 + dv < 0 || x1 + du > p.texW || y1 + dv > p.texH)
+        return false;
+
+    const GSContext &ctx = batch.state.context;
+    const GSMem::SurfaceLayout frame32 = GSMem::LayoutOf(GS_PSM_CT32, ctx.frame.fbp * 32u, ctx.frame.fbw);
+    const GSMem::SurfaceLayout texture32 = GSMem::LayoutOf(GS_PSM_CT32, p.tbp0, p.tbw);
+    if (!frame32.table || !texture32.table || frame32.spillsIntoNextPage || texture32.spillsIntoNextPage)
+        return false;
+
+    // Where each 32-bit word of a page is in the page, as 32-bit pixels.
+    static const std::array<uint16_t, 2048> wordAt = []
+    {
+        std::array<uint16_t, 2048> at{};
+        const GSMem::SurfaceLayout layout = GSMem::LayoutOf(GS_PSM_CT32, 0u, 1u);
+        for (uint32_t y = 0; y < 32u; ++y)
+            for (uint32_t x = 0; x < 64u; ++x)
+                at[layout.unit(x, y) & 2047u] = static_cast<uint16_t>((y << 6) | x);
+        return at;
+    }();
+    // The 32-bit pixel a pixel of a 16-bit view is half of, in `as32`'s
+    // buffer, and which half.
+    struct Half
+    {
+        int x, y;
+        bool high;
+    };
+    const auto halfOf = [](const GSMem::SurfaceLayout &as16, const GSMem::SurfaceLayout &as32, int x, int y)
+    {
+        const uint32_t unit = as16.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+        const uint32_t word = unit >> 1, page = (word >> 11) - as32.basePage, at = wordAt[word & 2047u];
+        return Half{static_cast<int>((page % as32.pagesPerRow) * 64u + (at & 63u)),
+                    static_cast<int>((page / as32.pagesPerRow) * 32u + (at >> 6)), (unit & 1u) != 0u};
+    };
+
+    struct Piece
+    {
+        int x, y, sourceX, sourceY, width;
+        bool high, sourceHigh;
+    };
+    std::vector<Piece> pieces;
+    pieces.reserve(static_cast<size_t>((y1 - y0) / 64 + 2) * static_cast<size_t>((x1 - x0) / 8));
+    for (int x = x0; x < x1; x += 8)
+    {
+        for (int y = y0; y < y1; y += 8)
+        {
+            const Half to = halfOf(p.frame, frame32, x, y), from = halfOf(p.texture, texture32, x + du, y + dv);
+            // A block is a block in both views, or this is not the layout
+            // it is taken for.
+            const Half toEnd = halfOf(p.frame, frame32, x + 7, y + 7), fromEnd = halfOf(p.texture, texture32, x + du + 7, y + dv + 7);
+            if (toEnd.x != to.x + 7 || toEnd.y != to.y + 7 || toEnd.high != to.high || fromEnd.x != from.x + 7 ||
+                fromEnd.y != from.y + 7 || fromEnd.high != from.high || ((to.x | to.y | from.x | from.y) & 7) != 0)
+                return false;
+            if (!pieces.empty())
+            {
+                Piece &last = pieces.back();
+                if (last.y == to.y && last.x + last.width == to.x && last.sourceY == from.y &&
+                    last.sourceX + last.width == from.x && last.high == to.high && last.sourceHigh == from.high)
+                {
+                    last.width += 8;
+                    continue;
+                }
+            }
+            pieces.push_back({to.x, to.y, from.x, from.y, 8, to.high, from.high});
+        }
+    }
+
+    // Each piece as a sprite between the two buffers as 32-bit ones.
+    GSPrimitiveBatch piece = batch;
+    GSDrawState &state = piece.state;
+    state.context.frame.psm = GS_PSM_CT32;
+    state.context.frame.fbmsk = 0u;
+    state.context.zbuf.zmask = true;
+    state.context.tex0.psm = GS_PSM_CT32;
+    state.context.tex0.tw = 10u;
+    state.context.tex0.th = 10u;
+    state.context.tex0.tcc = 1u;
+    state.context.tex0.tfx = 1u;
+    state.context.tex1 = 0u;
+    state.context.clamp = 0u;
+    state.context.alpha = 0u;
+    state.context.fba = 0u;
+    state.context.test = 0x30000u; // depth: always
+    state.context.xyoffset = {};
+    state.context.scissor.x0 = 0u;
+    state.context.scissor.y0 = 0u;
+    state.context.scissor.x1 = static_cast<uint16_t>(std::max<uint32_t>(ctx.frame.fbw * 64u, 1u) - 1u);
+    state.context.scissor.y1 = 2047u;
+    state.prim.abe = false;
+    state.prim.fge = false;
+    state.prim.tme = true;
+    state.prim.fst = true;
+    state.pabe = false;
+    state.textureWidth = 1024u;
+    state.textureHeight = 1024u;
+    state.linearFilter = false;
+    piece.vertexCount = 2u;
+    bool drawn = true;
+    if (m_gpu->statShuffled == 0u && std::getenv("PS2X_GS_STATS"))
+        std::fprintf(stderr, "[gs-gpu] a channel shuffle: page %u from page %u, both %u wide\n", ctx.frame.fbp, p.tbp0 / 32u,
+                     ctx.frame.fbw * 64u);
+    m_gpu->statShuffled += pieces.size();
+    for (const Piece &part : pieces)
+    {
+        GSVertex &a = piece.vertices[0], &b = piece.vertices[1];
+        a.x = static_cast<float>(part.x);
+        a.y = static_cast<float>(part.y);
+        a.u = static_cast<uint16_t>(part.sourceX << 4);
+        a.v = static_cast<uint16_t>(part.sourceY << 4);
+        b.x = static_cast<float>(part.x + part.width);
+        b.y = static_cast<float>(part.y + 8);
+        b.u = static_cast<uint16_t>((part.sourceX + part.width) << 4);
+        b.v = static_cast<uint16_t>((part.sourceY + 8) << 4);
+        a.z = b.z = 0.0;
+        m_shuffle = static_cast<uint8_t>(1u + (part.sourceHigh ? 1u : 0u) + (part.high ? 2u : 0u));
+        drawn = DrawFast(piece, FastKind::Sprite) && drawn;
+    }
+    m_shuffle = 0u;
+    return drawn;
 }
 
 // PS2X_GPU_COMPARE=<n> (with a resolution of 1): every n-th frame shown,

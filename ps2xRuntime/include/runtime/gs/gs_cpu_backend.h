@@ -288,6 +288,9 @@ private:
     // primitive only the software path can draw. GpuDownload brings them.
     // (display.renderer = hybrid keeps both drawing, as a check.)
     bool m_cardOnly = false;
+    // GpuShuffle: the sprite being drawn is a piece of a channel shuffle, and
+    // which halves it reads and writes (GSGpu::Pipeline::shuffle).
+    uint8_t m_shuffle = 0;
     // NarrowFlat: the primitive being drawn is one of its sprites, and the
     // run of primitives at one depth it last saw (where it narrows them about).
     bool m_flatSprite = false;
@@ -331,6 +334,7 @@ private:
     uint32_t GpuSurface(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind, int rows);
     void GpuFill(const GSMem::SurfaceLayout &layout, SurfaceScale scale, int depthKind, int x0, int y0, int x1, int y1, bool overwritten);
     void GpuDraw(const GSPrimitiveBatch &batch, PreparedPrimitive &primitive, SurfaceScale scale);
+    bool GpuShuffle(const GSPrimitiveBatch &batch, const PreparedPrimitive &primitive);
     void GpuTexture(PreparedPrimitive &primitive, const GSContext &context, GSGpu::Pipeline &state);
     void GpuTextureFromVram(FastPipeline &pipeline, GSGpu::Pipeline &state);
     void GpuForgetTexture(uint32_t texture);

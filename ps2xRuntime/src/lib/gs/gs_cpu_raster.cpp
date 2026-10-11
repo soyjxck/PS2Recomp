@@ -3729,6 +3729,10 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         return true;
     FastPipeline &p = primitive.pipeline;
 
+    // A channel shuffle is drawn by the card as what it is.
+    if (kind == FastKind::Sprite && p.frameKind == FrameKind::C16 && m_shuffle == 0u && GpuShuffle(batch, primitive))
+        return true;
+
     // Primitives wait together only while they draw to the same buffers.
     const GSContext &ctx = batch.state.context;
     if (!queue.pending.empty() &&
@@ -3762,7 +3766,7 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
         // a clear, a copy. What its pages hold is of no interest then.
         const bool everyPixel = primitive.sprite && p.ztst == 1u && !p.date &&
                                 (!p.alphaTest || p.atst == 1u || (p.atst == 0u && p.afail == 1u && p.zmask));
-        const bool overFrame = everyPixel && p.fbmsk == 0u && p.frameKind == FrameKind::C32 &&
+        const bool overFrame = everyPixel && p.fbmsk == 0u && p.frameKind == FrameKind::C32 && m_shuffle == 0u &&
                                (!p.abe || (!p.pabe && p.asel != 1u && p.bsel != 1u && p.dsel != 1u && p.csel != 1u));
         const bool overDepth = everyPixel && !p.zmask && (!p.alphaTest || p.atst == 1u);
         auto fill = [&](const GSMem::SurfaceLayout &layout, uint64_t key, int depthKind, bool overwritten)

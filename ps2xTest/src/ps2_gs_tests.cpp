@@ -1153,6 +1153,85 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("a 16-bit copy of each block's left columns to its right ones puts red and green in blue and alpha", [](TestCase &t)
+        {
+            // A buffer of 32-bit pixels read as 16-bit ones is twice as
+            // tall, and in every 16 columns of that view the left 8 are the
+            // low halves of 8 pixels and the right 8 their high halves.
+            // Drakengard 2 copies the left columns of its frame, drawn as a
+            // 16-bit texture, to the right columns of another buffer drawn
+            // into as a 16-bit frame, and then uses that buffer's alpha: the
+            // frame's green. These are its registers, for one strip in two.
+            constexpr uint32_t kSourceFbp = 0x50u, kShuffledFbp = 0x136u, kWidth = 10u;
+            constexpr uint64_t kFrame =
+                static_cast<uint64_t>(kShuffledFbp) | (static_cast<uint64_t>(kWidth) << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT16) << 24);
+            constexpr uint64_t kZbuf = 0xE6ull | (static_cast<uint64_t>(GS_PSM_Z16S & 0xFu) << 24);
+            constexpr uint64_t kScissor = (0ull << 0) | (639ull << 16) | (0ull << 32) | (959ull << 48);
+            constexpr uint64_t kXyOffset = (1728ull << 4) | ((1808ull << 4) << 32);
+            constexpr uint64_t kTest = 0x31001ull; // alpha test never, the frame only; depth always
+            constexpr uint64_t kTex0 =
+                (static_cast<uint64_t>(kSourceFbp) * 32ull) | (static_cast<uint64_t>(kWidth) << 14) |
+                (static_cast<uint64_t>(GS_PSM_CT16) << 20) | (10ull << 26) | (10ull << 30) | (1ull << 34);
+            constexpr uint64_t kTexa = 0ull | (255ull << 32);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8) | (1ull << 9);
+
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            const auto sourcePixel = [](uint32_t x, uint32_t y)
+            {
+                return ((x * 7u + y * 13u) & 0xFFu) | (((x * 3u + y * 5u + 1u) & 0xFFu) << 8) | 0x55AA0000u;
+            };
+            for (uint32_t y = 0u; y < 480u; ++y)
+                for (uint32_t x = 0u; x < 640u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kSourceFbp * 32u, kWidth, x, y, sourcePixel(x, y));
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_2, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_2, kZbuf);
+            gs.writeRegister(GS_REG_SCISSOR_2, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_2, kXyOffset);
+            gs.writeRegister(GS_REG_TEST_2, kTest);
+            gs.writeRegister(GS_REG_ALPHA_2, 0ull);
+            gs.writeRegister(GS_REG_TEX0_2, kTex0);
+            gs.writeRegister(GS_REG_TEX1_2, 0ull);
+            gs.writeRegister(GS_REG_CLAMP_2, 0ull);
+            gs.writeRegister(GS_REG_TEXA, kTexa);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+            // Every other strip of the game's forty.
+            for (uint32_t strip = 0u; strip < 40u; strip += 2u)
+            {
+                const uint64_t u0 = 16u * strip * 16u + 8u, u1 = (16u * strip + 8u) * 16u + 8u;
+                const uint64_t x0 = (1728u + 8u + 16u * strip) * 16u, x1 = (1728u + 16u + 16u * strip) * 16u;
+                gs.writeRegister(GS_REG_UV, u0 | (8ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, x0 | ((1808ull * 16ull) << 16));
+                gs.writeRegister(GS_REG_UV, u1 | ((960ull * 16ull + 8ull) << 16));
+                gs.writeRegister(GS_REG_XYZ2, x1 | (((1808ull + 960ull) * 16ull) << 16));
+            }
+
+            // Which pixels a strip of the 16-bit view is: by where its
+            // first column lies in memory.
+            uint32_t moved = 0u, kept = 0u, wrong = 0u;
+            for (uint32_t y = 0u; y < 480u; ++y)
+            {
+                for (uint32_t x = 0u; x < 640u; ++x)
+                {
+                    const uint32_t source = sourcePixel(x, y);
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, kShuffledFbp, kWidth, x, y);
+                    if (pixel == ((source & 0xFFFFu) << 16))
+                        ++moved;
+                    else if (pixel == 0u)
+                        ++kept;
+                    else
+                        ++wrong;
+                }
+            }
+            t.Equals(wrong, 0u, "a pixel of the other buffer is either untouched or has the frame's red and green as its blue and alpha");
+            t.Equals(moved, 640u * 480u / 2u, "twenty strips of forty are half the pixels");
+            t.Equals(kept, 640u * 480u / 2u, "and the other half are left alone");
+        });
+
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

@@ -104,7 +104,13 @@ namespace GSGpu
         uint8_t writeRgb = 1, writeAlpha = 1;
         uint8_t date = 0, datm = 0; // the destination alpha test, and the bit it wants
         uint8_t alphaOver = 0;      // a pixel's alpha may be more than 0x80, the GS's one
-        uint8_t unused[3]{};
+        // A channel shuffle (GSCpuBackend::GpuShuffle): one half of the
+        // texel, its red and green or its blue and alpha, is written to one
+        // half of the pixel and the other half of the pixel is left. 0 for
+        // none, else 1 + (1 if the texel's blue and alpha are read) + (2 if
+        // the pixel's blue and alpha are written).
+        uint8_t shuffle = 0;
+        uint8_t unused[2]{};
     };
 
     // Pixels asked for with Renderer::Read, when the graphics card gets to them.
