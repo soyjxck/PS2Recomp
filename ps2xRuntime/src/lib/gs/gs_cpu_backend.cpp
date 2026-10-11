@@ -2490,6 +2490,7 @@ PresentationFrame GSCpuBackend::Present(const GSPresentationRequest &request)
     thread_local std::vector<uint8_t> snapshot;
     thread_local GSCpuBackend snapshotBackend;
 
+    NoteFlatFrame(request.vsyncTick);
     const GSPmodeState pmode = decodePmode(request.pmode);
 
     // The picture from a larger copy of the frame on display, when there
