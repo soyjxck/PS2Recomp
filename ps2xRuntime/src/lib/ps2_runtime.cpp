@@ -1605,6 +1605,9 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
                                       elfCrc32,
                                       elfCrc32Valid);
 
+    // The ELF may carry the overlay the game starts with.
+    refreshOverlays();
+
     RUNTIME_LOG("ELF file loaded successfully. Entry point: 0x" << std::hex << m_cpuContext.pc << std::dec);
     return true;
 }
@@ -1715,6 +1718,139 @@ bool PS2Runtime::hasFunction(uint32_t address) const
 {
     uint32_t slot = 0u;
     return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+}
+
+namespace
+{
+    struct RegisteredOverlay
+    {
+        PS2Runtime::OverlayImage image;
+        bool active = false;
+    };
+
+    // Filled from the static initialisers of generated code, which run in no
+    // particular order: the list has to exist by the first of them.
+    std::vector<RegisteredOverlay> &registeredOverlays()
+    {
+        static std::vector<RegisteredOverlay> overlays;
+        return overlays;
+    }
+
+    uint64_t fnv1a64(const uint8_t *data, size_t size, uint64_t hash = 0xCBF29CE484222325ull)
+    {
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash = (hash ^ data[i]) * 0x100000001B3ull;
+        }
+        return hash;
+    }
+
+    bool overlayRangeInRam(const PS2Runtime::OverlayCodeRange &range)
+    {
+        const uint32_t start = range.start & PS2_RAM_MASK;
+        return range.end > range.start && static_cast<uint64_t>(start) + (range.end - range.start) <= PS2_RAM_SIZE;
+    }
+
+    bool overlayProbeMatches(const PS2Runtime::OverlayImage &image, const uint8_t *rdram)
+    {
+        if (image.codeRangeCount == 0u || !overlayRangeInRam(image.code[0]))
+        {
+            return false;
+        }
+        const uint32_t size = std::min(image.code[0].end - image.code[0].start, PS2Runtime::kOverlayProbeBytes);
+        return fnv1a64(rdram + (image.code[0].start & PS2_RAM_MASK), size) == image.probeHash;
+    }
+
+    bool overlayCodeMatches(const PS2Runtime::OverlayImage &image, const uint8_t *rdram)
+    {
+        uint64_t hash = 0xCBF29CE484222325ull;
+        for (size_t i = 0; i < image.codeRangeCount; ++i)
+        {
+            if (!overlayRangeInRam(image.code[i]))
+            {
+                return false;
+            }
+            hash = fnv1a64(rdram + (image.code[i].start & PS2_RAM_MASK), image.code[i].end - image.code[i].start, hash);
+        }
+        return hash == image.codeHash;
+    }
+}
+
+void PS2Runtime::registerOverlay(const OverlayImage &image)
+{
+    registeredOverlays().push_back(RegisteredOverlay{image, false});
+}
+
+void PS2Runtime::refreshOverlays()
+{
+    std::vector<RegisteredOverlay> &overlays = registeredOverlays();
+    const uint8_t *rdram = m_memory.getRDRAM();
+    if (overlays.empty() || rdram == nullptr)
+    {
+        return;
+    }
+
+    // Nothing has been loaded while the images in the table still start as
+    // they did and no other one does: the usual case, and a cheap one. Once
+    // that fails every image that could be there is hashed in full.
+    std::vector<bool> probes(overlays.size());
+    bool changed = false;
+    for (size_t i = 0; i < overlays.size(); ++i)
+    {
+        probes[i] = overlayProbeMatches(overlays[i].image, rdram);
+        changed = changed || probes[i] != overlays[i].active;
+    }
+    if (!changed)
+    {
+        return;
+    }
+
+    // Those that went are taken out before the ones that came are put in:
+    // they share addresses.
+    std::vector<RegisteredOverlay *> arrived;
+    for (size_t i = 0; i < overlays.size(); ++i)
+    {
+        RegisteredOverlay &overlay = overlays[i];
+        const bool present = probes[i] && overlayCodeMatches(overlay.image, rdram);
+        if (overlay.active && !present)
+        {
+            for (size_t f = 0; f < overlay.image.functionCount; ++f)
+            {
+                replaceFunction(overlay.image.functions[f].address, nullptr);
+            }
+            overlay.active = false;
+            std::cout << "[overlay] " << overlay.image.name << " is no longer in memory" << std::endl;
+        }
+        else if (!overlay.active && present)
+        {
+            arrived.push_back(&overlay);
+        }
+    }
+
+    for (RegisteredOverlay *overlay : arrived)
+    {
+        for (size_t i = 0; i < overlay->image.functionCount; ++i)
+        {
+            replaceFunction(overlay->image.functions[i].address, overlay->image.functions[i].function);
+        }
+        overlay->active = true;
+        std::cout << "[overlay] " << overlay->image.name << ": " << overlay->image.functionCount
+                  << " entries at 0x" << std::hex << overlay->image.code[0].start << std::dec << std::endl;
+    }
+}
+
+std::string PS2Runtime::describeActiveOverlays() const
+{
+    std::string names;
+    for (const RegisteredOverlay &overlay : registeredOverlays())
+    {
+        if (overlay.active)
+        {
+            names += names.empty() ? "" : ",";
+            names += overlay.image.name;
+        }
+    }
+    return names.empty() ? "none" : names;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)

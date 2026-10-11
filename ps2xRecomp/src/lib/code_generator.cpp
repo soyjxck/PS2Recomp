@@ -151,6 +151,12 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setOverlay(const std::string &name, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+    {
+        m_overlayName = name;
+        m_overlayRanges = ranges;
+    }
+
     void CodeGenerator::setEmitInstructionComments(bool emitInstructionComments)
     {
         m_emitInstructionComments = emitInstructionComments;
@@ -167,6 +173,16 @@ namespace ps2recomp
         if (it != m_renamedFunctions.end())
         {
             return it->second;
+        }
+
+        // Which function is at an overlay's address depends on the overlay in
+        // memory: only the runtime's table can say.
+        for (const auto &[rangeStart, rangeEnd] : m_overlayRanges)
+        {
+            if (address >= rangeStart && address < rangeEnd)
+            {
+                return "";
+            }
         }
 
         const Symbol *sym = findSymbolByAddress(address);

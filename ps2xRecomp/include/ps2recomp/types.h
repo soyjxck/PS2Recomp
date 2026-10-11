@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <map>
+#include <utility>
 
 namespace ps2recomp
 {
@@ -188,6 +189,12 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
+        // Overlays: several images linked at one address, one in memory at a
+        // time. Each is recompiled from its own ELF under overlayName; the
+        // image they are loaded over lists their address ranges and leaves
+        // the code there to them.
+        std::string overlayName;
+        std::vector<std::pair<uint32_t, uint32_t>> overlayRanges;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
     };

@@ -50,6 +50,7 @@ namespace ps2recomp
 
         void setRenamedFunctions(const std::unordered_map<uint32_t, std::string> &renames);
         void setBootstrapInfo(const BootstrapInfo &info);
+        void setOverlay(const std::string &name, const std::vector<std::pair<uint32_t, uint32_t>> &ranges);
         void setRelocationCallNames(const std::unordered_map<uint32_t, std::string> &callNames);
         void setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
@@ -68,6 +69,8 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
+        std::string m_overlayName;
+        std::vector<std::pair<uint32_t, uint32_t>> m_overlayRanges;
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;

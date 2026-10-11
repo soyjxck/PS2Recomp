@@ -350,6 +350,40 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+
+    // Overlays: code images linked at the same address that the game loads
+    // one at a time. Each is recompiled from its own ELF (general.overlay)
+    // and registers itself here; refreshOverlays() looks at what guest memory
+    // holds and puts the functions of the images found there in the table.
+    struct OverlayFunction
+    {
+        uint32_t address;
+        RecompiledFunction function;
+    };
+    struct OverlayCodeRange
+    {
+        uint32_t start;
+        uint32_t end;
+    };
+    struct OverlayImage
+    {
+        const char *name;
+        const OverlayFunction *functions;
+        size_t functionCount;
+        // The image's instructions, and what they hash to (FNV-1a, 64 bits):
+        // probeHash over the first bytes of the first range, codeHash over
+        // every range in order.
+        const OverlayCodeRange *code;
+        size_t codeRangeCount;
+        uint64_t probeHash;
+        uint64_t codeHash;
+    };
+    static constexpr uint32_t kOverlayProbeBytes = 256u;
+    static void registerOverlay(const OverlayImage &image);
+    void refreshOverlays();
+    // Names of the overlays whose functions are in the table, for logs.
+    std::string describeActiveOverlays() const;
+
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,

@@ -795,6 +795,66 @@ void register_code_generator_tests()
                  "multiple resume pcs should register to the same owner wrapper");
     });
 
+    tc.Run("an overlay registers with the runtime, and the image under it makes room", [](TestCase &t) {
+        Function overlayFunction;
+        overlayFunction.name = "Title";
+        overlayFunction.start = 0xA00000;
+        overlayFunction.end = 0xA00008;
+        overlayFunction.isRecompiled = true;
+
+        static uint8_t code[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        Section section{};
+        section.name = "ov02";
+        section.address = 0xA00000;
+        section.size = sizeof(code);
+        section.isCode = true;
+        section.data = code;
+        const std::vector<Section> sections{section};
+        const std::vector<Symbol> noSymbols;
+
+        CodeGenerator overlay(noSymbols, sections);
+        overlay.setRenamedFunctions({{overlayFunction.start, "ov02_Title_0xa00000"}});
+        overlay.setOverlay("ov02", {});
+        const std::string registration = overlay.generateFunctionRegistration({overlayFunction}, {});
+        printGeneratedCode("an overlay registers with the runtime", registration);
+
+        t.IsTrue(registration.find("{0xa00000u, ov02_Title_0xa00000},") != std::string::npos,
+                 "the overlay lists its functions by address");
+        t.IsTrue(registration.find("{0xa00000u, 0xa00008u},") != std::string::npos,
+                 "and the instructions the runtime is to know it by");
+        t.IsTrue(registration.find("PS2Runtime::registerOverlay({\"ov02\", kOverlayFunctions_ov02, 1u, kOverlayCode_ov02, 1u, 0x") != std::string::npos,
+                 "and hands both to the runtime under its name");
+        t.IsTrue(registration.find("g_ps2RecompiledFunctionTable") == std::string::npos,
+                 "the function table is not an overlay's to define");
+
+        Function mainFunction;
+        mainFunction.name = "main_fn";
+        mainFunction.start = 0x200000;
+        mainFunction.end = 0x200004;
+        mainFunction.isRecompiled = true;
+
+        // The ELF an overlay is loaded over may carry a copy of one, symbols and all.
+        Symbol carried{};
+        carried.name = "Title";
+        carried.address = 0xA00000;
+        carried.size = 8;
+        carried.isFunction = true;
+        const std::vector<Symbol> symbols{carried};
+        const std::vector<Section> noSections;
+
+        CodeGenerator mainImage(symbols, noSections);
+        mainImage.setRenamedFunctions({{mainFunction.start, "main_fn_0x200000"}});
+        t.Equals(mainImage.getFunctionName(0xA00000u), std::string("Title"),
+                 "a symbol names a jump's target");
+        mainImage.setOverlay("", {{0xA00000u, 0xA10000u}});
+        t.Equals(mainImage.getFunctionName(0xA00000u), std::string(),
+                 "but not in an overlay's range, where only the runtime knows what is loaded");
+
+        const std::string table = mainImage.generateFunctionRegistration({mainFunction}, {});
+        t.IsTrue(table.find("g_ps2RecompiledFunctionTableEnd = 0xa10000u;") != std::string::npos,
+                 "the table reaches to the end of the overlay range");
+    });
+
     tc.Run("configured internal guest handlers register to their owner wrapper", [](TestCase &t) {
         Function owner;
         owner.name = "sdk_bootstrap_owner";

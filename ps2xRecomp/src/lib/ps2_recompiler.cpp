@@ -915,8 +915,30 @@ namespace ps2recomp
             }
 
             m_functions = m_elfParser->extractFunctions();
+            if (!m_config.overlayRanges.empty())
+            {
+                // Whatever this ELF holds at an overlay's address is one of
+                // several images that take turns there: the overlays are
+                // recompiled on their own, and transfers into the range are
+                // left to the runtime's table.
+                const size_t before = m_functions.size();
+                std::erase_if(m_functions, [&](const Function &function)
+                              { return std::any_of(m_config.overlayRanges.begin(), m_config.overlayRanges.end(),
+                                                   [&](const std::pair<uint32_t, uint32_t> &range)
+                                                   { return function.start >= range.first && function.start < range.second; }); });
+                std::ostringstream msg;
+                msg << "left " << (before - m_functions.size()) << " function(s) inside overlay_ranges to the overlays";
+                m_reporter.info("overlay", msg.str());
+            }
             m_symbols = m_elfParser->extractSymbols();
             m_sections = m_elfParser->getSections();
+            // Nor is there anything to decode there: a call into the range
+            // must not become an entry point cut from the overlay this ELF
+            // happens to carry.
+            std::erase_if(m_sections, [&](const Section &section)
+                          { return std::any_of(m_config.overlayRanges.begin(), m_config.overlayRanges.end(),
+                                               [&](const std::pair<uint32_t, uint32_t> &range)
+                                               { return section.size != 0u && section.address >= range.first && section.address < range.second; }); });
             m_relocations = m_elfParser->getRelocations();
             collectCorrectnessCriticalFunctionStarts();
 
@@ -969,7 +991,9 @@ namespace ps2recomp
                     m_reporter.info("elf", msg.str());
                 }
 
-                if (entry != 0)
+                // An overlay is entered through the image it is loaded over; the
+                // entry point in its header is that image's.
+                if (entry != 0 && m_config.overlayName.empty())
                 {
                     m_bootstrapInfo.valid = true;
                     m_bootstrapInfo.entry = entry;
@@ -1021,6 +1045,7 @@ namespace ps2recomp
             }
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
+            m_codeGenerator->setOverlay(m_config.overlayName, m_config.overlayRanges);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
 
@@ -1192,6 +1217,12 @@ namespace ps2recomp
         {
             m_functionRenames.clear();
 
+            // Two overlays have functions at the same address, often of the
+            // same name: each overlay's are told apart by its own.
+            const std::string overlayPrefix = m_config.overlayName.empty()
+                                                  ? std::string()
+                                                  : sanitizeIdentifierBody(m_config.overlayName) + "_";
+
             auto makeName = [&](const Function &function) -> std::string
             {
                 std::string sanitized = sanitizeFunctionName(function.name);
@@ -1207,13 +1238,13 @@ namespace ps2recomp
                     if (sanitized == expectedStartName.str())
                     {
                         std::stringstream entryName;
-                        entryName << sanitized << "_0x" << std::hex << function.end;
+                        entryName << overlayPrefix << sanitized << "_0x" << std::hex << function.end;
                         return entryName.str();
                     }
                 }
 
                 std::stringstream ss;
-                ss << sanitized << "_0x" << std::hex << function.start;
+                ss << overlayPrefix << sanitized << "_0x" << std::hex << function.start;
                 return ss.str();
             };
 

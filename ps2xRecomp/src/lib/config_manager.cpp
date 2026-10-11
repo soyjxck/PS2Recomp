@@ -95,6 +95,27 @@ namespace ps2recomp
                 std::unique(config.entryPointHints.begin(), config.entryPointHints.end()),
                 config.entryPointHints.end());
 
+            config.overlayName = toml::find_or<std::string>(general, "overlay", "");
+            if (general.contains("overlay_ranges") && general.at("overlay_ranges").is_array())
+            {
+                // "0x00A00000-0x00A60000": start, and the address past the end.
+                for (const auto &range : toml::find<std::vector<std::string>>(general, "overlay_ranges"))
+                {
+                    const std::size_t dash = range.find('-');
+                    if (dash == std::string::npos)
+                    {
+                        throw std::runtime_error("overlay_ranges entry is not START-END: " + range);
+                    }
+                    const uint32_t start = static_cast<uint32_t>(std::stoul(range.substr(0, dash), nullptr, 0));
+                    const uint32_t end = static_cast<uint32_t>(std::stoul(range.substr(dash + 1), nullptr, 0));
+                    if (end <= start)
+                    {
+                        throw std::runtime_error("overlay_ranges entry is empty: " + range);
+                    }
+                    config.overlayRanges.emplace_back(start, end);
+                }
+            }
+
             if (general.contains("skip") && general.at("skip").is_array())
             {
                 config.skipFunctions = toml::find<std::vector<std::string>>(general, "skip");
@@ -298,6 +319,21 @@ namespace ps2recomp
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;
+        if (!config.overlayName.empty())
+        {
+            general["overlay"] = config.overlayName;
+        }
+        if (!config.overlayRanges.empty())
+        {
+            std::vector<std::string> ranges;
+            for (const auto &[start, end] : config.overlayRanges)
+            {
+                std::ostringstream rangeStream;
+                rangeStream << "0x" << std::hex << start << "-0x" << end;
+                ranges.push_back(rangeStream.str());
+            }
+            general["overlay_ranges"] = ranges;
+        }
         data["general"] = general;
 
         if (!config.mmioByInstructionAddress.empty())

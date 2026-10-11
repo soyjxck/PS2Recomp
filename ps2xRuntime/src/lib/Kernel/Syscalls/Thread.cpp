@@ -150,8 +150,14 @@ namespace ps2_syscalls
         }
     }
 
-    void FlushCache(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    void FlushCache(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // A game flushes the caches after it has loaded code: the moment to
+        // see which overlay is in memory now.
+        if (runtime != nullptr)
+        {
+            runtime->refreshOverlays();
+        }
         setReturnS32(ctx, KE_OK);
     }
 

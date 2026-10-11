@@ -3,7 +3,9 @@
 
 #include <cstdint>
 #include <map>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ps2recomp
@@ -19,6 +21,10 @@ namespace ps2recomp
         std::string emit(const std::vector<Function> &functions, const std::map<uint32_t, std::string> &stubs);
 
     private:
+        void emitOverlay(std::stringstream &ss,
+                         const std::vector<Function> &functions,
+                         const std::vector<std::pair<uint32_t, std::string>> &entries);
+
         CodeGenerator &m_codeGenerator;
     };
 }

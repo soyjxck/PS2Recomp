@@ -1390,6 +1390,42 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove(configPath, removeError);
         });
 
+        tc.Run("config manager parses overlay settings", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path configPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-overlay-" + uniqueSuffix + ".toml");
+
+            std::ofstream configFile(configPath);
+            t.IsTrue(static_cast<bool>(configFile), "temp config file should be writable");
+            if (!configFile)
+            {
+                return;
+            }
+
+            configFile << "[general]\n";
+            configFile << "input = \"dummy.elf\"\n";
+            configFile << "output = \"out\"\n";
+            configFile << "overlay = \"ov01\"\n";
+            configFile << "overlay_ranges = [\"0x00A00000-0x00A60000\", \"0xC00000-0xC10000\"]\n";
+            configFile.close();
+
+            ConfigManager manager(configPath.string());
+            RecompilerConfig config = manager.loadConfig();
+
+            t.Equals(config.overlayName, std::string("ov01"), "the overlay's name should load");
+            t.Equals(config.overlayRanges.size(), static_cast<size_t>(2), "both overlay ranges should load");
+            if (config.overlayRanges.size() == 2)
+            {
+                t.Equals(config.overlayRanges[0].first, 0x00A00000u, "a range starts at its first address");
+                t.Equals(config.overlayRanges[0].second, 0x00A60000u, "and ends before its second");
+                t.Equals(config.overlayRanges[1].first, 0x00C00000u, "the second range should parse too");
+            }
+
+            std::error_code removeError;
+            std::filesystem::remove(configPath, removeError);
+        });
+
         tc.Run("config manager loads modern and legacy guest entry hints", [](TestCase &t) {
             const auto uniqueSuffix = std::to_string(
                 static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));

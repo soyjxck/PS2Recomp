@@ -381,6 +381,60 @@ void register_ps2_runtime_expansion_tests()
                      "missing exact dispatch target should request runtime stop");
         });
 
+        tc.Run("the overlay in guest memory is the one in the function table", [](TestCase &t)
+        {
+            // Two images linked at the same address. The runtime knows each
+            // by a hash of its instructions and gives the table to whichever
+            // guest memory holds, when it is asked to look.
+            constexpr uint32_t kBase = 0x00A00000u;
+            static const uint8_t kCodeA[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+            static const uint8_t kCodeB[8] = {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7};
+            auto fnv = [](const uint8_t *data, size_t size)
+            {
+                uint64_t hash = 0xCBF29CE484222325ull;
+                for (size_t i = 0; i < size; ++i)
+                    hash = (hash ^ data[i]) * 0x100000001B3ull;
+                return hash;
+            };
+            static const PS2Runtime::OverlayFunction kFunctionsA[] = {
+                {kBase, &testResumeOwnerFallbackHandler}, {kBase + 8u, &testResumeOwnerFallbackHandler}};
+            static const PS2Runtime::OverlayFunction kFunctionsB[] = {{kBase, &testResumeNextFunctionHandler}};
+            static const PS2Runtime::OverlayCodeRange kRangeA[] = {{kBase, kBase + 16u}};
+            static const PS2Runtime::OverlayCodeRange kRangeB[] = {{kBase, kBase + 8u}};
+            static bool registered = false;
+            if (!registered)
+            {
+                registered = true;
+                PS2Runtime::registerOverlay({"test_a", kFunctionsA, 2u, kRangeA, 1u, fnv(kCodeA, 16u), fnv(kCodeA, 16u)});
+                PS2Runtime::registerOverlay({"test_b", kFunctionsB, 1u, kRangeB, 1u, fnv(kCodeB, 8u), fnv(kCodeB, 8u)});
+            }
+
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "PS2Memory initialize should succeed");
+            uint8_t *rdram = runtime.memory().getRDRAM();
+            (void)runtime.replaceFunction(kBase, nullptr);
+            (void)runtime.replaceFunction(kBase + 8u, nullptr);
+
+            runtime.refreshOverlays();
+            t.IsFalse(runtime.hasFunction(kBase), "no overlay is in memory yet");
+
+            std::memcpy(rdram + kBase, kCodeA, sizeof(kCodeA));
+            runtime.refreshOverlays();
+            t.IsTrue(runtime.lookupFunction(kBase) == &testResumeOwnerFallbackHandler, "the first image's function is at the address");
+            t.IsTrue(runtime.hasFunction(kBase + 8u), "with all of its entries");
+            t.Equals(runtime.describeActiveOverlays(), std::string("test_a"), "and the runtime names it");
+
+            std::memcpy(rdram + kBase, kCodeB, sizeof(kCodeB));
+            runtime.refreshOverlays();
+            t.IsTrue(runtime.lookupFunction(kBase) == &testResumeNextFunctionHandler, "loading the second image puts its function there");
+            t.IsFalse(runtime.hasFunction(kBase + 8u), "and takes out what only the first had");
+
+            std::memset(rdram + kBase, 0, 16u);
+            runtime.refreshOverlays();
+            t.IsFalse(runtime.hasFunction(kBase), "an image that is gone leaves nothing behind");
+            t.Equals(runtime.describeActiveOverlays(), std::string("none"), "and none is named");
+        });
+
         tc.Run("lookupFunction rejects final-function PCs inside code regions without exact registration", [](TestCase &t)
         {
             PS2Runtime runtime;
