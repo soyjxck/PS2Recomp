@@ -322,6 +322,7 @@ namespace ps2x::iop::detail
         case IopThreadState::Delay:
         case IopThreadState::Semaphore:
         case IopThreadState::EventFlag:
+        case IopThreadState::Service:
             status = 0x04u;
             break;
         case IopThreadState::Suspended:
@@ -658,6 +659,22 @@ namespace ps2x::iop::detail
             return;
         m_currentThread->state = IopThreadState::Sleep;
         cpu.yielded = true;
+    }
+
+    int IopKernel::blockCurrent(IopCpuState &cpu)
+    {
+        if (m_currentThread == nullptr)
+            return 0;
+        m_currentThread->state = IopThreadState::Service;
+        cpu.yielded = true;
+        return m_currentThread->id;
+    }
+
+    void IopKernel::resumeBlocked(int threadId)
+    {
+        const auto thread = m_threads.find(threadId);
+        if (thread != m_threads.end() && thread->second.state == IopThreadState::Service)
+            thread->second.state = IopThreadState::Ready;
     }
 
     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)

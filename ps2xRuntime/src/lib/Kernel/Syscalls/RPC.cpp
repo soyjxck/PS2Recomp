@@ -702,6 +702,87 @@ namespace ps2_syscalls
         finishCall(nullptr, *ctx);
     }
 
+    uint32_t findEeRpcServer(uint8_t *rdram, uint32_t sid)
+    {
+        uint32_t address = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            const auto server = g_rpc_servers.find(sid);
+            if (server != g_rpc_servers.end())
+            {
+                address = server->second.sd_ptr;
+            }
+        }
+
+        // The descriptor SifBindRpc makes up for a server on the IOP is in
+        // the same table; it has no function.
+        const auto *sd = address != 0u
+                             ? reinterpret_cast<const t_SifRpcServerData *>(getConstMemPtr(rdram, address))
+                             : nullptr;
+        return sd != nullptr && sd->func != 0u ? address : 0u;
+    }
+
+    bool callEeRpcServer(uint8_t *rdram,
+                         PS2Runtime *runtime,
+                         uint32_t sid,
+                         uint32_t function,
+                         const void *send,
+                         size_t sendSize,
+                         size_t receiveSize,
+                         std::function<void(const void *reply, size_t replySize)> completion)
+    {
+        const uint32_t address = runtime != nullptr ? findEeRpcServer(rdram, sid) : 0u;
+        if (address == 0u)
+        {
+            return false;
+        }
+
+        const auto *sd = reinterpret_cast<const t_SifRpcServerData *>(getConstMemPtr(rdram, address));
+        const uint32_t serverFunction = sd->func;
+        const uint32_t buffer = sd->buf;
+        const auto inRam = [](uint32_t guest, size_t size)
+        {
+            return static_cast<uint64_t>(guest & PS2_RAM_MASK) + size <= PS2_RAM_SIZE;
+        };
+        if (!runtime->hasFunction(serverFunction) ||
+            (sendSize != 0u && (send == nullptr || buffer == 0u || !inRam(buffer, sendSize))))
+        {
+            return false;
+        }
+        if (sendSize != 0u)
+        {
+            std::memcpy(getMemPtr(rdram, buffer), send, sendSize);
+        }
+
+        // As a request from the IOP reaches sceSifRpcLoop: the server's
+        // function with the call number, its buffer and the size, run when
+        // the scheduler next takes invocations.
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::RpcCallback;
+        invocation.tag = sid;
+        invocation.context = runtime->cpu();
+        invocation.context.pc = serverFunction;
+        SET_GPR_U32(&invocation.context, 4, function);
+        SET_GPR_U32(&invocation.context, 5, buffer);
+        SET_GPR_U32(&invocation.context, 6, static_cast<uint32_t>(sendSize));
+        SET_GPR_U32(&invocation.context, 7, 0u);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        invocation.onComplete =
+            [rdram, buffer, receiveSize, inRam, completion = std::move(completion)](const R5900Context &completed, R5900Context &)
+        {
+            uint32_t result = getRegU32(&completed, 2);
+            if (result == 0u)
+            {
+                result = buffer;
+            }
+            const bool readable = receiveSize != 0u && result != 0u && inRam(result, receiveSize);
+            completion(readable ? getConstMemPtr(rdram, result) : nullptr, readable ? receiveSize : 0u);
+        };
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        return true;
+    }
+
     void SifRegisterRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t sdPtr = getRegU32(ctx, 4);

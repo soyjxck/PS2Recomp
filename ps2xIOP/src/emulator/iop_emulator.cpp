@@ -323,7 +323,7 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "sifcmd"))
             {
-                return rpc.dispatchSifCmdImport(call.ordinal, cpu)
+                return rpc.dispatchSifCmdImport(call.ordinal, cpu, *this)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }

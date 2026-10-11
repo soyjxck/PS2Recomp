@@ -73,9 +73,39 @@ namespace
         bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
 
+        // One RPC server on the "EE": calls to it are kept, with the
+        // completion to answer them by.
+        uint32_t findEeRpcServer(uint32_t sid) override
+        {
+            return sid == eeServerSid ? eeServerAddress : 0u;
+        }
+        bool callEeRpcServer(uint32_t sid,
+                             uint32_t function,
+                             const void *send,
+                             size_t sendSize,
+                             size_t receiveSize,
+                             EeRpcCompletion completion) override
+        {
+            if (sid != eeServerSid)
+                return false;
+            ++eeCalls;
+            eeCallFunction = function;
+            eeCallSend.assign(static_cast<const char *>(send), sendSize);
+            eeCallReceiveSize = receiveSize;
+            eeCompletion = std::move(completion);
+            return true;
+        }
+
         std::vector<uint8_t> guest;
         std::vector<std::string> logs;
         std::string cdRoot;
+        uint32_t eeServerSid = 0u;
+        uint32_t eeServerAddress = 0u;
+        uint32_t eeCalls = 0u;
+        uint32_t eeCallFunction = 0u;
+        std::string eeCallSend;
+        size_t eeCallReceiveSize = 0u;
+        EeRpcCompletion eeCompletion;
     };
 
 #pragma pack(push, 1)
@@ -883,6 +913,109 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    // A module that, as it starts, binds a client (at 0x10200) to a server on
+    // the EE and calls its function 7 without waiting: it sends the four
+    // bytes at 0x10300, wants four back at 0x10310, and its end function
+    // stores the parameter it is given (0x55) at 0x10320.
+    void writeEeRpcClientIrx(TestHost &host, uint32_t address, uint32_t sid)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t endFunctionOffset = 0xA0u;
+        constexpr uint32_t importTableOffset = 0xC0u;
+        constexpr uint32_t bindStub = loadAddress + importTableOffset + 20u;
+        constexpr uint32_t callStub = bindStub + 8u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        const uint32_t code[] = {
+            0x27BDFFD0u, // addiu sp, sp, -0x30
+            0xAFBF002Cu, // sw    ra, 0x2c(sp)
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x3C050000u | ((sid >> 16u) & 0xFFFFu), // lui a1, SID upper
+            0x34A50000u | (sid & 0xFFFFu),          // ori a1, a1, SID lower
+            0x0C000000u | ((bindStub >> 2u) & 0x03FFFFFFu), // jal sceSifBindRpc
+            0x00003021u, // addu  a2, zero, zero (mode)
+            0x3C040001u, // lui   a0, 1
+            0x34840200u, // ori   a0, a0, 0x200 (client)
+            0x24050007u, // addiu a1, zero, 7 (function)
+            0x24060001u, // addiu a2, zero, 1 (SIF_RPC_M_NOWAIT)
+            0x3C070001u, // lui   a3, 1
+            0x34E70300u, // ori   a3, a3, 0x300 (send)
+            0x24080004u, // addiu t0, zero, 4
+            0xAFA80010u, // sw    t0, 0x10(sp) (send size)
+            0xAFA80018u, // sw    t0, 0x18(sp) (receive size)
+            0x3C080001u, // lui   t0, 1
+            0x35090310u, // ori   t1, t0, 0x310
+            0xAFA90014u, // sw    t1, 0x14(sp) (receive)
+            0x350900A0u, // ori   t1, t0, 0xa0
+            0xAFA9001Cu, // sw    t1, 0x1c(sp) (end function)
+            0x24090055u, // addiu t1, zero, 0x55
+            0xAFA90020u, // sw    t1, 0x20(sp) (end parameter)
+            0x0C000000u | ((callStub >> 2u) & 0x03FFFFFFu), // jal sceSifCallRpc
+            0x00000000u, // nop
+            0x8FBF002Cu, // lw    ra, 0x2c(sp)
+            0x00001021u, // addu  v0, zero, zero
+            0x27BD0030u, // addiu sp, sp, 0x30
+            0x03E00008u, // jr    ra
+            0x00000000u, // nop
+        };
+        static_assert(sizeof(code) <= endFunctionOffset);
+        const uint32_t endFunction[] = {
+            0x3C080001u, // lui   t0, 1
+            0x35080320u, // ori   t0, t0, 0x320
+            0x03E00008u, // jr    ra
+            0xAD040000u, // sw    a0, 0(t0)
+        };
+        const uint32_t importTable[] = {
+            0x41E00000u, // IRX import magic
+            0x00000000u,
+            0x00000101u,
+            0x63666973u, // "sifc"
+            0x0000646Du, // "md"
+            0x03E00008u, // jr ra
+            0x2400000Fu, // addiu zero, zero, 15 (sceSifBindRpc)
+            0x03E00008u, // jr ra
+            0x24000010u, // addiu zero, zero, 16 (sceSifCallRpc)
+            0x00000000u,
+            0x00000000u,
+        };
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = 0x304u;
+        program.memsz = 0x400u;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::fill(host.guest.begin() + address, host.guest.end(), 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, sizeof(code));
+        std::memcpy(host.guest.data() + address + codeOffset + endFunctionOffset, endFunction, sizeof(endFunction));
+        std::memcpy(host.guest.data() + address + codeOffset + importTableOffset, importTable, sizeof(importTable));
+        std::memcpy(host.guest.data() + address + codeOffset + 0x300u, "ping", 4u);
+    }
+
     bool expect(bool value, const char *message)
     {
         if (!value)
@@ -1141,6 +1274,41 @@ int main()
         { return message.find("unhandled import cdvdman:7") != std::string::npos; });
     if (!expect(!emittedUnhandledSeek,
                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+
+    // A module's own calls to a server on the EE.
+    iop.reset();
+    constexpr uint32_t eeSid = 0x00000901u;
+    host.eeServerSid = eeSid;
+    host.eeServerAddress = 0x00123400u;
+    writeEeRpcClientIrx(host, 0x100u, eeSid);
+    const ModuleLoadResult eeClientModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(eeClientModule.handled && eeClientModule.startResult == 0,
+                "Synthetic EE RPC client IRX did not start")) return 1;
+    uint32_t boundServer = 0u;
+    if (!expect(iop.readMemory(0x00010224u, &boundServer, sizeof(boundServer)) && boundServer == 0x00123400u,
+                "sceSifBindRpc did not give the client the EE server it asked for")) return 1;
+    if (!expect(host.eeCalls == 1u && host.eeCallFunction == 7u && host.eeCallSend == "ping" &&
+                    host.eeCallReceiveSize == 4u && host.eeCompletion,
+                "sceSifCallRpc did not reach the host as the call the module made")) return 1;
+    uint32_t endParameterSeen = 0xFFFFFFFFu;
+    if (!expect(iop.readMemory(0x00010320u, &endParameterSeen, sizeof(endParameterSeen)) && endParameterSeen == 0u,
+                "The end function ran before the EE had answered")) return 1;
+    host.eeCompletion("pong", 4u);
+    char reply[4]{};
+    if (!expect(iop.readMemory(0x00010310u, reply, sizeof(reply)) && std::memcmp(reply, "pong", 4u) == 0,
+                "The EE's reply did not reach the module's receive buffer")) return 1;
+    if (!expect(iop.readMemory(0x00010320u, &endParameterSeen, sizeof(endParameterSeen)) && endParameterSeen == 0x55u,
+                "The end function was not called with its parameter")) return 1;
+
+    // A reply that comes after a reset finds nothing to answer.
+    writeEeRpcClientIrx(host, 0x100u, eeSid);
+    (void)iop.loadModuleBuffer(0x100u);
+    const IopHost::EeRpcCompletion lateReply = host.eeCompletion;
+    iop.reset();
+    lateReply("late", 4u);
+    if (!expect(!iop.readMemory(0x00010310u, reply, sizeof(reply)) || std::memcmp(reply, "late", 4u) != 0,
+                "A reply from before the reset was delivered after it")) return 1;
+    host.eeServerSid = 0u;
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";
     return 0;

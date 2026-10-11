@@ -21,6 +21,8 @@ namespace ps2x::iop::detail
         EventFlag,
         Suspended,
         Dead,
+        // Inside a kernel service that finishes later (an RPC to the EE).
+        Service,
     };
 
     struct IopThread
@@ -58,6 +60,10 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
 
         void sleepCurrent(IopCpuState &cpu);
+        // The running thread waits for resumeBlocked() with the id returned
+        // here; 0 when there is no thread to block (an interrupt handler).
+        [[nodiscard]] int blockCurrent(IopCpuState &cpu);
+        void resumeBlocked(int threadId);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);

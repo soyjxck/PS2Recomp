@@ -21,8 +21,37 @@ namespace ps2x::iop::detail
     void IopRpcBridge::reset()
     {
         m_servers.clear();
+        m_eeClients.clear();
+        m_eeCalls.clear();
+        m_eeCallEpoch = std::make_shared<int>(0);
+        m_nextEeCall = 1u;
+        m_nextRpcId = 1u;
         m_nextDmaId = 1u;
         m_sifInitialized = false;
+    }
+
+    void IopRpcBridge::completeEeCall(uint32_t token, const void *reply, size_t replySize, IopGuestExecutor &executor)
+    {
+        const auto pending = m_eeCalls.find(token);
+        if (pending == m_eeCalls.end())
+            return;
+        const EeCall call = pending->second;
+        m_eeCalls.erase(pending);
+
+        if (call.receive != 0u && call.receiveSize != 0u && reply != nullptr)
+        {
+            (void)m_memory.writeRam(call.receive, reply, std::min<size_t>(replySize, call.receiveSize));
+        }
+        // sifcmd calls the end function from its interrupt handler, then
+        // lets a caller that waited go on.
+        if (call.endFunction != 0u)
+        {
+            (void)executor.executeGuestFunction(call.endFunction, call.endParameter, 0u, 0u, 0u, call.gp);
+        }
+        if (call.blockedThread != 0)
+        {
+            m_kernel.resumeBlocked(call.blockedThread);
+        }
     }
 
     bool IopRpcBridge::dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu)
@@ -131,7 +160,7 @@ namespace ps2x::iop::detail
         }
     }
 
-    bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
+    bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor)
     {
         const auto setV0 = [&](uint32_t value)
         {
@@ -148,10 +177,87 @@ namespace ps2x::iop::detail
         case 10:
         case 11:
         case 14: // InitRpc
-        case 15:
-        case 16:
             setV0(0);
             return true;
+        case 15: // sceSifBindRpc(client, sid, mode): to a server on the EE
+        {
+            // SifRpcClientData: header (packet, rpc id, semaphore, mode),
+            // command, buff, cbuff, end function, end parameter, server.
+            // The server's address on the other side is what tells the
+            // caller that the bind took; it stays 0 when the EE has
+            // registered no such server (yet).
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t sid = cpu.gpr[5];
+            const uint32_t server = m_host.findEeRpcServer(sid);
+            if (client != 0u && IopMemory::physicalAddress(client) + 0x28u <= IopMemory::RamSize)
+            {
+                m_memory.write32(client + 0x00u, 0u);
+                m_memory.write32(client + 0x04u, m_nextRpcId++);
+                m_memory.write32(client + 0x08u, 0xFFFFFFFFu);
+                m_memory.write32(client + 0x0Cu, cpu.gpr[6]);
+                m_memory.write32(client + 0x10u, 0u);
+                m_memory.write32(client + 0x14u, 0u);
+                m_memory.write32(client + 0x18u, 0u);
+                m_memory.write32(client + 0x24u, server);
+            }
+            if (server != 0u)
+                m_eeClients[client] = sid;
+            else
+                m_eeClients.erase(client);
+            setV0(0u);
+            return true;
+        }
+        case 16: // sceSifCallRpc(client, function, mode, send, ssize, receive, rsize, end function, end parameter)
+        {
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t function = cpu.gpr[5];
+            const uint32_t mode = cpu.gpr[6];
+            const uint32_t send = cpu.gpr[7];
+            const uint32_t stackPointer = cpu.gpr[29];
+            const uint32_t sendSize = m_memory.read32(stackPointer + 0x10u);
+
+            const auto bound = m_eeClients.find(client);
+            std::vector<uint8_t> payload(sendSize <= IopMemory::RamSize ? sendSize : 0u);
+            if (bound == m_eeClients.end() || payload.size() != sendSize ||
+                (sendSize != 0u && !m_memory.readRam(send, payload.data(), payload.size())))
+            {
+                setV0(0u);
+                return true;
+            }
+
+            EeCall call;
+            call.client = client;
+            call.receive = m_memory.read32(stackPointer + 0x14u);
+            call.receiveSize = m_memory.read32(stackPointer + 0x18u);
+            call.endFunction = m_memory.read32(stackPointer + 0x1Cu);
+            call.endParameter = m_memory.read32(stackPointer + 0x20u);
+            call.gp = cpu.gpr[28];
+
+            // The EE runs its function when its scheduler gets to it; the
+            // reply may also come before callEeRpcServer() returns.
+            const uint32_t token = m_nextEeCall++;
+            m_eeCalls.emplace(token, call);
+            const std::weak_ptr<int> epoch = m_eeCallEpoch;
+            const bool sent = m_host.callEeRpcServer(
+                bound->second, function, payload.data(), payload.size(), call.receiveSize,
+                [this, epoch, token, &executor](const void *reply, size_t replySize)
+                {
+                    if (!epoch.expired())
+                        completeEeCall(token, reply, replySize, executor);
+                });
+            if (!sent)
+            {
+                m_eeCalls.erase(token);
+            }
+            else if ((mode & 1u) == 0u) // not SIF_RPC_M_NOWAIT: the caller waits for the reply
+            {
+                const auto pending = m_eeCalls.find(token);
+                if (pending != m_eeCalls.end())
+                    pending->second.blockedThread = m_kernel.blockCurrent(cpu);
+            }
+            setV0(0u);
+            return true;
+        }
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {
@@ -230,9 +336,15 @@ namespace ps2x::iop::detail
             setV0(server.serverData);
             return true;
         }
-        case 18:
-            setV0(0);
+        case 18: // sceSifCheckStatRpc(client): 1 while a call of its is on its way
+        {
+            const uint32_t client = cpu.gpr[4];
+            const bool busy = std::any_of(m_eeCalls.begin(), m_eeCalls.end(),
+                                          [client](const auto &pending)
+                                          { return pending.second.client == client; });
+            setV0(busy ? 1u : 0u);
             return true;
+        }
         case 19: // SetRpcQueue
             setV0(cpu.gpr[4]);
             return true;

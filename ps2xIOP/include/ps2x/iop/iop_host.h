@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -135,6 +136,33 @@ namespace ps2x::iop
             (void)commandId;
             (void)packet;
             (void)packetSize;
+            return false;
+        }
+
+        // IOP -> EE RPC. The address of the descriptor of a server the EE has
+        // registered under this SID, or 0; and one call to it: `completion`
+        // gets the reply once the server's function has returned on the EE,
+        // which a host is free to make later than this call. The defaults
+        // are a host with no such servers.
+        using EeRpcCompletion = std::function<void(const void *reply, size_t replySize)>;
+        virtual uint32_t findEeRpcServer(uint32_t sid)
+        {
+            (void)sid;
+            return 0u;
+        }
+        virtual bool callEeRpcServer(uint32_t sid,
+                                     uint32_t function,
+                                     const void *send,
+                                     size_t sendSize,
+                                     size_t receiveSize,
+                                     EeRpcCompletion completion)
+        {
+            (void)sid;
+            (void)function;
+            (void)send;
+            (void)sendSize;
+            (void)receiveSize;
+            (void)completion;
             return false;
         }
 
