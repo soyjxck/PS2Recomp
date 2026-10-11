@@ -1,6 +1,8 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
 #include "runtime/vu1_worker.h"
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -27,9 +29,104 @@ enum VIFCmd : uint8_t
     VIF_DIRECTHL = 0x51,
 };
 
+// PS2X_VIF1_TRACE=<secs>[:count] (armed by the runtime at that emulated
+// time): one line for each VIFcode VIF1 is sent, in the order it gets them,
+// and for a DIRECT what the GIF packets in it are: the registers an A+D
+// packet sets with their values, the size of an image. What a display list
+// does between two draws (which texture it loads, which state it sets) is
+// read off this.
+int g_ps2xVif1TraceRemaining = 0;
+
 namespace
 {
     constexpr uint8_t kGifFmtImage = 2u;
+
+    void traceVif1Direct(const uint8_t *data, uint32_t sizeBytes)
+    {
+        uint32_t offset = 0u;
+        while (offset + 16u <= sizeBytes)
+        {
+            uint64_t tagLo = 0u, tagHi = 0u;
+            std::memcpy(&tagLo, data + offset, sizeof(tagLo));
+            std::memcpy(&tagHi, data + offset + 8u, sizeof(tagHi));
+            offset += 16u;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            if (flg == 2u || flg == 3u)
+            {
+                std::fprintf(stderr, "[vif1]     image %u qwords (%u here)\n", nloop, (sizeBytes - offset) / 16u);
+                offset += nloop * 16u;
+                continue;
+            }
+            if (flg == 1u)
+            {
+                std::fprintf(stderr, "[vif1]     reglist nloop=%u nreg=%u\n", nloop, nreg);
+                offset += ((nloop * nreg * 8u) + 15u) & ~15u;
+                continue;
+            }
+            if (nreg == 1u && (tagHi & 0xFu) == 0xEu)
+            {
+                for (uint32_t i = 0; i < nloop && offset + 16u <= sizeBytes; ++i, offset += 16u)
+                {
+                    uint64_t value = 0u, reg = 0u;
+                    std::memcpy(&value, data + offset, sizeof(value));
+                    std::memcpy(&reg, data + offset + 8u, sizeof(reg));
+                    std::fprintf(stderr, "[vif1]     reg 0x%02x = 0x%016llx\n", static_cast<uint32_t>(reg & 0xFFu),
+                                 static_cast<unsigned long long>(value));
+                }
+                continue;
+            }
+            std::fprintf(stderr, "[vif1]     packed nloop=%u nreg=%u regs=0x%llx prim=0x%x (tag %016llx %016llx)\n", nloop, nreg,
+                         static_cast<unsigned long long>(tagHi), static_cast<uint32_t>((tagLo >> 47) & 0x7FFu),
+                         static_cast<unsigned long long>(tagLo), static_cast<unsigned long long>(tagHi));
+            offset += nloop * nreg * 16u;
+        }
+    }
+
+    void traceVif1Code(uint32_t cmd, const uint8_t *data, uint32_t pos, uint32_t sizeBytes, uint32_t pendingImageQw)
+    {
+        const uint8_t opcode = (cmd >> 24) & 0x7Fu;
+        const uint32_t imm = cmd & 0xFFFFu;
+        const uint32_t num = (cmd >> 16) & 0xFFu;
+        if (opcode == VIF_NOP)
+            return;
+        --g_ps2xVif1TraceRemaining;
+        const char *name = nullptr;
+        switch (opcode)
+        {
+        case VIF_STCYCL: name = "STCYCL"; break;
+        case VIF_OFFSET: name = "OFFSET"; break;
+        case VIF_BASE: name = "BASE"; break;
+        case VIF_ITOP: name = "ITOP"; break;
+        case VIF_STMOD: name = "STMOD"; break;
+        case VIF_MSKPATH3: name = "MSKPATH3"; break;
+        case VIF_MARK: name = "MARK"; break;
+        case VIF_FLUSHE: name = "FLUSHE"; break;
+        case VIF_FLUSH: name = "FLUSH"; break;
+        case VIF_FLUSHA: name = "FLUSHA"; break;
+        case VIF_MSCAL: name = "MSCAL"; break;
+        case VIF_MSCALF: name = "MSCALF"; break;
+        case VIF_MSCNT: name = "MSCNT"; break;
+        case VIF_STMASK: name = "STMASK"; break;
+        case VIF_STROW: name = "STROW"; break;
+        case VIF_STCOL: name = "STCOL"; break;
+        case VIF_MPG: name = "MPG"; break;
+        case VIF_DIRECT: name = "DIRECT"; break;
+        case VIF_DIRECTHL: name = "DIRECTHL"; break;
+        default: name = (opcode & 0x60u) == 0x60u ? "UNPACK" : "?"; break;
+        }
+        std::fprintf(stderr, "[vif1] +%06x %s%s imm=0x%x num=%u\n", pos - 4u, name, (cmd & 0x80000000u) ? " (irq)" : "", imm, num);
+        if (opcode == VIF_DIRECT || opcode == VIF_DIRECTHL)
+        {
+            // The start of it may be image data an earlier tag announced.
+            const uint32_t qwords = std::min<uint32_t>(imm == 0u ? 65536u : imm, (sizeBytes - pos) / 16u);
+            const uint32_t image = std::min(pendingImageQw, qwords);
+            traceVif1Direct(data + pos + image * 16u, (qwords - image) * 16u);
+        }
+    }
 
     uint32_t pendingGifImageQwc(const uint8_t *data, uint32_t sizeBytes)
     {
@@ -542,6 +639,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         vif1_regs.num = num;
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
+
+        if (g_ps2xVif1TraceRemaining > 0)
+            traceVif1Code(cmd, data, pos, sizeBytes, m_vif1PendingPath2ImageQwc);
 
         if (opcode == VIF_NOP)
         {

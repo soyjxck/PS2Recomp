@@ -577,6 +577,7 @@ void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, 
                  ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u);
 }
 extern int g_ps2xGifTraceRemaining; // ps2_memory.cpp
+extern int g_ps2xVif1TraceRemaining; // ps2_vif1_interpreter.cpp
 void ps2xInstallGsFinishDelay(EeScheduler &scheduler); // EeScheduler.cpp
 
 namespace
@@ -2219,6 +2220,46 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
+    // PS2X_VU0_TRACE=<secs>[:count]: log the microprograms the EE calls on
+    // VU0 from that emulated time on (64 of them unless told): where each
+    // starts and who called it ($ra), the registers that are not zero going
+    // in, and the ones the program changed coming out. A program called at
+    // an address that is not one of its routines shows here first.
+    static const uint64_t vu0TraceTick = envEmulatedTicks("PS2X_VU0_TRACE");
+    static int vu0TraceLeft = []
+    {
+        const char *value = std::getenv("PS2X_VU0_TRACE");
+        const char *colon = value ? std::strchr(value, ':') : nullptr;
+        return colon ? std::atoi(colon + 1) : 64;
+    }();
+    const bool vu0Trace = vu0TraceTick != 0u && vu0TraceLeft > 0 && m_eeScheduler &&
+                          m_eeScheduler->currentVSyncTick() >= vu0TraceTick;
+    __m128 vu0TraceBefore[32];
+    auto vu0TraceRegs = [&](const char *when, bool changedOnly)
+    {
+        std::fprintf(stderr, "[vu0] %s pc=0x%x ra=0x%08x vi", when, startPC,
+                     static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)));
+        for (uint32_t r = 0; r < 16u; ++r)
+            std::fprintf(stderr, " %u", ctx->vi[r]);
+        std::fprintf(stderr, "\n");
+        for (uint32_t r = 1; r < 32u; ++r)
+        {
+            alignas(16) float f[4];
+            _mm_store_ps(f, ctx->vu0_vf[r]);
+            const bool show = changedOnly
+                                  ? std::memcmp(&vu0TraceBefore[r], &ctx->vu0_vf[r], sizeof(__m128)) != 0
+                                  : (f[0] != 0.0f || f[1] != 0.0f || f[2] != 0.0f || f[3] != 0.0f);
+            if (show)
+                std::fprintf(stderr, "[vu0]   vf%02u % .6g % .6g % .6g % .6g\n", r, f[0], f[1], f[2], f[3]);
+        }
+    };
+    if (vu0Trace)
+    {
+        --vu0TraceLeft;
+        vu0TraceRegs("call", false);
+        std::memcpy(vu0TraceBefore, ctx->vu0_vf, sizeof(vu0TraceBefore));
+    }
+
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
     // VCALLMS runs the program to its E bit before the EE continues. The cap
@@ -2229,6 +2270,12 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
                   m_gs, &m_memory,
                   startPC, 0u, ctx->vu0_itop, 1u << 20);
     copyVu0StateToContext(m_vu0.state(), ctx);
+    if (vu0Trace)
+    {
+        std::fprintf(stderr, "[vu0]   ended pc=0x%x cycles=%llu\n", m_vu0.state().pc,
+                     static_cast<unsigned long long>(m_vu0.state().cycles));
+        vu0TraceRegs("done", true);
+    }
 }
 
 void PS2Runtime::vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
@@ -3233,6 +3280,16 @@ void PS2Runtime::run()
                 gifTraceArmed = true;
                 const char *colon = std::strchr(std::getenv("PS2X_GIF_TRACE"), ':');
                 g_ps2xGifTraceRemaining = colon ? std::atoi(colon + 1) : 16;
+            }
+            // PS2X_VIF1_TRACE=<secs>[:count]: the VIFcodes VIF1 is sent from
+            // that time on (see traceVif1Code), 256 of them unless told.
+            static const uint64_t vif1TraceTick = envEmulatedTicks("PS2X_VIF1_TRACE");
+            static bool vif1TraceArmed = false;
+            if (vif1TraceTick != 0u && !vif1TraceArmed && m_eeScheduler && m_eeScheduler->currentVSyncTick() >= vif1TraceTick)
+            {
+                vif1TraceArmed = true;
+                const char *colon = std::strchr(std::getenv("PS2X_VIF1_TRACE"), ':');
+                g_ps2xVif1TraceRemaining = colon ? std::atoi(colon + 1) : 256;
             }
             static const uint64_t exitTick = envEmulatedTicks("PS2X_EXIT_AT");
             static const uint64_t perfTicks = envEmulatedTicks("PS2X_PERF_LOG");
