@@ -1460,6 +1460,37 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vu0_vf[27]") == std::string::npos, "S1 must not use rs(format) as register index");
         });
 
+        tc.Run("VCALLMSR starts at the address CTC2 put in CMSAR0", [](TestCase &t) {
+            // ctc2 $v0, $vi27 ; vcallmsr $vi27: how a program calls one of
+            // its VU0 routines by address. Both name control register 27.
+            CodeGenerator gen({}, {});
+
+            Instruction ctc2{};
+            ctc2.opcode = OPCODE_COP2;
+            ctc2.rs = COP2_CTC2;
+            ctc2.rt = 2;
+            ctc2.rd = VU0_CR_CMSAR0;
+            const std::string ctc2Code = gen.translateInstruction(ctc2);
+            t.IsTrue(ctc2Code.find("ctx->vu0_cmsar0 = GPR_U32(ctx, 2)") != std::string::npos,
+                     "CTC2 $vi27 should write CMSAR0");
+
+            Instruction call{};
+            call.opcode = OPCODE_COP2;
+            call.rs = COP2_CO;
+            call.rd = VU0_CR_CMSAR0;
+            call.function = VU0_S1_VCALLMSR;
+            call.raw = 0x4A00D839u;
+            const std::string callCode = gen.translateInstruction(call);
+            printGeneratedCode("VCALLMSR starts at the address CTC2 put in CMSAR0", callCode);
+
+            t.IsTrue(callCode.find("ctx->vu0_cmsar0 & 0x1FF") != std::string::npos,
+                     "VCALLMSR should take the address from CMSAR0");
+            t.IsTrue(callCode.find("ctx->vi[") == std::string::npos,
+                     "VCALLMSR must not index the integer registers with 27");
+            t.IsTrue(callCode.find("vu0StartMicroProgram") != std::string::npos,
+                     "VCALLMSR should start the microprogram");
+        });
+
         tc.Run("VU0 S1 q/i forms keep mask and use sa as destination", [](TestCase &t) {
             Instruction inst{};
             inst.opcode = OPCODE_COP2;
