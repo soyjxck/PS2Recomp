@@ -218,7 +218,7 @@ void EeScheduler::run()
             {
                 // Nothing to run: the interrupt the guest is waiting for may
                 // be in the packets the GS has not reached yet.
-                if (GsWorker::drain())
+                if (GsWorker::drain(GsWorker::Wait::Idle))
                     continue;
                 copyMainContextToRuntime();
                 publishIdleDebugContext();
@@ -1971,7 +1971,7 @@ void EeScheduler::processDueDeadlines()
                 // What the guest sent during the frame is drawn before its
                 // vblank, and a FINISH or SIGNAL among it reaches the guest
                 // first, as it would on hardware that kept up.
-                if (GsWorker::drain())
+                if (GsWorker::drain(GsWorker::Wait::VBlank))
                 {
                     const uint32_t gsInterrupts = pendingGsInterrupts();
                     if ((gsInterrupts & ~m_gsIrqLatched) != 0u)
@@ -2090,7 +2090,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             scheduleEvent(m_eeCycle + gsFinishDelayCycles(), std::chrono::steady_clock::now(),
                           EeEvent{EeEventType::Dmac, kGsSyncDue, 0});
         }
-        else if (event.id == kGsSyncDue && GsWorker::drain())
+        else if (event.id == kGsSyncDue && GsWorker::drain(GsWorker::Wait::InterruptDue))
         {
             const uint32_t gsInterrupts = pendingGsInterrupts();
             if ((gsInterrupts & ~m_gsIrqLatched) != 0u)

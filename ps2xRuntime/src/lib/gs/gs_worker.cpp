@@ -15,8 +15,54 @@
 
 namespace
 {
-    // PS2X_GS_STATS: how long callers of drain() waited, VU1's part first.
+    // PS2X_GS_STATS: how long callers of drain() waited, VU1's part first,
+    // and the same by where they waited.
     std::atomic<uint64_t> g_drainWaits{0}, g_drainVu1Nanoseconds{0}, g_drainGsNanoseconds{0};
+    constexpr size_t kWaitKinds = static_cast<size_t>(GsWorker::Wait::Count);
+    std::atomic<uint64_t> g_waitNanoseconds[kWaitKinds], g_waitCount[kWaitKinds];
+    const char *const kWaitNames[kWaitKinds] = {"elsewhere", "an interrupt sent", "an interrupt due", "vblank", "idle",
+                                                "CSR read", "sceGsSyncPath", "a VIF1 register", "VU1 memory"};
+
+    bool statsWanted()
+    {
+        static const bool wanted = []
+        {
+            const char *value = std::getenv("PS2X_GS_STATS");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return wanted;
+    }
+
+    void countWait(GsWorker::Wait why, std::chrono::steady_clock::time_point since)
+    {
+        const size_t kind = static_cast<size_t>(why) < kWaitKinds ? static_cast<size_t>(why) : 0u;
+        g_waitCount[kind].fetch_add(1u, std::memory_order_relaxed);
+        g_waitNanoseconds[kind].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - since)
+                                              .count()),
+                                          std::memory_order_relaxed);
+    }
+
+    // "the EE waited at: vblank 31% (60/s, 5.2 ms each), ..."
+    void printWaits(double window)
+    {
+        char line[512];
+        int used = std::snprintf(line, sizeof(line), "[gs-waits] the EE waited at:");
+        bool any = false;
+        for (size_t kind = 0; kind < kWaitKinds; ++kind)
+        {
+            const uint64_t count = g_waitCount[kind].exchange(0u, std::memory_order_relaxed);
+            const double seconds = static_cast<double>(g_waitNanoseconds[kind].exchange(0u, std::memory_order_relaxed)) * 1e-9;
+            if (count == 0u || used >= static_cast<int>(sizeof(line)))
+                continue;
+            used += std::snprintf(line + used, sizeof(line) - static_cast<size_t>(used), "%s %s %.0f%% (%.0f/s, %.1f ms each)",
+                                  any ? "," : "", kWaitNames[kind], 100.0 * seconds / window,
+                                  static_cast<double>(count) / window, 1000.0 * seconds / static_cast<double>(count));
+            any = true;
+        }
+        if (any)
+            std::fprintf(stderr, "%s\n", line);
+    }
 
     struct Worker
     {
@@ -85,6 +131,7 @@ namespace
                                      100.0 * static_cast<double>(g_drainVu1Nanoseconds.exchange(0)) * 1e-9 / window,
                                      100.0 * static_cast<double>(g_drainGsNanoseconds.exchange(0)) * 1e-9 / window,
                                      static_cast<double>(g_drainWaits.exchange(0)) / window);
+                        printWaits(window);
                         busySeconds = 0.0;
                         packets = 0;
                         windowStart = finished;
@@ -129,7 +176,7 @@ namespace GsWorker
         if (void (*hook)() = g_interruptSentHook.load(std::memory_order_acquire))
             hook();
         else
-            drain();
+            drain(Wait::Interrupt);
     }
 
     bool raisesInterrupt(const uint8_t *data, uint32_t sizeBytes)
@@ -273,35 +320,48 @@ namespace GsWorker
             interruptSent();
     }
 
-    bool drain()
+    bool drainVu1(Wait why)
+    {
+        if (!statsWanted())
+            return Vu1Worker::drain();
+        const auto start = std::chrono::steady_clock::now();
+        const bool waited = Vu1Worker::drain();
+        if (waited)
+            countWait(why, start);
+        return waited;
+    }
+
+    bool drain(Wait why)
     {
         Worker &w = worker();
         if (std::this_thread::get_id() == w.threadId || Vu1Worker::onWorkerThread())
             return false;
-        static const bool wantStats = []
-        {
-            const char *value = std::getenv("PS2X_GS_STATS");
-            return value != nullptr && value[0] != '\0' && value[0] != '0';
-        }();
+        const bool wantStats = statsWanted();
         const auto start = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // VU1 produces GS packets: it has to finish before the GS can.
         const bool waitedForVu1 = Vu1Worker::drain();
         const auto afterVu1 = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (wantStats && waitedForVu1)
             g_drainVu1Nanoseconds.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(afterVu1 - start).count()));
-        if (!w.active.load(std::memory_order_acquire))
-            return waitedForVu1;
-        std::unique_lock<std::mutex> lock(w.mutex);
-        if (w.completed == w.posted)
-            return waitedForVu1;
-        const uint64_t target = w.posted;
-        w.workDone.wait(lock, [&]
-                        { return w.completed >= target; });
-        if (wantStats)
+        bool waited = waitedForVu1;
+        if (w.active.load(std::memory_order_acquire))
         {
-            g_drainWaits.fetch_add(1u);
-            g_drainGsNanoseconds.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - afterVu1).count()));
+            std::unique_lock<std::mutex> lock(w.mutex);
+            if (w.completed != w.posted)
+            {
+                const uint64_t target = w.posted;
+                w.workDone.wait(lock, [&]
+                                { return w.completed >= target; });
+                waited = true;
+                if (wantStats)
+                {
+                    g_drainWaits.fetch_add(1u);
+                    g_drainGsNanoseconds.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - afterVu1).count()));
+                }
+            }
         }
-        return true;
+        if (wantStats && waited)
+            countWait(why, start);
+        return waited;
     }
 }

@@ -24,9 +24,27 @@ namespace GsWorker
     // Process a GIF packet (copied) after everything posted before it.
     void post(const uint8_t *data, uint32_t sizeBytes);
 
+    // Where the EE side waits. PS2X_GS_STATS=1 gives the time by these.
+    enum class Wait : uint8_t
+    {
+        Other,
+        Interrupt,    // a packet that raises FINISH or SIGNAL was sent
+        InterruptDue, // the same, PS2X_GS_FINISH_DELAY_US later
+        VBlank,       // a vblank is about to be delivered
+        Idle,         // no thread of the guest's can run
+        Csr,          // the guest read CSR
+        SyncPath,     // sceGsSyncPath
+        Vif1,         // the guest used a VIF1 register
+        Vu1Memory,    // the guest used VU1's memory
+        Count,
+    };
+
     // Returns when everything posted so far has been processed. True if there
     // was anything to wait for. Does nothing on the worker thread itself.
-    bool drain();
+    bool drain(Wait why = Wait::Other);
+
+    // The same for VU1's queue alone: what its registers and memory need.
+    bool drainVu1(Wait why);
 
     // Called by a sender on the EE side after posting a packet that raises an
     // interrupt. Without a hook the caller waits for the queue (the interrupt

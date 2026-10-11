@@ -1247,7 +1247,7 @@ namespace ps2_stubs
 
     void sceGsSyncPath(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        GsWorker::drain();
+        GsWorker::drain(GsWorker::Wait::SyncPath);
         int32_t mode = static_cast<int32_t>(getRegU32(ctx, 4));
         auto &mem = runtime->memory();
 

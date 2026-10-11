@@ -587,7 +587,7 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
 
     // VU1 memory belongs to the VU1 worker while it has work queued.
     if (physAddr >= PS2_VU1_CODE_BASE && physAddr < PS2_VU1_DATA_BASE + PS2_VU1_DATA_SIZE)
-        Vu1Worker::drain();
+        GsWorker::drainVu1(GsWorker::Wait::Vu1Memory);
 
     if (const uint8_t *ptr = mapRange(PS2_VU0_CODE_BASE, PS2_VU0_CODE_SIZE, m_vu0Code))
     {
@@ -787,7 +787,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
+            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -835,7 +835,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
+            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -1266,7 +1266,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
-        Vu1Worker::drain(); // the worker owns the VIF1 registers while it has work
+        GsWorker::drainVu1(GsWorker::Wait::Vif1); // the worker owns the VIF1 registers while it has work
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
 
         switch (address)
@@ -2509,7 +2509,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(); // SIGNAL and FINISH come out of queued packets
+            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
