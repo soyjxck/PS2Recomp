@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <atomic>
 
 namespace ps2x
 {
@@ -74,12 +75,28 @@ namespace ps2x
             }();
             return values;
         }
+
+        // What ps2x::setSetting (ps2_settings_store.h) has put in the
+        // place of a key's value for this run. The store gives its
+        // lookup here the first time something is set; before that,
+        // and in a program without the store, there is none.
+        using ChangedLookup = const char *(*)(const char *key);
+        inline std::atomic<ChangedLookup> &changedLookup()
+        {
+            static std::atomic<ChangedLookup> lookup{nullptr};
+            return lookup;
+        }
     }
 
-    // The environment variable if it is set, else the file's "section.key",
+    // What has been set for the key while the game runs, else the
+    // environment variable if it is set, else the file's "section.key",
     // else nullptr. Either name may be nullptr.
     inline const char *setting(const char *environment, const char *key)
     {
+        if (key)
+            if (const auto changed = settings_detail::changedLookup().load(std::memory_order_acquire))
+                if (const char *value = changed(key))
+                    return *value ? value : nullptr;
         if (environment)
             if (const char *value = std::getenv(environment); value && *value)
                 return value;

@@ -9,6 +9,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_settings_menu.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -1243,6 +1244,9 @@ bool PS2Runtime::initialize(const char *title)
             ToggleBorderlessWindowed();
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        // [audio] volume (PS2X_VOLUME): 0 to 100, of everything that is played.
+        if (const char *volume = ps2x::setting("PS2X_VOLUME", "audio.volume"))
+            SetMasterVolume(std::clamp(static_cast<float>(std::atof(volume)), 0.0f, 100.0f) / 100.0f);
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -3024,6 +3028,7 @@ void PS2Runtime::run()
             ToggleBorderlessWindowed();
 #endif
         ps2xInputFrame();
+        ps2x::settingsMenuFrame();
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));

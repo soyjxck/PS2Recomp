@@ -1934,6 +1934,7 @@ void EeScheduler::processDueDeadlines()
 }
 
 void ps2xHoldForFrameDump(uint64_t tick); // ps2_runtime.cpp
+bool ps2xSettingsMenuHolds();             // ps2_settings_menu.cpp
 void ps2xArmGsProbe(uint64_t tick);       // gs/gs_cpu_raster.cpp
 
 void EeScheduler::processEvent(const EeEvent &event)
@@ -1947,6 +1948,28 @@ void EeScheduler::processEvent(const EeEvent &event)
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         ps2xHoldForFrameDump(m_vsyncTick);
+        if (ps2xSettingsMenuHolds())
+        {
+            // The game stands still while the settings menu is open. The
+            // deadlines its events have on the host's clock are put off
+            // by as long, or it would hurry afterwards to make up the
+            // time.
+            const auto from = std::chrono::steady_clock::now();
+            while (ps2xSettingsMenuHolds() && !m_stopRequested.load(std::memory_order_acquire) &&
+                   !m_runtime.isStopRequested())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            const auto stood = std::chrono::steady_clock::now() - from;
+            if (!turboEnabled())
+            {
+                std::lock_guard lock(m_eventMutex);
+                for (ScheduledEvent &item : m_deadlines)
+                {
+                    item.hostDeadline += stood;
+                }
+            }
+        }
         ps2xArmGsProbe(m_vsyncTick);
         if ((m_vsyncTick & 1u) != 0u)
         {

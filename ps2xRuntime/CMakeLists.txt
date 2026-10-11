@@ -390,6 +390,8 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
+    src/lib/ps2_settings_menu.cpp
+    src/lib/ps2_settings_store.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -631,7 +633,10 @@ target_link_libraries(ps2EntryRunner
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
+        src/lib/ps2_settings_menu_ui.cpp
     )
+    # Its names are its own: not in a unity batch with the panel's.
+    set_source_files_properties(src/lib/ps2_settings_menu_ui.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
     target_link_libraries(ps2EntryRunner PRIVATE rlImGui imgui)
     target_compile_definitions(ps2EntryRunner PRIVATE PS2X_ENABLE_DEBUG_UI=1)
 endif()

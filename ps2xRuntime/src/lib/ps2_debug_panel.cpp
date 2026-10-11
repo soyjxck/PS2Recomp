@@ -4,6 +4,7 @@
 #include "ps2_runtime_macros.h"
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_settings_menu.h"
 
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
@@ -2183,6 +2184,7 @@ void PS2DebugPanel::initialize()
     if (!m_initialized)
     {
         rlImGuiSetup(true);
+        ps2xSetupSettingsMenuUi();
         m_initialized = true;
         // PS2X_DEBUG_PANEL=0 starts with the panel hidden (F1 toggles).
         if (const char *panel = std::getenv("PS2X_DEBUG_PANEL"); panel && panel[0] == '0')
@@ -2217,13 +2219,27 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         toggleVisible();
     }
 
-    ps2xInputSetUiOpen(m_visible); // the panel needs the mouse
-    if (!m_visible)
+    // The settings menu is drawn in the same frame of the library as the
+    // panel, and by itself when the panel is hidden.
+    const ps2x::SettingsMenuState &settingsMenu = ps2x::settingsMenuState();
+    const bool settingsMenuShows = settingsMenu.open || settingsMenu.noticeStrength > 0.0f;
+    ps2xInputSetUiOpen(m_visible || settingsMenu.open); // these need the mouse, or let it go
+    if (!m_visible && !settingsMenuShows)
     {
         return;
     }
 
     rlImGuiBegin();
+    if (settingsMenuShows)
+    {
+        ps2xDrawSettingsMenu(settingsMenu);
+    }
+    if (!m_visible)
+    {
+        rlImGuiEnd();
+        ps2xGrabSettingsMenu(settingsMenu);
+        return;
+    }
 
     ImGui::SetNextWindowSize(ImVec2(780.0f, 620.0f), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Runtime Debugger", &m_visible, ImGuiWindowFlags_MenuBar))
@@ -2311,6 +2327,7 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
     ImGui::End();
 
     rlImGuiEnd();
+    ps2xGrabSettingsMenu(settingsMenu);
 #else
     (void)runtime;
 #endif
