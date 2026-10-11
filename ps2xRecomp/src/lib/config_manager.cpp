@@ -95,6 +95,11 @@ namespace ps2recomp
                 std::unique(config.entryPointHints.begin(), config.entryPointHints.end()),
                 config.entryPointHints.end());
 
+            if (general.contains("keep") && general.at("keep").is_array())
+            {
+                config.keepFunctions = toml::find<std::vector<std::string>>(general, "keep");
+            }
+
             config.overlayName = toml::find_or<std::string>(general, "overlay", "");
             if (general.contains("overlay_ranges") && general.at("overlay_ranges").is_array())
             {
@@ -319,6 +324,10 @@ namespace ps2recomp
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;
+        if (!config.keepFunctions.empty())
+        {
+            general["keep"] = config.keepFunctions;
+        }
         if (!config.overlayName.empty())
         {
             general["overlay"] = config.overlayName;

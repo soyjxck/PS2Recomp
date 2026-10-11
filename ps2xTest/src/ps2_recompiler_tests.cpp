@@ -1390,7 +1390,7 @@ void register_ps2_recompiler_tests()
             std::filesystem::remove(configPath, removeError);
         });
 
-        tc.Run("config manager parses overlay settings", [](TestCase &t) {
+        tc.Run("config manager parses overlay and keep settings", [](TestCase &t) {
             const auto uniqueSuffix = std::to_string(
                 static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
             const std::filesystem::path configPath =
@@ -1408,6 +1408,7 @@ void register_ps2_recompiler_tests()
             configFile << "output = \"out\"\n";
             configFile << "overlay = \"ov01\"\n";
             configFile << "overlay_ranges = [\"0x00A00000-0x00A60000\", \"0xC00000-0xC10000\"]\n";
+            configFile << "keep = [\"sin\", \"sceVu0*\"]\n";
             configFile.close();
 
             ConfigManager manager(configPath.string());
@@ -1421,6 +1422,7 @@ void register_ps2_recompiler_tests()
                 t.Equals(config.overlayRanges[0].second, 0x00A60000u, "and ends before its second");
                 t.Equals(config.overlayRanges[1].first, 0x00C00000u, "the second range should parse too");
             }
+            t.Equals(config.keepFunctions.size(), static_cast<size_t>(2), "the names to keep as guest code should load");
 
             std::error_code removeError;
             std::filesystem::remove(configPath, removeError);

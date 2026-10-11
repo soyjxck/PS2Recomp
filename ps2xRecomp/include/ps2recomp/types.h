@@ -189,6 +189,9 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
         std::vector<std::string> entryPointHints;
+        // Names the runtime has a handler for that stay recompiled guest code
+        // all the same ("sin", or "sceVu0*" for a prefix).
+        std::vector<std::string> keepFunctions;
         // Overlays: several images linked at one address, one in memory at a
         // time. Each is recompiled from its own ELF under overlayName; the
         // image they are loaded over lists their address ranges and leaves

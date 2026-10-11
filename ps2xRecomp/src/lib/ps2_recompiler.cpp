@@ -2270,6 +2270,18 @@ namespace ps2recomp
         {
             return true;
         }
+
+        // general.keep: the ELF has symbols, so every name the runtime knows
+        // would be bound to its handler; these stay the game's own code.
+        for (const std::string &pattern : m_config.keepFunctions)
+        {
+            const bool prefix = !pattern.empty() && pattern.back() == '*';
+            if (prefix ? function.name.compare(0, pattern.size() - 1, pattern, 0, pattern.size() - 1) == 0
+                       : function.name == pattern)
+            {
+                return false;
+            }
+        }
         return ps2_runtime_calls::isStubName(function.name);
     }
 
