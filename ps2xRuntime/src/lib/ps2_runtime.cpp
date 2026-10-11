@@ -1290,7 +1290,11 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        // ALWAYS_RUN: raylib otherwise waits in PollInputEvents for as long
+        // as the window is minimised, and this loop with it (no picture, no
+        // pad, no frame dumps, no PS2X_EXIT_AT) while the game's own thread
+        // plays on with whatever the pad last held.
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
         InitWindow(hostDisplay().windowWidth, hostDisplay().windowHeight, title);
         if (hostDisplay().fullscreen)
             ToggleBorderlessWindowed();
