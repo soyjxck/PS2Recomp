@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "runtime/ps2_display_mode.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_settings_store.h"
 
@@ -85,5 +86,26 @@ void register_ps2_settings_store_tests()
                      "the value set again");
             ps2x::setSetting("store_test.value", "");
             t.IsNull(ps2x::setting(nullptr, "store_test.value"), "set to nothing, there is none");
+        });
+
+        tc.Run("[display] fullscreen names one of three modes", [](TestCase &t)
+               {
+            using ps2x::DisplayMode;
+            const auto from = [](const char *text)
+            { return ps2x::displayModeFrom(text, DisplayMode::Window); };
+            t.IsTrue(from("off") == DisplayMode::Window, "off is a window");
+            t.IsTrue(from("borderless") == DisplayMode::Borderless, "borderless");
+            t.IsTrue(from("exclusive") == DisplayMode::Exclusive, "exclusive");
+            t.IsTrue(from(" Exclusive ") == DisplayMode::Exclusive, "whatever its case and the blanks about it");
+            // A file written when there were two keeps doing what it did.
+            t.IsTrue(from("on") == DisplayMode::Borderless, "on was the whole screen without a frame, and is");
+            t.IsTrue(from("1") == DisplayMode::Borderless, "and so was 1");
+            t.IsTrue(from("0") == DisplayMode::Window, "0 is a window");
+            t.IsTrue(ps2x::displayModeFrom(nullptr, DisplayMode::Exclusive) == DisplayMode::Exclusive, "nothing set: what the caller says");
+            t.IsTrue(ps2x::displayModeFrom("sideways", DisplayMode::Borderless) == DisplayMode::Borderless,
+                     "a word that names none: what the caller says");
+            // What the menu writes is what is read back.
+            for (const DisplayMode mode : {DisplayMode::Window, DisplayMode::Borderless, DisplayMode::Exclusive})
+                t.IsTrue(from(ps2x::displayModeValue(mode)) == mode, "a mode's own word names it");
         }); });
 }

@@ -1,4 +1,5 @@
 #include "runtime/ps2_settings_menu.h"
+#include "runtime/ps2_display_mode.h"
 #include "runtime/ps2_input.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_settings_store.h"
@@ -122,11 +123,6 @@ namespace
 
     // ---- the runtime's own lines: the picture -----------------------------
 
-    bool fullScreen()
-    {
-        return IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
-    }
-
     void addRuntimeRows(Menu &all)
     {
         if (all.runtimeRows)
@@ -140,15 +136,13 @@ namespace
             row.key = "display.fullscreen";
             row.environment = "PS2X_FULLSCREEN";
             row.label = "Display Mode";
-            row.description = "A window, or the whole screen. F11 switches as well.";
-            row.choices = {{"off", "Window"}, {"on", "Full Screen"}};
+            row.description = "A window, the whole screen without a frame (borderless), or the screen taken over (full screen). "
+                              "F11 switches as well.";
+            row.choices = {{"off", "Window"}, {"borderless", "Borderless"}, {"exclusive", "Full Screen"}};
             row.apply = [](const std::string &value)
-            {
-                if ((value == "on") != fullScreen())
-                    ToggleBorderlessWindowed();
-            };
+            { ps2x::setDisplayMode(ps2x::displayModeFrom(value.c_str(), ps2x::DisplayMode::Window)); };
             row.current = []
-            { return std::string(fullScreen() ? "on" : "off"); };
+            { return std::string(ps2x::displayModeValue(ps2x::displayMode())); };
             rows.push_back(std::move(row));
         }
         {
@@ -164,7 +158,8 @@ namespace
             row.apply = [](const std::string &value)
             {
                 int width = 0, height = 0;
-                if (std::sscanf(value.c_str(), "%dx%d", &width, &height) == 2 && width >= 64 && height >= 64 && !fullScreen())
+                if (std::sscanf(value.c_str(), "%dx%d", &width, &height) == 2 && width >= 64 && height >= 64 &&
+                    ps2x::displayMode() == ps2x::DisplayMode::Window)
                     SetWindowSize(width, height);
             };
             rows.push_back(std::move(row));

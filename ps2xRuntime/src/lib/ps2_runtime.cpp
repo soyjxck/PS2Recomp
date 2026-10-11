@@ -9,6 +9,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/ps2_audio_output.h"
+#include "runtime/ps2_display_mode.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_settings_menu.h"
 #include "runtime/gs/gs_gpu_renderer.h"
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -66,15 +68,18 @@ static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
 //                                 and so on, or "native": one host pixel
 //                                 for each of the game's, which is 640:448.
 //   window     (PS2X_WINDOW)      the window's size, as 1280x720.
-//   fullscreen (PS2X_FULLSCREEN)  on: the whole screen, borderless. F11
-//                                 switches while the game runs.
+//   fullscreen (PS2X_FULLSCREEN)  off: a window. borderless: a window
+//                                 without a frame over the whole screen.
+//                                 exclusive: the screen taken over in its
+//                                 own mode. on is borderless. F11 switches
+//                                 while the game runs (ps2_display_mode.h).
 //   filter     (PS2X_FILTER)      linear (smooth, the default) or nearest.
 struct HostDisplay
 {
     float aspect = 4.0f / 3.0f; // width over height as shown; 0 for the picture's own
     int windowWidth = 0;
     int windowHeight = 0;
-    bool fullscreen = false;
+    ps2x::DisplayMode mode = ps2x::DisplayMode::Window;
     bool smooth = true;
 };
 
@@ -102,12 +107,106 @@ static const HostDisplay &hostDisplay()
             d.windowHeight = d.aspect > 0.0f ? 720 : HOST_WINDOW_HEIGHT;
             d.windowWidth = d.aspect > 0.0f ? static_cast<int>(720.0f * d.aspect + 0.5f) : HOST_WINDOW_WIDTH;
         }
-        d.fullscreen = ps2x::settingOn("PS2X_FULLSCREEN", "display.fullscreen", false);
+        d.mode = ps2x::displayModeFrom(ps2x::setting("PS2X_FULLSCREEN", "display.fullscreen"), ps2x::DisplayMode::Window);
         if (const char *filter = ps2x::setting("PS2X_FILTER", "display.filter"))
             d.smooth = std::strcmp(filter, "nearest") != 0;
         return d;
     }();
     return display;
+}
+
+const char *ps2x::displayModeValue(DisplayMode mode)
+{
+    switch (mode)
+    {
+    case DisplayMode::Borderless:
+        return "borderless";
+    case DisplayMode::Exclusive:
+        return "exclusive";
+    default:
+        return "off";
+    }
+}
+
+ps2x::DisplayMode ps2x::displayModeFrom(const char *text, DisplayMode otherwise)
+{
+    if (!text)
+        return otherwise;
+    std::string value;
+    for (const char *at = text; *at != '\0'; ++at)
+        if (!std::isspace(static_cast<unsigned char>(*at)))
+            value.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(*at))));
+    if (value == "off" || value == "no" || value == "false" || value == "0" || value == "window")
+        return DisplayMode::Window;
+    // "on" is from when the window had one other state, and that was this.
+    if (value == "borderless" || value == "on" || value == "yes" || value == "true" || value == "1")
+        return DisplayMode::Borderless;
+    if (value == "exclusive" || value == "fullscreen")
+        return DisplayMode::Exclusive;
+    return otherwise;
+}
+
+namespace
+{
+    // Which of the two F11 goes to, and the window as it was before it
+    // became the screen (raylib gives the screen's mode the window's size,
+    // so the window is made the monitor's size first).
+    ps2x::DisplayMode g_wholeScreenMode = ps2x::DisplayMode::Borderless;
+    int g_windowedWidth = 0, g_windowedHeight = 0;
+}
+
+ps2x::DisplayMode ps2x::displayMode()
+{
+#if !defined(PLATFORM_VITA)
+    if (IsWindowFullscreen())
+        return DisplayMode::Exclusive;
+    if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+        return DisplayMode::Borderless;
+#endif
+    return DisplayMode::Window;
+}
+
+void ps2x::setDisplayMode(DisplayMode mode)
+{
+#if !defined(PLATFORM_VITA)
+    if (mode != DisplayMode::Window)
+        g_wholeScreenMode = mode;
+    const DisplayMode now = displayMode();
+    if (mode == now)
+        return;
+
+    // Each of the other two is entered from a window.
+    if (now == DisplayMode::Borderless)
+    {
+        ToggleBorderlessWindowed();
+    }
+    else if (now == DisplayMode::Exclusive)
+    {
+        ToggleFullscreen();
+        if (g_windowedWidth > 0 && g_windowedHeight > 0)
+            SetWindowSize(g_windowedWidth, g_windowedHeight);
+    }
+
+    if (mode == DisplayMode::Borderless)
+    {
+        ToggleBorderlessWindowed();
+    }
+    else if (mode == DisplayMode::Exclusive)
+    {
+        const int monitor = GetCurrentMonitor();
+        g_windowedWidth = GetScreenWidth();
+        g_windowedHeight = GetScreenHeight();
+        SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+        ToggleFullscreen();
+    }
+#else
+    (void)mode;
+#endif
+}
+
+void ps2x::toggleDisplayMode()
+{
+    setDisplayMode(displayMode() == DisplayMode::Window ? g_wholeScreenMode : DisplayMode::Window);
 }
 
 static std::atomic<float> g_presentationAspect{0.0f};
@@ -1320,8 +1419,7 @@ bool PS2Runtime::initialize(const char *title)
         // plays on with whatever the pad last held.
         SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
         InitWindow(hostDisplay().windowWidth, hostDisplay().windowHeight, title);
-        if (hostDisplay().fullscreen)
-            ToggleBorderlessWindowed();
+        ps2x::setDisplayMode(hostDisplay().mode);
         // A second GL context beside the window's, for a GS drawn by the
         // graphics card (display.renderer = gpu or hybrid).
         if (const char *renderer = ps2x::setting("PS2X_GS_RENDERER", "display.renderer");
@@ -3324,7 +3422,7 @@ void PS2Runtime::run()
 
 #if !defined(PLATFORM_VITA)
         if (IsKeyPressed(KEY_F11))
-            ToggleBorderlessWindowed();
+            ps2x::toggleDisplayMode();
 #endif
         ps2xInputFrame();
         ps2x::settingsMenuFrame();
