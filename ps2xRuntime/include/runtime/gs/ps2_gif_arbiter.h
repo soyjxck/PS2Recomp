@@ -35,6 +35,15 @@ public:
     void drain();
     bool empty() const { return m_queue.empty(); }
 
+    // What submit() and drain() come to for one packet with nothing queued:
+    // the packet goes to the GS as it is, without a copy on the heap and a
+    // sort of one. VU1 sends thousands a frame that way.
+    void process(const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (data && sizeBytes >= 16u && m_processFn)
+            m_processFn(data, sizeBytes);
+    }
+
 private:
     ProcessPacketFn m_processFn;
     std::vector<GifArbiterPacket> m_queue;
