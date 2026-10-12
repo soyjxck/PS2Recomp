@@ -416,6 +416,70 @@ set_source_files_properties(
     src/lib/vu/ps2_vu1_lower.cpp
     PROPERTIES UNITY_GROUP vu1)
 
+# With MSVC the generated VU sources are compiled by clang-cl where it is
+# installed (Visual Studio's "C++ Clang tools", or LLVM's own installer). Its
+# objects link with MSVC's, and it does with these files what MSVC cannot:
+# see where the function is used. Only in a release build made with Ninja;
+# PS2X_CLANG_CL_USABLE says whether it applies here.
+set(PS2X_CLANG_CL_USABLE OFF)
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_GENERATOR MATCHES "Ninja"
+   AND NOT PS2X_IS_ARM_TARGET AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    find_program(PS2X_CLANG_CL clang-cl
+        HINTS "$ENV{VCINSTALLDIR}/Tools/Llvm/x64/bin" "$ENV{ProgramFiles}/LLVM/bin"
+        DOC "clang-cl, for the generated VU sources of an MSVC build")
+    if(PS2X_CLANG_CL)
+        set(PS2X_CLANG_CL_USABLE ON)
+        # What the runtime's own sources get in a release build
+        # (cmake/ReleaseMode.cmake), less what only MSVC has, and with the
+        # C runtime the project links (the DLL one unless it says otherwise).
+        # -ffp-contract=off: under /fp:precise clang makes one fused
+        # operation of a product and a sum written as two (x*x + y*y), and
+        # cl does not. The VU's product sums ask for fusing themselves
+        # (std::fma, the intrinsics) and keep it; what would change is the
+        # arithmetic written plainly, ESADD, ELENG and their like and the
+        # polynomials of EATAN, ESIN and EEXP. Compiled code has to round
+        # as the interpreter in the same program does, and where both
+        # compilers emit one inline function the linker keeps either.
+        set(PS2X_VU_CLANG_CRT /MD)
+        if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+            set(PS2X_VU_CLANG_CRT /MT)
+        endif()
+        set(PS2X_VU_CLANG_FLAGS /nologo /c /TP /std:c++20 /EHsc ${PS2X_VU_CLANG_CRT} /O2 /Ob2 /Oi /Gy /GF
+            /Zc:inline /fp:precise /clang:-ffp-contract=off /GS- /DNDEBUG -Wno-everything)
+        if(PS2X_X86_AVX2)
+            list(APPEND PS2X_VU_CLANG_FLAGS /arch:AVX2 -mfma)
+        endif()
+    endif()
+endif()
+
+# ps2x_vu_objects_by_clang_cl(<variable> "<files every object depends on>" <source>...)
+# gives each source a command that compiles it with clang-cl, with the runtime
+# target's include directories and definitions, in the VU job pool, and puts
+# the objects in <variable>: they are the library's sources in its place.
+function(ps2x_vu_objects_by_clang_cl OUT DEPENDENCIES)
+    set(OBJECTS)
+    foreach(SOURCE ${ARGN})
+        get_filename_component(NAME "${SOURCE}" NAME_WE)
+        set(OBJECT "${CMAKE_CURRENT_BINARY_DIR}/generated/${NAME}.clang.obj")
+        add_custom_command(
+            OUTPUT "${OBJECT}"
+            COMMAND "${PS2X_CLANG_CL}" ${PS2X_VU_CLANG_FLAGS}
+                    "-I${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu"
+                    "-I$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:ps2_runtime,INCLUDE_DIRECTORIES>>,;-I>"
+                    "-D$<JOIN:$<TARGET_PROPERTY:ps2_runtime,COMPILE_DEFINITIONS>,;-D>"
+                    "/clang:-MD" "/clang:-MF${OBJECT}.d"
+                    "/Fo${OBJECT}" "${SOURCE}"
+            DEPENDS "${SOURCE}" ${DEPENDENCIES}
+            DEPFILE "${OBJECT}.d"
+            JOB_POOL ps2_vu_aot_compile
+            COMMENT "Building CXX object generated/${NAME}.clang.obj (clang-cl)"
+            COMMAND_EXPAND_LISTS VERBATIM)
+        list(APPEND OBJECTS "${OBJECT}")
+    endforeach()
+    set_source_files_properties(${OBJECTS} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
+    set(${OUT} ${OBJECTS} PARENT_SCOPE)
+endfunction()
+
 set(PS2X_VU_AOT_IMAGES "" CACHE STRING "Local VU code images or block profiles to compile; never distributed")
 set(PS2X_VU_AOT_PAIR_IMAGES "" CACHE STRING "Additional local VU inputs to compile as reusable individual pairs")
 set(PS2X_VU_AOT_LOOP_IMAGES "" CACHE STRING "Local VU code images to scan for bounded conditional loops")
@@ -458,75 +522,23 @@ if(PS2X_VU_AOT_IMAGES OR PS2X_VU_AOT_PAIR_IMAGES OR PS2X_VU_AOT_LOOP_IMAGES)
         PS2X_VU_AOT_INCLUDE="${PS2X_VU_AOT_INCLUDE}"
         PS2X_VU_AOT_EXTERN_INCLUDE="${PS2X_VU_AOT_EXTERN_INCLUDE}")
 
-    # With MSVC these are compiled by clang-cl where it is installed (Visual
-    # Studio's "C++ Clang tools", or LLVM's own installer). Its objects link
-    # with MSVC's, and it does what MSVC cannot be told to do without running
-    # out of memory: inline a pair's executors and fold the pair's words into
-    # them (ps2_vu1_detail.h), as clang and GCC do elsewhere. A game that
-    # skins its characters with VU0 spends most of a fight in these blocks:
-    # in Drakengard 2's first one the game thread takes 35% less CPU, and
-    # the frames are the same to the pixel as MSVC's.
+    # With MSVC these are compiled by clang-cl where it is installed. It
+    # does what MSVC cannot be told to do without running out of memory:
+    # inline a pair's executors and fold the pair's words into them
+    # (ps2_vu1_detail.h), as clang and GCC do elsewhere. A game that skins
+    # its characters with VU0 spends most of a fight in these blocks: in
+    # Drakengard 2's first one the game thread takes 35% less CPU, and the
+    # frames are the same to the pixel as MSVC's.
     # -DPS2X_VU_AOT_CLANG_CL=OFF leaves the blocks to MSVC.
     option(PS2X_VU_AOT_CLANG_CL "With MSVC and Ninja: compile the VU AOT sources with clang-cl when it is found" ON)
-    set(PS2X_VU_AOT_BY_CLANG_CL OFF)
-    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND PS2X_VU_AOT_CLANG_CL
-       AND CMAKE_GENERATOR MATCHES "Ninja" AND NOT PS2X_IS_ARM_TARGET
-       AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-        find_program(PS2X_CLANG_CL clang-cl
-            HINTS "$ENV{VCINSTALLDIR}/Tools/Llvm/x64/bin" "$ENV{ProgramFiles}/LLVM/bin"
-            DOC "clang-cl, for the VU AOT sources of an MSVC build")
-        if(PS2X_CLANG_CL)
-            set(PS2X_VU_AOT_BY_CLANG_CL ON)
-            message(STATUS "VU AOT sources: compiled with ${PS2X_CLANG_CL}")
-        else()
-            message(STATUS "VU AOT sources: clang-cl not found, compiled with MSVC (slower in play)")
-        endif()
-    endif()
-
-    if(PS2X_VU_AOT_BY_CLANG_CL)
-        # What the runtime's own sources get in a release build
-        # (cmake/ReleaseMode.cmake), less what only MSVC has, and with the
-        # C runtime the project links (the DLL one unless it says otherwise).
-        # -ffp-contract=off: under /fp:precise clang makes one fused
-        # operation of a product and a sum written as two (x*x + y*y), and
-        # cl does not. The VU's product sums ask for fusing themselves
-        # (std::fma, the intrinsics) and keep it; what would change is the
-        # arithmetic written plainly, ESADD, ELENG and their like and the
-        # polynomials of EATAN, ESIN and EEXP in ps2_vu1_lower.inl. A
-        # compiled block has to round as the interpreter in the same
-        # program does, and where both compilers emit one inline function
-        # the linker keeps either.
-        set(PS2X_VU_AOT_CLANG_CRT /MD)
-        if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
-            set(PS2X_VU_AOT_CLANG_CRT /MT)
-        endif()
-        set(PS2X_VU_AOT_CLANG_FLAGS /nologo /c /TP /std:c++20 /EHsc ${PS2X_VU_AOT_CLANG_CRT} /O2 /Ob2 /Oi /Gy /GF
-            /Zc:inline /fp:precise /clang:-ffp-contract=off /GS- /DNDEBUG -Wno-everything)
-        if(PS2X_X86_AVX2)
-            list(APPEND PS2X_VU_AOT_CLANG_FLAGS /arch:AVX2 -mfma)
-        endif()
-        set(PS2X_VU_AOT_OBJECTS)
-        foreach(PS2X_VU_AOT_SOURCE ${PS2X_VU_AOT_SOURCES})
-            get_filename_component(PS2X_VU_AOT_NAME "${PS2X_VU_AOT_SOURCE}" NAME_WE)
-            set(PS2X_VU_AOT_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/generated/${PS2X_VU_AOT_NAME}.clang.obj")
-            add_custom_command(
-                OUTPUT "${PS2X_VU_AOT_OBJECT}"
-                COMMAND "${PS2X_CLANG_CL}" ${PS2X_VU_AOT_CLANG_FLAGS}
-                        "-I${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu"
-                        "-I$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:ps2_runtime,INCLUDE_DIRECTORIES>>,;-I>"
-                        "-D$<JOIN:$<TARGET_PROPERTY:ps2_runtime,COMPILE_DEFINITIONS>,;-D>"
-                        "/clang:-MD" "/clang:-MF${PS2X_VU_AOT_OBJECT}.d"
-                        "/Fo${PS2X_VU_AOT_OBJECT}" "${PS2X_VU_AOT_SOURCE}"
-                DEPENDS "${PS2X_VU_AOT_SOURCE}" "${PS2X_VU_AOT_INCLUDE}" "${PS2X_VU_AOT_EXTERN_INCLUDE}"
-                DEPFILE "${PS2X_VU_AOT_OBJECT}.d"
-                JOB_POOL ps2_vu_aot_compile
-                COMMENT "Building CXX object generated/${PS2X_VU_AOT_NAME}.clang.obj (clang-cl)"
-                COMMAND_EXPAND_LISTS VERBATIM)
-            list(APPEND PS2X_VU_AOT_OBJECTS "${PS2X_VU_AOT_OBJECT}")
-        endforeach()
-        set_source_files_properties(${PS2X_VU_AOT_OBJECTS} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
+    if(PS2X_CLANG_CL_USABLE AND PS2X_VU_AOT_CLANG_CL)
+        message(STATUS "VU AOT sources: compiled with ${PS2X_CLANG_CL}")
+        ps2x_vu_objects_by_clang_cl(PS2X_VU_AOT_OBJECTS "${PS2X_VU_AOT_INCLUDE};${PS2X_VU_AOT_EXTERN_INCLUDE}" ${PS2X_VU_AOT_SOURCES})
         target_sources(ps2_runtime PRIVATE ${PS2X_VU_AOT_OBJECTS})
     else()
+        if(MSVC AND PS2X_VU_AOT_CLANG_CL AND NOT PS2X_CLANG_CL_USABLE AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+            message(STATUS "VU AOT sources: compiled with MSVC (slower in play; clang-cl with Ninja in a release build would compile them)")
+        endif()
         target_sources(ps2_runtime PRIVATE ${PS2X_VU_AOT_SOURCES})
     endif()
     set_source_files_properties(${PS2X_VU_AOT_SOURCES} PROPERTIES
@@ -582,7 +594,27 @@ if(PS2X_VU_PROGRAM_PROFILES)
     add_custom_target(ps2_vu_programs DEPENDS "${PS2X_VU_PROGRAM_INCLUDE}"
                       "${PS2X_VU_PROGRAM_EXTERN_INCLUDE}" ${PS2X_VU_PROGRAM_SOURCES})
     add_dependencies(ps2_runtime ps2_vu_programs)
-    target_sources(ps2_runtime PRIVATE ${PS2X_VU_PROGRAM_SOURCES})
+
+    # By clang-cl too, with MSVC. A routine is a few hundred pairs, each a
+    # template that only takes its place in the routine if every helper
+    # under it is inlined; MSVC's code keeps the routine's state in memory
+    # between them. Xenosaga's VU1 thread takes a tenth less CPU in its
+    # close-ups, and a file compiles in 5 s where cl took 40.
+    # -DPS2X_VU_PROGRAM_CLANG_CL=OFF leaves the routines to MSVC.
+    option(PS2X_VU_PROGRAM_CLANG_CL "With MSVC and Ninja: compile the VU1 routines with clang-cl when it is found" ON)
+    if(PS2X_CLANG_CL_USABLE AND PS2X_VU_PROGRAM_CLANG_CL)
+        message(STATUS "VU1 routines: compiled with ${PS2X_CLANG_CL}")
+        # The pool the VU AOT sources are compiled in, if they have not made it.
+        get_property(PS2X_JOB_POOLS GLOBAL PROPERTY JOB_POOLS)
+        if(NOT PS2X_JOB_POOLS MATCHES "ps2_vu_aot_compile")
+            set_property(GLOBAL APPEND PROPERTY JOB_POOLS ps2_vu_aot_compile=${PS2X_VU_AOT_COMPILE_JOBS})
+        endif()
+        ps2x_vu_objects_by_clang_cl(PS2X_VU_PROGRAM_OBJECTS "${PS2X_VU_PROGRAM_INCLUDE};${PS2X_VU_PROGRAM_EXTERN_INCLUDE}"
+                                    ${PS2X_VU_PROGRAM_SOURCES})
+        target_sources(ps2_runtime PRIVATE ${PS2X_VU_PROGRAM_OBJECTS})
+    else()
+        target_sources(ps2_runtime PRIVATE ${PS2X_VU_PROGRAM_SOURCES})
+    endif()
     set_source_files_properties(src/lib/vu/ps2_vu1_program.cpp PROPERTIES COMPILE_DEFINITIONS
         "PS2X_VU_PROGRAM_INCLUDE=\"${PS2X_VU_PROGRAM_INCLUDE}\";PS2X_VU_PROGRAM_EXTERN_INCLUDE=\"${PS2X_VU_PROGRAM_EXTERN_INCLUDE}\"")
     set_source_files_properties(${PS2X_VU_PROGRAM_SOURCES} PROPERTIES
