@@ -2007,7 +2007,9 @@ struct GSCpuBackend::PreparedPrimitive
 // pool draws the batches one after another, in the order they were handed
 // over, while the GS thread carries on decoding. Within a batch rows are given
 // out in bands, and within a band primitives are drawn in submission order, so
-// the pixels are the ones drawing them one by one would give.
+// the pixels are the ones drawing them one by one would give. A primitive
+// that samples what it draws is a batch by itself and all one band: every
+// pixel of it may read the ones before, so one thread draws its rows in order.
 //
 // What keeps that safe is knowing which VRAM pages the primitives not yet
 // drawn write and read: anything else that reads or writes VRAM (a transfer, a
@@ -2053,6 +2055,7 @@ struct GSCpuBackend::RasterQueue
         size_t weight = 0; // what it counts for against kMaxInFlight
         uint64_t number = 0;
         int firstRow = 0;
+        int bandHeight = kBandHeight;
         int bandCount = 0;
         std::atomic<int> nextBand{0};
         int drawing = 0; // threads inside drawBands (under the mutex)
@@ -2074,8 +2077,8 @@ struct GSCpuBackend::RasterQueue
             const int band = batch.nextBand.fetch_add(1, std::memory_order_relaxed);
             if (band >= batch.bandCount)
                 return;
-            const int bandFirst = batch.firstRow + band * kBandHeight;
-            const int bandLast = bandFirst + kBandHeight - 1;
+            const int bandFirst = batch.firstRow + band * batch.bandHeight;
+            const int bandLast = bandFirst + batch.bandHeight - 1;
             if (batch.image)
             {
                 // firstRow is a multiple of the band height: see StoreImagePixels.
@@ -2211,7 +2214,9 @@ struct GSCpuBackend::RasterQueue
     }
 
     // Hands the pending primitives to the pool. Does not wait for them.
-    void submit(const char *why = nullptr)
+    // `whole`: as one band, for one thread to draw from the first row to the
+    // last.
+    void submit(const char *why = nullptr, bool whole = false)
     {
         if (pending.empty())
             return;
@@ -2266,7 +2271,8 @@ struct GSCpuBackend::RasterQueue
         batch->weight = batch->primitives.size();
         batch->number = ++submitted;
         batch->firstRow = top;
-        batch->bandCount = (bottom - top) / kBandHeight + 1;
+        batch->bandHeight = whole ? bottom - top + 1 : kBandHeight;
+        batch->bandCount = (bottom - top) / batch->bandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
         batch->drawing = 0;
 
@@ -2326,6 +2332,7 @@ struct GSCpuBackend::RasterQueue
         batch->weight = bytes / 256u + 1u;
         batch->number = ++submitted;
         batch->firstRow = static_cast<int>(dsay - dsay % static_cast<uint32_t>(kBandHeight));
+        batch->bandHeight = kBandHeight;
         batch->bandCount = (static_cast<int>(dsay + rrh) - 1 - batch->firstRow) / kBandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
         batch->drawing = 0;
@@ -4222,10 +4229,37 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
 
     // A texture sampled from VRAM while drawing can wait with the others
     // unless it is its own target (every pixel written changes what the next
-    // one reads): that one is drawn now, on this thread.
+    // one reads). That one is drawn in one piece, rows in order, after all
+    // that came before it and before anything that comes after: by the pool,
+    // as a batch of its own that is one band, when VRAM alone is drawn into
+    // and its texels need no palette (which is looked up on this thread). A
+    // sprite that blurs the whole frame into itself is some milliseconds, and
+    // drawn here it was those and as many again of waiting for the pool to
+    // get to it, with nothing decoded meanwhile. Otherwise now, on this
+    // thread.
     const bool live = p.tme && !p.decoded;
     if (live && p.textureIsTarget)
     {
+        if (!twice && p.texKind < TextureKind::Index8)
+        {
+            queue.submit("direct");
+            queue.fbp = ctx.frame.fbp;
+            queue.fbw = ctx.frame.fbw;
+            queue.fpsm = ctx.frame.psm;
+            queue.zbp = ctx.zbuf.zbp;
+            queue.zpsm = ctx.zbuf.psm;
+            addPages(queue.written, p.frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+            if (!p.zmask)
+                addPages(queue.written, p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+            addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
+            queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
+                                   static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
+            // The queued copy must not point at this call's draw state.
+            p.drawState = nullptr;
+            queue.pending.push_back(primitive);
+            queue.submit("direct", true);
+            return true;
+        }
         queue.run("direct");
         if (twice && card)
             GpuDraw(batch, primitive, scale);
