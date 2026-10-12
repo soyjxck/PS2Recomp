@@ -454,10 +454,67 @@ if(PS2X_VU_AOT_IMAGES OR PS2X_VU_AOT_PAIR_IMAGES OR PS2X_VU_AOT_LOOP_IMAGES)
         VERBATIM)
     add_custom_target(ps2_vu_aot DEPENDS "${PS2X_VU_AOT_INCLUDE}" "${PS2X_VU_AOT_EXTERN_INCLUDE}" ${PS2X_VU_AOT_SOURCES})
     add_dependencies(ps2_runtime ps2_vu_aot)
-    target_sources(ps2_runtime PRIVATE ${PS2X_VU_AOT_SOURCES})
     target_compile_definitions(ps2_runtime PRIVATE
         PS2X_VU_AOT_INCLUDE="${PS2X_VU_AOT_INCLUDE}"
         PS2X_VU_AOT_EXTERN_INCLUDE="${PS2X_VU_AOT_EXTERN_INCLUDE}")
+
+    # With MSVC these are compiled by clang-cl where it is installed (Visual
+    # Studio's "C++ Clang tools", or LLVM's own installer). Its objects link
+    # with MSVC's, and it does what MSVC cannot be told to do without running
+    # out of memory: inline a pair's executors and fold the pair's words into
+    # them (ps2_vu1_detail.h), as clang and GCC do elsewhere. A game that
+    # skins its characters with VU0 spends most of a fight in these blocks:
+    # in Drakengard 2's first one the game thread takes 35% less CPU, and
+    # the frames are the same to the pixel as MSVC's.
+    # -DPS2X_VU_AOT_CLANG_CL=OFF leaves the blocks to MSVC.
+    option(PS2X_VU_AOT_CLANG_CL "With MSVC and Ninja: compile the VU AOT sources with clang-cl when it is found" ON)
+    set(PS2X_VU_AOT_BY_CLANG_CL OFF)
+    if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND PS2X_VU_AOT_CLANG_CL
+       AND CMAKE_GENERATOR MATCHES "Ninja" AND NOT PS2X_IS_ARM_TARGET
+       AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        find_program(PS2X_CLANG_CL clang-cl
+            HINTS "$ENV{VCINSTALLDIR}/Tools/Llvm/x64/bin" "$ENV{ProgramFiles}/LLVM/bin"
+            DOC "clang-cl, for the VU AOT sources of an MSVC build")
+        if(PS2X_CLANG_CL)
+            set(PS2X_VU_AOT_BY_CLANG_CL ON)
+            message(STATUS "VU AOT sources: compiled with ${PS2X_CLANG_CL}")
+        else()
+            message(STATUS "VU AOT sources: clang-cl not found, compiled with MSVC (slower in play)")
+        endif()
+    endif()
+
+    if(PS2X_VU_AOT_BY_CLANG_CL)
+        # What the runtime's own sources get in a release build
+        # (cmake/ReleaseMode.cmake), less what only MSVC has.
+        set(PS2X_VU_AOT_CLANG_FLAGS /nologo /c /TP /std:c++20 /EHsc /MD /O2 /Ob2 /Oi /Gy /GF /Zc:inline
+            /fp:precise /GS- /DNDEBUG -Wno-everything)
+        if(PS2X_X86_AVX2)
+            list(APPEND PS2X_VU_AOT_CLANG_FLAGS /arch:AVX2 -mfma)
+        endif()
+        set(PS2X_VU_AOT_OBJECTS)
+        foreach(PS2X_VU_AOT_SOURCE ${PS2X_VU_AOT_SOURCES})
+            get_filename_component(PS2X_VU_AOT_NAME "${PS2X_VU_AOT_SOURCE}" NAME_WE)
+            set(PS2X_VU_AOT_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/generated/${PS2X_VU_AOT_NAME}.clang.obj")
+            add_custom_command(
+                OUTPUT "${PS2X_VU_AOT_OBJECT}"
+                COMMAND "${PS2X_CLANG_CL}" ${PS2X_VU_AOT_CLANG_FLAGS}
+                        "-I${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu"
+                        "-I$<JOIN:$<REMOVE_DUPLICATES:$<TARGET_PROPERTY:ps2_runtime,INCLUDE_DIRECTORIES>>,;-I>"
+                        "-D$<JOIN:$<TARGET_PROPERTY:ps2_runtime,COMPILE_DEFINITIONS>,;-D>"
+                        "/clang:-MD" "/clang:-MF${PS2X_VU_AOT_OBJECT}.d"
+                        "/Fo${PS2X_VU_AOT_OBJECT}" "${PS2X_VU_AOT_SOURCE}"
+                DEPENDS "${PS2X_VU_AOT_SOURCE}" "${PS2X_VU_AOT_INCLUDE}" "${PS2X_VU_AOT_EXTERN_INCLUDE}"
+                DEPFILE "${PS2X_VU_AOT_OBJECT}.d"
+                JOB_POOL ps2_vu_aot_compile
+                COMMENT "Building CXX object generated/${PS2X_VU_AOT_NAME}.clang.obj (clang-cl)"
+                COMMAND_EXPAND_LISTS VERBATIM)
+            list(APPEND PS2X_VU_AOT_OBJECTS "${PS2X_VU_AOT_OBJECT}")
+        endforeach()
+        set_source_files_properties(${PS2X_VU_AOT_OBJECTS} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
+        target_sources(ps2_runtime PRIVATE ${PS2X_VU_AOT_OBJECTS})
+    else()
+        target_sources(ps2_runtime PRIVATE ${PS2X_VU_AOT_SOURCES})
+    endif()
     set_source_files_properties(${PS2X_VU_AOT_SOURCES} PROPERTIES
         SKIP_UNITY_BUILD_INCLUSION ON
         INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu")
