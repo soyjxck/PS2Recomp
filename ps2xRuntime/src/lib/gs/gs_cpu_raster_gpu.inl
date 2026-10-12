@@ -549,6 +549,17 @@ void GSCpuBackend::GpuDownloadPages(std::vector<uint32_t> &pages)
             {
                 uint32_t pageRow, pageColumn;
                 place(page, pageRow, pageColumn);
+                // The words an image VRAM still holds was sent over since
+                // the card last drew in this page are the newer there, and
+                // stay (GpuKeepImage).
+                uint64_t kept[32];
+                bool anyKept = false;
+                for (uint32_t i = 0; i < 32u; ++i)
+                {
+                    const uint32_t block = (page * 32u + i) & 0x3FFFu;
+                    kept[i] = m_blockKeptSerial[block] != 0u && m_blockKeptSerial[block] >= m_pageDrawSerial[page] ? m_blockKeptWords[block] : 0u;
+                    anyKept = anyKept || kept[i] != 0u;
+                }
                 for (int py = 0; py < pageHeight; ++py)
                 {
                     const int y = static_cast<int>(pageRow) * pageHeight + py;
@@ -560,6 +571,12 @@ void GSCpuBackend::GpuDownloadPages(std::vector<uint32_t> &pages)
                     for (int px = 0; px < pageWidth; ++px, from += 4)
                     {
                         const uint32_t unit = FastPipeline::unitIn(layout, row, static_cast<int>(pageColumn) * pageWidth + px);
+                        if (anyKept)
+                        {
+                            const uint32_t word = (unit * layout.unitBits) >> 5;
+                            if ((kept[(word >> 6) & 31u] >> (word & 63u)) & 1u)
+                                continue;
+                        }
                         if (!depth)
                         {
                             std::memcpy(m_vram + ((unit * 4u) & (kVramMask - 3u)), from, 4u);
@@ -657,6 +674,49 @@ void GSCpuBackend::GpuUploading(const GSMem::SurfaceLayout &layout, int x0, int 
     {
         gpu.why = GpuState::WhyImage;
         GpuDownloadPages(gpu.pages);
+    }
+}
+
+// An image VRAM already holds has been sent again, and is not stored
+// (UploadImage). Where the card alone has the page, the console would now
+// have the image over what was drawn there, and VRAM has the image and not
+// the drawing: the image's words are noted, for GpuDownloadPages to leave
+// as they are when it brings the rest of the page. A word counts when every
+// pixel in it is the image's. (Should the card draw in the page once more
+// before anything reads it, the note is void and the page is the card's
+// again whole, the image's pixels included: its surface never had them.)
+void GSCpuBackend::GpuKeepImage(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    if (!m_gpu || m_cardAheadCount == 0u || !layout.table || x0 < 0 || y0 < 0 || x1 < x0 || y1 < y0)
+        return;
+    const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
+    const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    const uint32_t unitsAWord = 32u / layout.unitBits;
+    for (int tileY = y0 & ~(tileH - 1); tileY <= y1; tileY += tileH)
+    {
+        for (int tileX = x0 & ~(tileW - 1); tileX <= x1; tileX += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(tileX), static_cast<uint32_t>(tileY)) * layout.unitBits) >> 11) & 0x3FFFu;
+            const uint32_t page = (block >> 5) % kPageCount;
+            if (!m_cardAhead[page])
+                continue;
+            uint64_t words = ~0ull;
+            if (tileX < x0 || tileY < y0 || tileX + tileW - 1 > x1 || tileY + tileH - 1 > y1)
+            {
+                uint8_t pixels[64] = {};
+                for (int y = std::max(tileY, y0); y <= std::min(tileY + tileH - 1, y1); ++y)
+                    for (int x = std::max(tileX, x0); x <= std::min(tileX + tileW - 1, x1); ++x)
+                        ++pixels[((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 5) & 63u];
+                words = 0u;
+                for (uint32_t word = 0; word < 64u; ++word)
+                    if (pixels[word] == unitsAWord)
+                        words |= 1ull << word;
+            }
+            if (m_blockKeptSerial[block] < m_pageDrawSerial[page])
+                m_blockKeptWords[block] = 0u;
+            m_blockKeptWords[block] |= words;
+            m_blockKeptSerial[block] = m_writeSerial;
+        }
     }
 }
 

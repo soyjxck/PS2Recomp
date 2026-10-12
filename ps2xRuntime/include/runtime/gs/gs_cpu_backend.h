@@ -432,6 +432,15 @@ private:
     bool GpuDownloadFrames(const GSFrameReg *frames, const uint32_t *heights, const bool *baseIsPages, size_t count);
     void GpuDownloadPages(std::vector<uint32_t> &pages);
     void GpuUploading(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    // An image sent over pages the card alone has drawn in is not stored
+    // when VRAM still holds its bytes (the card's drawing never reached
+    // them), and the pages stay the card's. Which 32-bit words of each
+    // block such an image covered, and when: what is brought back from the
+    // card later leaves those words as VRAM has them, unless the card has
+    // drawn in the page again since (m_pageDrawSerial).
+    std::array<uint64_t, 16384> m_blockKeptWords{};
+    std::array<uint64_t, 16384> m_blockKeptSerial{};
+    void GpuKeepImage(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
     // FlushPrimitives for whoever is about to read or write VRAM anywhere.
     void FlushForVram(const char *why);
     static bool GpuSetting();

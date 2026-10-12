@@ -597,6 +597,8 @@ void GSCpuBackend::ResetUnlocked()
     m_uploads.clear();
     m_uploadAt.clear();
     m_blockContent.fill(0u);
+    m_blockKeptWords.fill(0u);
+    m_blockKeptSerial.fill(0u);
     m_blocksViews.clear();
     m_clutPlaces.clear();
     m_blockHasClutPlace.fill(0u);
@@ -2410,6 +2412,10 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
                 if (!m_clutBlocksHit.empty())
                     TakeClutsFrom(layout, dpsm, streamBits, left, top, right, bottom, data, static_cast<size_t>(wholeBytes), false);
             }
+            // Nor is the card told, and a page it alone has drawn in stays
+            // its own. But the image is the newer of the two there.
+            if (streamBits == layout.unitBits)
+                GpuKeepImage(layout, left, top, right, bottom);
             m_transferState.copiedPixels = total;
             m_transferState.direction = 3u;
             m_transferState.totalPixels = 0u;
