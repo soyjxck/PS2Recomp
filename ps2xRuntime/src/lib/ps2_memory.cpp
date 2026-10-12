@@ -14,6 +14,33 @@
 
 namespace
 {
+    // The buffers DMA chains were gathered in, for the next chains. A frame's
+    // display list is megabytes and comes again every frame: a new vector
+    // each time was grown by copying what it held, on memory the system had
+    // to page in afresh.
+    thread_local std::vector<std::vector<uint8_t>> t_chainBuffers;
+
+    std::vector<uint8_t> takeChainBuffer()
+    {
+        std::vector<uint8_t> buffer;
+        if (!t_chainBuffers.empty())
+        {
+            buffer = std::move(t_chainBuffers.back());
+            t_chainBuffers.pop_back();
+            buffer.clear();
+        }
+        return buffer;
+    }
+
+    void keepChainBuffer(std::vector<uint8_t> &buffer)
+    {
+        constexpr size_t kKept = 4u;
+        constexpr size_t kLargestKept = size_t{32} << 20;
+        if (buffer.capacity() != 0u && buffer.capacity() <= kLargestKept && t_chainBuffers.size() < kKept)
+            t_chainBuffers.push_back(std::move(buffer));
+        buffer = {};
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -1412,7 +1439,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // program sends its microprograms again for every model.
                     const int kMaxChainTags = 1 << 20;
                     const size_t kMaxChainBytes = size_t{256} << 20;
-                    std::vector<uint8_t> chainBuf;
+                    std::vector<uint8_t> chainBuf = takeChainBuffer();
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1615,6 +1642,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         pt.srcAddr = 0;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
+                        chainBuf = {};
                         if (channelBase == 0x1000A000)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
@@ -1628,6 +1656,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             m_pendingVif0Transfers.push_back(std::move(pt));
                         }
                     }
+                    keepChainBuffer(chainBuf);
                     // else if (channelBase == 0x10009000u)
                     // {
 
@@ -1843,6 +1872,8 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    for (auto &p : m_pendingGifTransfers)
+        keepChainBuffer(p.chainData);
     m_pendingGifTransfers.clear();
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
@@ -1901,6 +1932,8 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    for (auto &p : m_pendingVif0Transfers)
+        keepChainBuffer(p.chainData);
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -1959,6 +1992,8 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    for (auto &p : m_pendingVif1Transfers)
+        keepChainBuffer(p.chainData);
     m_pendingVif1Transfers.clear();
 
     // With VIF1 and PATH3 queued for the worker, the arbiter is the worker's.
