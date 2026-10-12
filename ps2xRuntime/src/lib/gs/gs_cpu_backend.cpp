@@ -598,6 +598,8 @@ void GSCpuBackend::ResetUnlocked()
     m_uploadAt.clear();
     m_blockContent.fill(0u);
     m_blocksViews.clear();
+    m_clutPlaces.clear();
+    m_blockHasClutPlace.fill(0u);
     m_lastTextures = {};
     ++m_copiesForgotten;
     m_clutSnapshots.clear();
@@ -727,6 +729,29 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             }
         }
     }
+    // Or it lies inside a larger image, and was taken from that as it was
+    // sent (TakeClutsFrom). The first load from a place only makes the place
+    // known: the image after it brings the CLUT with it.
+    // (PS2X_GS_BLOCK_COPIES=0 turns this off with the copies by block.)
+    static const bool placesWanted = []
+    {
+        const char *value = std::getenv("PS2X_GS_BLOCK_COPIES");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (placesWanted && !uploaded && tex0.csm == 0u && sourceLayout.table && (sixteenBit || thirtyTwoBit))
+    {
+        if (ClutPlace *place = ClutPlaceFor(tex0, fourBit))
+        {
+            const int lastX = fourBit ? 7 : 15, lastY = fourBit ? 1 : 15;
+            if (place->have && !DrawnSince(sourceLayout, 0, 0, lastX, lastY, place->image.serial) &&
+                !UploadedSince(sourceLayout, 0, 0, lastX, lastY, place->image.serial))
+            {
+                uploaded = &place->image;
+                uploadedW = 16u;
+                uploadedH = fourBit ? 2u : 16u;
+            }
+        }
+    }
     if (!uploaded && HasQueuedPrimitives() && sourceLayout.table)
         FlushPrimitivesTouching(sourceLayout, sourceX0, sourceY0, sourceX1, sourceY1, false, "clut");
     if (!uploaded)
@@ -805,6 +830,107 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination] = static_cast<uint16_t>(raw & 0xFFFFu);
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
+    }
+}
+
+// The place a CSM1 CLUT of that base and format is loaded from, made known
+// if it was not.
+GSCpuBackend::ClutPlace *GSCpuBackend::ClutPlaceFor(const GSTex0Reg &tex0, bool fourBit)
+{
+    const uint64_t key = (static_cast<uint64_t>(tex0.cbp) << 16) | (static_cast<uint64_t>(tex0.cpsm) << 8) | (fourBit ? 1u : 0u);
+    for (ClutPlace &place : m_clutPlaces)
+    {
+        if (place.key == key)
+            return &place;
+    }
+    const GSMem::SurfaceLayout layout = GSMem::LayoutOf(tex0.cpsm, tex0.cbp, 1u);
+    if (!layout.table || (layout.unitBits != 32u && layout.unitBits != 16u))
+        return nullptr;
+    if (m_clutPlaces.size() >= 512u)
+    {
+        m_clutPlaces.clear();
+        m_blockHasClutPlace.fill(0u);
+    }
+    ClutPlace place;
+    place.key = key;
+    place.cbp = tex0.cbp;
+    place.cpsm = static_cast<uint8_t>(tex0.cpsm);
+    place.fourBit = fourBit;
+    const int tileW = layout.unitBits == 32u ? 8 : 16, tileH = 8;
+    const int width = fourBit ? 8 : 16, height = fourBit ? 2 : 16;
+    for (int y = 0; y < height; y += tileH)
+    {
+        for (int x = 0; x < width; x += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
+            place.blocks[place.blockCount++] = static_cast<uint16_t>(block);
+            m_blockHasClutPlace[block] = 1u;
+        }
+    }
+    m_clutPlaces.push_back(std::move(place));
+    return &m_clutPlaces.back();
+}
+
+// A whole image has just been marked as stored (MarkUploaded left in
+// m_clutBlocksHit which blocks of known CLUT places it covers whole): the
+// places that are all inside it take their texels from its data. A texel of
+// a place and a pixel of the image are the same word of VRAM when they are
+// at the same spot of the same block, which is checked for each by the two
+// layouts' own addresses.
+void GSCpuBackend::TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dpsm, uint32_t streamBits, int left, int top, uint32_t rrw,
+                                 const uint8_t *data, size_t bytes)
+{
+    for (ClutPlace &place : m_clutPlaces)
+    {
+        const bool wide = place.cpsm == GS_PSM_CT32 || place.cpsm == GS_PSM_CT24;
+        if (wide ? !(dpsm == GS_PSM_CT32 && streamBits == 32u) : !(dpsm == place.cpsm && streamBits == 16u))
+            continue;
+        int originX[4] = {}, originY[4] = {};
+        bool all = true;
+        for (uint32_t i = 0; i < place.blockCount && all; ++i)
+        {
+            all = false;
+            for (const ClutBlockHit &hit : m_clutBlocksHit)
+            {
+                if (hit.block == place.blocks[i])
+                {
+                    originX[i] = hit.x;
+                    originY[i] = hit.y;
+                    all = true;
+                    break;
+                }
+            }
+        }
+        if (!all)
+            continue;
+
+        const GSMem::SurfaceLayout own = GSMem::LayoutOf(place.cpsm, place.cbp, 1u);
+        const int tileW = own.unitBits == 32u ? 8 : 16, tileH = 8;
+        const int width = place.fourBit ? 8 : 16, height = place.fourBit ? 2 : 16;
+        const size_t fromBytes = streamBits / 8u;
+        const size_t toBytes = wide ? (place.cpsm == GS_PSM_CT24 ? 3u : 4u) : 2u;
+        place.image.pixels.assign(16u * static_cast<size_t>(height) * toBytes, 0u);
+        bool same = true;
+        for (int y = 0; y < height && same; ++y)
+        {
+            for (int x = 0; x < width && same; ++x)
+            {
+                const uint32_t unit = own.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                const uint32_t block = ((unit * own.unitBits) >> 11) & 0x3FFFu;
+                uint32_t which = 0;
+                while (which < place.blockCount && place.blocks[which] != block)
+                    ++which;
+                const int imageX = which < place.blockCount ? originX[which] + (x & (tileW - 1)) : 0;
+                const int imageY = which < place.blockCount ? originY[which] + (y & (tileH - 1)) : 0;
+                const size_t offset = (static_cast<size_t>(imageY - top) * rrw + static_cast<size_t>(imageX - left)) * fromBytes;
+                same = which < place.blockCount && imageX >= left && imageY >= top &&
+                       layout.unit(static_cast<uint32_t>(imageX), static_cast<uint32_t>(imageY)) == unit && offset + fromBytes <= bytes;
+                if (same)
+                    std::memcpy(place.image.pixels.data() + (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * toBytes, data + offset, toBytes);
+            }
+        }
+        place.have = same;
+        place.image.serial = m_writeSerial;
     }
 }
 
@@ -1782,6 +1908,7 @@ void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int 
     }
     const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
     const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    m_clutBlocksHit.clear();
     for (int y = y0 & ~(tileH - 1); y <= y1; y += tileH)
     {
         for (int x = x0 & ~(tileW - 1); x <= x1; x += tileW)
@@ -1792,6 +1919,8 @@ void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int 
             {
                 const uint64_t place = (static_cast<uint64_t>(static_cast<uint32_t>(x - x0)) << 32) | static_cast<uint32_t>(y - y0);
                 const bool whole = everyBit && x >= x0 && y >= y0 && x + tileW - 1 <= x1 && y + tileH - 1 <= y1;
+                if (whole && m_blockHasClutPlace[block] != 0u)
+                    m_clutBlocksHit.push_back({static_cast<uint16_t>(block), x, y});
                 // What it held is known if an image put it there and nothing
                 // has been drawn in its page since.
                 const uint64_t held = m_blockUploadSerial[block] > m_pageVramDrawSerial[block >> 5] ? m_blockContent[block] : 0u;
@@ -2252,6 +2381,8 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         const uint64_t content = whole ? mixContent(uploadHash | 1u, (static_cast<uint64_t>(rrw) << 32) | (static_cast<uint64_t>(dpsm) << 8) | streamBits) | 1u : 0u;
         MarkUploaded(layout, left, static_cast<int>(dsay + firstPixel / rrw), right, static_cast<int>(dsay + (pixel - 1u) / rrw), content,
                      streamBits == layout.unitBits);
+        if (whole && !m_clutBlocksHit.empty())
+            TakeClutsFrom(layout, dpsm, streamBits, left, top, rrw, data, static_cast<size_t>(wholeBytes));
     }
 
     m_transferState.copiedPixels = pixel;

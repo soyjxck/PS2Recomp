@@ -1284,7 +1284,8 @@ void register_ps2_gs_tests()
             // The texture at `tbp`, 128 texels wide and two to the
             // `rowsLog2` high, its first `rows` rows (all of them if 0) drawn
             // one texel a pixel into the frame at `fbp`; returns the frame.
-            const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp, uint32_t rows = 0u, uint64_t clamp = 0ull)
+            const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp, uint32_t rows = 0u, uint64_t clamp = 0ull,
+                                  uint32_t cbp = kCbp)
             {
                 if (rows == 0u)
                     rows = 1u << rowsLog2;
@@ -1300,7 +1301,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(tbp) | (static_cast<uint64_t>(kWidth) << 14) |
                                                     (static_cast<uint64_t>(GS_PSM_T8) << 20) | (7ull << 26) |
                                                     (static_cast<uint64_t>(rowsLog2) << 30) | (1ull << 34) | (1ull << 35) |
-                                                    (static_cast<uint64_t>(kCbp) << 37) | (1ull << 61));
+                                                    (static_cast<uint64_t>(cbp) << 37) | (1ull << 61));
                 gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
                 gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
                 gs.writeRegister(GS_REG_UV, 8ull | (8ull << 16));
@@ -1462,6 +1463,28 @@ void register_ps2_gs_tests()
             t.IsTrue(draw(kRegionPage * 32u, 7u, 416u, 0u, kRegion) == region, "the picture VRAM gives");
             poke(kRegionPage, 2u);
             t.IsTrue(draw(kRegionPage * 32u, 7u, 432u, 0u, kRegion) != region, "which it follows once its page has been drawn into");
+
+            // --- A CLUT that lies inside a larger image (a page of textures
+            // sent whole, their CLUTs in it) is taken from that image as it
+            // was sent, once a load has shown the place to hold a CLUT: it
+            // need not wait for the image to be stored. The CLUT here is the
+            // 16 by 16 pixels from (0, 16) of a page image, which are the
+            // blocks 8 to 11 of the page.
+            constexpr uint32_t kPackedPage = 180u, kPackedCbp = kPackedPage * 32u + 8u;
+            upload(kPackedPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, image(8192u, 8u));
+            const std::vector<uint32_t> firstClut = draw(kPiecesPage * 32u, 6u, 448u, 0u, 0ull, kPackedCbp);
+            upload(kPackedPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, image(8192u, 9u));
+            poke(kPackedPage, 1u);
+            const std::vector<uint32_t> secondClut = draw(kPiecesPage * 32u, 6u, 456u, 0u, 0ull, kPackedCbp);
+            poke(kPackedPage, 1u);
+            t.IsTrue(secondClut != firstClut, "sanity: the second image brought another CLUT");
+            drawInto(kPackedPage);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 464u, 0u, 0ull, kPackedCbp) == secondClut,
+                     "a CLUT inside a larger image is loaded from the image as it was sent, and is the one VRAM holds");
+            poke(kPackedPage, 1u);
+            drawInto(kPackedPage);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 472u, 0u, 0ull, kPackedCbp) != secondClut,
+                     "and is read from VRAM again once its page has been drawn into");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)

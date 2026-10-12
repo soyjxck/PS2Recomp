@@ -261,6 +261,36 @@ private:
     std::unordered_map<uint64_t, UploadRecord> m_uploads;
     // The latest whole image written at each base pointer, from (0, 0).
     std::unordered_map<uint64_t, UploadRecord> m_uploadAt;
+    // A CLUT that is not an image of its own but lies inside a larger one
+    // (a page of textures sent whole, with their CLUTs in it): where such
+    // CLUTs have been loaded from, and for each its texels as the last whole
+    // image that covered it brought them, taken from that image's data as
+    // it was sent. Loading the CLUT then need not wait for the image to
+    // reach VRAM, as it need not for a CLUT sent by itself.
+    struct ClutPlace
+    {
+        uint64_t key = 0; // base, format, 16 or 256 entries
+        uint32_t cbp = 0;
+        uint8_t cpsm = 0;
+        bool fourBit = false;
+        uint8_t blockCount = 0;
+        std::array<uint16_t, 4> blocks{}; // the blocks its texels are in
+        bool have = false;
+        UploadRecord image; // 16 texels wide; `serial` is when it was taken
+    };
+    std::vector<ClutPlace> m_clutPlaces;
+    std::array<uint8_t, 16384> m_blockHasClutPlace{};
+    // From MarkUploaded for a whole image: the blocks of such places it
+    // covered whole, and the pixel of the image each starts at.
+    struct ClutBlockHit
+    {
+        uint16_t block = 0;
+        int x = 0, y = 0;
+    };
+    std::vector<ClutBlockHit> m_clutBlocksHit;
+    ClutPlace *ClutPlaceFor(const GSTex0Reg &tex0, bool fourBit);
+    void TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dpsm, uint32_t streamBits, int left, int top, uint32_t rrw,
+                       const uint8_t *data, size_t bytes);
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint32_t, 256>>> m_clutSnapshots;
     uint64_t m_clutHashLoad = ~0ull; // m_clutLoads the hash below is of
     uint64_t m_clutHash = 0;
