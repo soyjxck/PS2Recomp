@@ -1489,6 +1489,22 @@ void register_ps2_gs_tests()
             drawInto(kPackedPage);
             t.IsTrue(draw(kPiecesPage * 32u, 6u, 472u, 0u, 0ull, kPackedCbp) != secondClut,
                      "and is read from VRAM again once its page has been drawn into");
+
+            // --- A game that sends the same page every frame: the second
+            // time VRAM holds it already and nothing is stored, but the CLUT
+            // place the first load made known still takes its texels from
+            // what was sent. (Another CLUT is loaded in between, so that the
+            // load after it is a load.)
+            constexpr uint32_t kSamePage = 190u, kSameCbp = kSamePage * 32u + 8u;
+            const std::vector<uint8_t> same = image(8192u, 10u);
+            upload(kSamePage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, same);
+            const std::vector<uint32_t> sameClut = draw(kPiecesPage * 32u, 6u, 480u, 0u, 0ull, kSameCbp);
+            upload(kSamePage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, same);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 488u) != sameClut, "sanity: the other CLUT is another");
+            poke(kSamePage, 1u);
+            t.IsTrue(draw(kPiecesPage * 32u, 6u, 496u, 0u, 0ull, kSameCbp) == sameClut,
+                     "a page sent again as it is still gives its CLUT to the place a load made known");
+            poke(kSamePage, 1u);
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)

@@ -288,7 +288,9 @@ private:
         int x = 0, y = 0;
     };
     std::vector<ClutBlockHit> m_clutBlocksHit;
+    uint32_t m_clutPlacesUnfilled = 0; // places that have not had their texels yet
     ClutPlace *ClutPlaceFor(const GSTex0Reg &tex0, bool fourBit);
+    void NoteClutBlocksIn(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
     void TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dpsm, uint32_t streamBits, int left, int top, uint32_t rrw,
                        const uint8_t *data, size_t bytes);
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint32_t, 256>>> m_clutSnapshots;

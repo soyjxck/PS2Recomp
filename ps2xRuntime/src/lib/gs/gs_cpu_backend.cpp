@@ -600,6 +600,7 @@ void GSCpuBackend::ResetUnlocked()
     m_blocksViews.clear();
     m_clutPlaces.clear();
     m_blockHasClutPlace.fill(0u);
+    m_clutPlacesUnfilled = 0u;
     m_lastTextures = {};
     ++m_copiesForgotten;
     m_clutSnapshots.clear();
@@ -850,6 +851,7 @@ GSCpuBackend::ClutPlace *GSCpuBackend::ClutPlaceFor(const GSTex0Reg &tex0, bool 
     {
         m_clutPlaces.clear();
         m_blockHasClutPlace.fill(0u);
+        m_clutPlacesUnfilled = 0u;
     }
     ClutPlace place;
     place.key = key;
@@ -868,7 +870,29 @@ GSCpuBackend::ClutPlace *GSCpuBackend::ClutPlaceFor(const GSTex0Reg &tex0, bool 
         }
     }
     m_clutPlaces.push_back(std::move(place));
+    ++m_clutPlacesUnfilled;
     return &m_clutPlaces.back();
+}
+
+// The blocks of known CLUT places that an image at those pixels of a surface
+// covers whole, into m_clutBlocksHit: what MarkUploaded notes as it goes, for
+// an image that is not marked because VRAM holds it already.
+void GSCpuBackend::NoteClutBlocksIn(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    m_clutBlocksHit.clear();
+    if (!layout.table || x0 < 0 || y0 < 0 || x1 < x0 || y1 < y0)
+        return;
+    const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
+    const int tileH = layout.unitBits >= 16u ? 8 : 16;
+    for (int y = (y0 + tileH - 1) & ~(tileH - 1); y + tileH - 1 <= y1; y += tileH)
+    {
+        for (int x = (x0 + tileW - 1) & ~(tileW - 1); x + tileW - 1 <= x1; x += tileW)
+        {
+            const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
+            if (m_blockHasClutPlace[block] != 0u)
+                m_clutBlocksHit.push_back({static_cast<uint16_t>(block), x, y});
+        }
+    }
 }
 
 // A whole image has just been marked as stored (MarkUploaded left in
@@ -929,6 +953,8 @@ void GSCpuBackend::TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dp
                     std::memcpy(place.image.pixels.data() + (static_cast<size_t>(y) * 16u + static_cast<size_t>(x)) * toBytes, data + offset, toBytes);
             }
         }
+        if (place.have != same)
+            m_clutPlacesUnfilled += same ? ~0u : 1u;
         place.have = same;
         place.image.serial = m_writeSerial;
     }
@@ -2334,6 +2360,17 @@ void GSCpuBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         }
         if (same)
         {
+            // Nothing is stored and nothing marked. But a CLUT place that
+            // has not had its texels yet (it became known after this image
+            // was first sent, and a game that sends the same page every
+            // frame never stores it again) can have them from these bytes:
+            // they are what VRAM holds there.
+            if (m_clutPlacesUnfilled != 0u && streamBits == layout.unitBits)
+            {
+                NoteClutBlocksIn(layout, left, top, right, bottom);
+                if (!m_clutBlocksHit.empty())
+                    TakeClutsFrom(layout, dpsm, streamBits, left, top, rrw, data, static_cast<size_t>(wholeBytes));
+            }
             m_transferState.copiedPixels = total;
             m_transferState.direction = 3u;
             m_transferState.totalPixels = 0u;
