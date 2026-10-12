@@ -4,6 +4,7 @@
 #include "runtime/ps2_settings.h"
 #include "runtime/vu1_worker.h"
 #include "../ps2_record_queue.h"
+#include "ThreadNaming.h"
 
 #include <atomic>
 #include <chrono>
@@ -294,7 +295,10 @@ namespace GsWorker
             return;
         w.quit = false;
         w.thread = std::thread([&w]
-                               { w.loop(); });
+                               {
+                                   ThreadNaming::SetCurrentThreadName("GS");
+                                   w.loop();
+                               });
         w.threadId = w.thread.get_id();
         w.active.store(true, std::memory_order_release);
     }

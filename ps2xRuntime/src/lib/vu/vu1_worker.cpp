@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_worker.h"
 #include "../ps2_record_queue.h"
+#include "ThreadNaming.h"
 
 #include <atomic>
 #include <cstring>
@@ -137,7 +138,10 @@ namespace Vu1Worker
             return;
         w.quit = false;
         w.thread = std::thread([&w]
-                               { w.loop(); });
+                               {
+                                   ThreadNaming::SetCurrentThreadName("VU1");
+                                   w.loop();
+                               });
         w.threadId = w.thread.get_id();
         w.active.store(true, std::memory_order_release);
     }
