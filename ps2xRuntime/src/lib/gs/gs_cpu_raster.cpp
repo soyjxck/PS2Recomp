@@ -1676,13 +1676,15 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::BlocksCopy(FastPipeline &p, in
     if (view.key == 0u)
     {
         // PS2X_GS_BLOCKS_WHY=1: the textures most often turned away here,
-        // and what their blocks are.
-        static const bool wantWhy = []
+        // and what their blocks are, every two million times; a larger
+        // number is how many times instead.
+        static const uint64_t whyEvery = []() -> uint64_t
         {
             const char *value = std::getenv("PS2X_GS_BLOCKS_WHY");
-            return value != nullptr && value[0] != '\0' && value[0] != '0';
+            const uint64_t given = value != nullptr ? std::strtoull(value, nullptr, 10) : 0u;
+            return given > 1u ? given : (given == 1u ? 2000000u : 0u);
         }();
-        if (wantWhy)
+        if (whyEvery != 0u)
         {
             struct Why
             {
@@ -1720,7 +1722,7 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::BlocksCopy(FastPipeline &p, in
                     }
                 }
             }
-            if (++turnedAway % 2000000u == 0u)
+            if (++turnedAway % whyEvery == 0u)
             {
                 std::vector<const Why *> most;
                 for (const auto &entry : whys)
