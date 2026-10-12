@@ -3440,7 +3440,12 @@ void PS2Runtime::run()
             uint64_t shownTick = emulatedTick;
             if (GsWorker::Display shown; GsWorker::shownDisplay(shown))
                 shownTick = shown.tick;
-            if (exitTick != 0u && shownTick >= exitTick)
+            // And with that picture saved, if it is one to save: this loop
+            // can get here in the same turn the tick arrives in, after it
+            // has looked for a new picture and found none.
+            const bool lastFrameKept = !frameDumpPlan().dueAt(exitTick) ||
+                                       g_frameDumpSavedTick.load(std::memory_order_acquire) >= exitTick;
+            if (exitTick != 0u && shownTick >= exitTick && lastFrameKept)
             {
                 std::fprintf(stderr, "[run] PS2X_EXIT_AT reached at emu=%.2fs\n",
                              static_cast<double>(shownTick) / kTestVBlanksPerSecond);
