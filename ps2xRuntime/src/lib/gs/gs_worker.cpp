@@ -3,6 +3,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/vu1_worker.h"
+#include "../ps2_record_queue.h"
 
 #include <atomic>
 #include <chrono>
@@ -73,14 +74,15 @@ namespace
         std::mutex mutex;
         std::condition_variable workReady;
         std::condition_variable workDone;
-        struct Packet
+        // What is queued: a GIF packet, one of the EE's vblanks (its display
+        // registers) or the mark after a packet that raises an interrupt.
+        enum Kind : uint32_t
         {
-            std::vector<uint8_t> data;
-            GsWorker::Display vblank; // tick not 0: no packet, a vblank of the EE's
-            uint64_t interruptMark = 0; // not 0: no packet, the mark after one that raises an interrupt
+            kPacket,
+            kVBlank,
+            kInterruptMark,
         };
-        std::deque<Packet> queue;
-        std::vector<std::vector<uint8_t>> spare; // buffers to reuse
+        RecordQueue queue;
         GsWorker::Display vblankReached;
         uint64_t interruptMarkReached = 0;
         size_t queuedBytes = 0;
@@ -98,7 +100,7 @@ namespace
         {
             // Everything queued is taken in one go, so the threads that post
             // meet this one at the lock once per run, not per packet.
-            std::deque<Packet> taken;
+            RecordQueue taken;
             std::unique_lock<std::mutex> lock(mutex);
             for (;;)
             {
@@ -106,7 +108,7 @@ namespace
                                { return quit || !queue.empty(); });
                 if (queue.empty())
                     return;
-                taken.swap(queue);
+                std::swap(taken, queue);
                 lock.unlock();
 
                 // PS2X_GS_STATS=1: how much of its time the worker spends drawing.
@@ -118,24 +120,25 @@ namespace
                 const auto started = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
                 size_t bytes = 0;
-                for (const Packet &packet : taken)
+                RecordQueue::Record record;
+                for (RecordQueue::Reader reader = taken.read(); reader.next(record);)
                 {
-                    if (packet.vblank.tick != 0u || packet.interruptMark != 0u)
+                    if (record.kind != kPacket)
                     {
                         {
                             std::lock_guard<std::mutex> guard(mutex);
-                            if (packet.vblank.tick != 0u)
-                                vblankReached = packet.vblank;
+                            if (record.kind == kVBlank)
+                                std::memcpy(&vblankReached, record.data, sizeof(vblankReached));
                             else
-                                interruptMarkReached = packet.interruptMark;
+                                interruptMarkReached = record.value;
                         }
                         workDone.notify_all();
                         continue;
                     }
-                    gs->processGIFPacket(packet.data.data(), static_cast<uint32_t>(packet.data.size()));
-                    bytes += packet.data.size();
+                    gs->processGIFPacket(record.data, record.size);
+                    bytes += record.size;
                 }
-                const uint64_t count = taken.size();
+                const uint64_t count = taken.count;
 
                 if (wantStats)
                 {
@@ -163,12 +166,7 @@ namespace
                 lock.lock();
                 completed += count;
                 queuedBytes -= bytes;
-                while (!taken.empty())
-                {
-                    if (spare.size() < 256u && !taken.front().data.empty())
-                        spare.push_back(std::move(taken.front().data));
-                    taken.pop_front();
-                }
+                taken.clear();
                 workDone.notify_all();
             }
         }
@@ -332,25 +330,14 @@ namespace GsWorker
             return;
         }
 
-        // The copy is made outside the lock.
-        std::vector<uint8_t> packet;
+        bool wasEmpty = false;
         {
             std::unique_lock<std::mutex> lock(w.mutex);
             w.workDone.wait(lock, [&]
                             { return w.queuedBytes < Worker::kMaxQueuedBytes; });
-            if (!w.spare.empty())
-            {
-                packet = std::move(w.spare.back());
-                w.spare.pop_back();
-            }
-        }
-        packet.assign(data, data + sizeBytes);
-        bool wasEmpty = false;
-        {
-            std::lock_guard<std::mutex> lock(w.mutex);
             wasEmpty = w.queue.empty();
-            w.queuedBytes += packet.size();
-            w.queue.push_back(Worker::Packet{std::move(packet), {}, 0u});
+            w.queuedBytes += sizeBytes;
+            w.queue.append(Worker::kPacket, 0u, data, sizeBytes);
             ++w.posted;
         }
         // The worker only sleeps on an empty queue.
@@ -407,7 +394,7 @@ namespace GsWorker
             if (queued)
             {
                 wasEmpty = w.queue.empty();
-                w.queue.push_back(Worker::Packet{{}, display, 0u});
+                w.queue.append(Worker::kVBlank, 0u, reinterpret_cast<const uint8_t *>(&display), sizeof(display));
                 ++w.posted;
             }
             else
@@ -437,7 +424,7 @@ namespace GsWorker
             if (queued)
             {
                 wasEmpty = w.queue.empty();
-                w.queue.push_back(Worker::Packet{{}, {}, mark});
+                w.queue.append(Worker::kInterruptMark, mark, nullptr, 0u);
                 ++w.posted;
             }
             else

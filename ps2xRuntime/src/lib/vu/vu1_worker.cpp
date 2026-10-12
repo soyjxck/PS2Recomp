@@ -1,8 +1,10 @@
 #include "runtime/vu1_worker.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_worker.h"
+#include "../ps2_record_queue.h"
 
 #include <atomic>
+#include <cstring>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -12,12 +14,15 @@
 
 namespace
 {
-    struct Item
+    // What is queued: VIF1 data, a PATH3 GIF packet, or one of the two the GS
+    // worker is to be handed in its turn (GsWorker::postVBlank,
+    // postInterruptMark).
+    enum Kind : uint32_t
     {
-        bool path3 = false;
-        GsWorker::Display vblank; // tick not 0: no data, a vblank of the EE's
-        uint64_t interruptMark = 0; // not 0: no data, GsWorker::postInterruptMark's
-        std::vector<uint8_t> data;
+        kVif1,
+        kPath3,
+        kVBlank,
+        kInterruptMark,
     };
 
     struct Worker
@@ -27,8 +32,7 @@ namespace
         std::mutex mutex;
         std::condition_variable workReady;
         std::condition_variable workDone;
-        std::deque<Item> queue;
-        std::vector<std::vector<uint8_t>> spare;
+        RecordQueue queue;
         size_t queuedBytes = 0;
         uint64_t posted = 0;
         uint64_t completed = 0;
@@ -40,6 +44,9 @@ namespace
 
         void loop()
         {
+            // Everything queued is taken in one go, as the GS worker takes
+            // its own.
+            RecordQueue taken;
             std::unique_lock<std::mutex> lock(mutex);
             for (;;)
             {
@@ -47,47 +54,62 @@ namespace
                                { return quit || !queue.empty(); });
                 if (queue.empty())
                     return;
-                Item item = std::move(queue.front());
-                queue.pop_front();
-                queuedBytes -= item.data.size();
+                std::swap(taken, queue);
                 lock.unlock();
 
-                const uint32_t size = static_cast<uint32_t>(item.data.size());
-                if (item.vblank.tick != 0u)
-                    GsWorker::postVBlank(item.vblank);
-                else if (item.interruptMark != 0u)
-                    GsWorker::postInterruptMark(item.interruptMark);
-                else if (item.path3)
-                    memory->submitGifPacket(GifPathId::Path3, item.data.data(), size, true);
-                else
-                    memory->processVIF1Data(item.data.data(), size);
+                size_t bytes = 0;
+                RecordQueue::Record record;
+                for (RecordQueue::Reader reader = taken.read(); reader.next(record);)
+                {
+                    switch (record.kind)
+                    {
+                    case kVBlank:
+                    {
+                        GsWorker::Display display;
+                        std::memcpy(&display, record.data, sizeof(display));
+                        GsWorker::postVBlank(display);
+                        break;
+                    }
+                    case kInterruptMark:
+                        GsWorker::postInterruptMark(record.value);
+                        break;
+                    case kPath3:
+                        memory->submitGifPacket(GifPathId::Path3, record.data, record.size, true);
+                        bytes += record.size;
+                        break;
+                    default:
+                        memory->processVIF1Data(record.data, record.size);
+                        bytes += record.size;
+                        break;
+                    }
+                }
 
                 lock.lock();
-                ++completed;
-                if (spare.size() < 64u && !item.data.empty())
-                    spare.push_back(std::move(item.data));
+                completed += taken.count;
+                queuedBytes -= bytes;
+                taken.clear();
                 workDone.notify_all();
             }
         }
 
-        void post(bool path3, const uint8_t *data, uint32_t sizeBytes)
+        void post(uint32_t kind, uint64_t value, const uint8_t *data, uint32_t sizeBytes)
         {
-            std::unique_lock<std::mutex> lock(mutex);
-            workDone.wait(lock, [&]
-                          { return queuedBytes < kMaxQueuedBytes; });
-            Item item;
-            item.path3 = path3;
-            if (!spare.empty())
+            bool wasEmpty = false;
             {
-                item.data = std::move(spare.back());
-                spare.pop_back();
+                std::unique_lock<std::mutex> lock(mutex);
+                if (kind == kVif1 || kind == kPath3)
+                {
+                    workDone.wait(lock, [&]
+                                  { return queuedBytes < kMaxQueuedBytes; });
+                    queuedBytes += sizeBytes;
+                }
+                wasEmpty = queue.empty();
+                queue.append(kind, value, data, sizeBytes);
+                ++posted;
             }
-            item.data.assign(data, data + sizeBytes);
-            queuedBytes += item.data.size();
-            queue.push_back(std::move(item));
-            ++posted;
-            lock.unlock();
-            workReady.notify_one();
+            // The worker only sleeps on an empty queue.
+            if (wasEmpty)
+                workReady.notify_one();
         }
     };
 
@@ -158,7 +180,7 @@ namespace Vu1Worker
     {
         if (!data || sizeBytes == 0u)
             return;
-        worker().post(false, data, sizeBytes);
+        worker().post(kVif1, 0u, data, sizeBytes);
         if (GsWorker::mayRaiseInterrupt(data, sizeBytes))
             GsWorker::interruptSent();
     }
@@ -167,35 +189,19 @@ namespace Vu1Worker
     {
         if (!data || sizeBytes == 0u)
             return;
-        worker().post(true, data, sizeBytes);
+        worker().post(kPath3, 0u, data, sizeBytes);
         if (GsWorker::raisesInterrupt(data, sizeBytes))
             GsWorker::interruptSent();
     }
 
     void postVBlank(const GsWorker::Display &display)
     {
-        Worker &w = worker();
-        {
-            std::lock_guard<std::mutex> lock(w.mutex);
-            Item item;
-            item.vblank = display;
-            w.queue.push_back(std::move(item));
-            ++w.posted;
-        }
-        w.workReady.notify_one();
+        worker().post(kVBlank, 0u, reinterpret_cast<const uint8_t *>(&display), sizeof(display));
     }
 
     void postInterruptMark(uint64_t mark)
     {
-        Worker &w = worker();
-        {
-            std::lock_guard<std::mutex> lock(w.mutex);
-            Item item;
-            item.interruptMark = mark;
-            w.queue.push_back(std::move(item));
-            ++w.posted;
-        }
-        w.workReady.notify_one();
+        worker().post(kInterruptMark, mark, nullptr, 0u);
     }
 
     bool drain()
