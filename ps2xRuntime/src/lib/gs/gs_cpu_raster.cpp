@@ -1668,7 +1668,10 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::BlocksCopy(FastPipeline &p, in
     if (m_blocksViews.size() > 16384u)
         m_blocksViews.clear();
     BlocksView &view = m_blocksViews[viewKey];
-    if (view.serial == 0u || PagesWrittenSince(p.texture, x0, y0, x1, y1, view.serial))
+    // Written since: by a transfer or a primitive, or by the graphics card
+    // handing back what it alone had drawn there (which marks the pages as
+    // drawn into in VRAM and nothing else).
+    if (view.serial == 0u || PagesWrittenSince(p.texture, x0, y0, x1, y1, view.serial) || DrawnSince(p.texture, x0, y0, x1, y1, view.serial))
     {
         view.serial = m_writeSerial;
         view.key = BlocksKey(p.texture, x0, y0, x1, y1);
