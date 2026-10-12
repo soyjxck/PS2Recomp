@@ -867,7 +867,35 @@ namespace
                 return true;
             return std::binary_search(atTicks.begin(), atTicks.end(), tick);
         }
+
+        // Whether a frame to save is at `tick` or at most `lead` ticks after it.
+        bool dueWithin(uint64_t tick, uint64_t lead) const
+        {
+            if (dir.empty() || tick == 0u)
+                return false;
+            if (everyTicks != 0u)
+            {
+                const uint64_t phase = tick % everyTicks;
+                if (phase == 0u || phase + lead >= everyTicks)
+                    return true;
+            }
+            const auto next = std::lower_bound(atTicks.begin(), atTicks.end(), tick);
+            return next != atTicks.end() && *next <= tick + lead;
+        }
     };
+
+    // A saved frame is the picture as play would show it, and in play every
+    // vblank's picture is presented. Presenting leaves things behind that
+    // later drawing goes by: a display buffer the game fills a field at a
+    // time is drawn twice as tall from the first presentation that finds it
+    // on display, and flat layers are followed from one presentation to the
+    // next. A run that is not paced presents whenever the host gets to it,
+    // so a frame it saved depended on when that had last been: the first
+    // one of a boot came out a line shorter in some runs than in others. So
+    // the vblanks from this long before a saved frame are presented too,
+    // each at its tick, as the saved one is. The lead is the one a
+    // fast-forward starts drawing with (GS::skipDrawForFastForward).
+    constexpr uint64_t kDumpLeadTicks = 20u;
 
     const FrameDumpPlan &frameDumpPlan()
     {
@@ -893,8 +921,10 @@ namespace
         return plan;
     }
 
-    // The last tick whose frame the window thread has saved.
+    // The last tick whose frame the window thread has saved, and the last
+    // one it has presented.
     std::atomic<uint64_t> g_frameDumpSavedTick{0};
+    std::atomic<uint64_t> g_framePresentedTick{0};
 
     // Whether the frame on display at this tick is one to save. Asked once
     // a tick: ticks at or before it are done with afterwards, saved or not.
@@ -952,16 +982,21 @@ namespace
 
 // Called by the EE at each vblank. A frame dump is of the picture on display
 // at its tick, whatever the host's speed: the emulation stops at a tick that
-// is to be dumped until the window thread has saved it (or stopped drawing).
+// is to be dumped until the window thread has saved it (or stopped drawing),
+// and at each of the ticks leading up to it until the window thread has
+// presented it (kDumpLeadTicks).
 void ps2xSetGsBackgroundDrawing(const uint8_t *vram); // gs/gs_cpu_backend.cpp
 
 void ps2xHoldForFrameDump(uint64_t tick)
 {
-    if (!frameDumpPlan().dueAt(tick))
+    const FrameDumpPlan &plan = frameDumpPlan();
+    const bool save = plan.dueAt(tick);
+    if (!save && !plan.dueWithin(tick, kDumpLeadTicks))
         return;
     GsWorker::drain(); // a GS that may lag: the picture of this vblank, not of an earlier one
+    const std::atomic<uint64_t> &reached = save ? g_frameDumpSavedTick : g_framePresentedTick;
     const auto giveUp = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while (g_frameDumpSavedTick.load(std::memory_order_acquire) < tick && std::chrono::steady_clock::now() < giveUp)
+    while (reached.load(std::memory_order_acquire) < tick && std::chrono::steady_clock::now() < giveUp)
         std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
@@ -1008,6 +1043,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         rt->gs().latchHostPresentationFrame(lagging ? &shown : nullptr);
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
+        g_framePresentedTick.store(currentTick, std::memory_order_release);
     }
     else if (s_hasUploadedFrame)
     {
