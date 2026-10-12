@@ -757,6 +757,22 @@ if(PS2X_IS_VITA)
     endif()
 endif()
 
+# A product and a sum written as two operations stay two. Clang and GCC make
+# one fused multiply-add of `a * b + c` where the processor has one, as every
+# Apple Silicon Mac does, and it rounds once where the console and an MSVC
+# build round twice: the software renderer's set-up and the VU's plainly
+# written arithmetic (ESADD, ELENG and their like) then differ from a Windows
+# build's in a last bit, and a few hundred pixels of a frame with them. With
+# this the two draw the same pixels (Drakengard's software frames from arm64
+# macOS and from x64 MSVC are identical). What asks for fusing itself keeps
+# it: the VU's product sums are std::fma on every compiler.
+# PUBLIC, so that a game's own sources and its recompiled code are built the
+# same way. (A whole build by clang-cl would want /clang:-ffp-contract=off
+# likewise, as the VU AOT sources above have; nobody builds that yet.)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND NOT MSVC)
+    target_compile_options(ps2_runtime PUBLIC -ffp-contract=off)
+endif()
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
     EnableFastReleaseMode(ps2EntryRunner)
