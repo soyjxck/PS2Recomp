@@ -2059,6 +2059,11 @@ struct GSCpuBackend::RasterQueue
         int bandCount = 0;
         std::atomic<int> nextBand{0};
         int drawing = 0; // threads inside drawBands (under the mutex)
+        // PS2X_GS_STATS: when its first band was taken and its last, and the
+        // time threads have spent in it.
+        bool whole = false;
+        int64_t firstTakenNs = 0, threadNs = 0;
+        std::atomic<int64_t> lastTakenNs{0};
     };
     std::vector<std::thread> workers;
     std::mutex mutex;
@@ -2077,6 +2082,8 @@ struct GSCpuBackend::RasterQueue
             const int band = batch.nextBand.fetch_add(1, std::memory_order_relaxed);
             if (band >= batch.bandCount)
                 return;
+            if (band == batch.bandCount - 1 && wantStats())
+                batch.lastTakenNs.store(nowNs(), std::memory_order_relaxed);
             const int bandFirst = batch.firstRow + band * batch.bandHeight;
             const int bandLast = bandFirst + batch.bandHeight - 1;
             if (batch.image)
@@ -2113,11 +2120,43 @@ struct GSCpuBackend::RasterQueue
         if (batch->nextBand.load(std::memory_order_relaxed) >= batch->bandCount)
             return false;
         ++batch->drawing;
+        const bool timed = wantStats();
+        int64_t entered = 0;
+        if (timed)
+        {
+            entered = nowNs();
+            if (batch->firstTakenNs == 0)
+            {
+                batch->firstTakenNs = entered;
+                if (pool.waitingAtDone)
+                {
+                    ++pool.gaps;
+                    pool.gapNs += entered - pool.lastDoneNs;
+                }
+            }
+        }
         lock.unlock();
         drawBands(*batch);
+        const int64_t left = timed ? nowNs() : 0;
         lock.lock();
+        if (timed)
+            batch->threadNs += left - entered;
         if (--batch->drawing == 0)
         {
+            if (timed)
+            {
+                const int64_t doneNs = nowNs();
+                PoolStats::Kind &kind = pool.kind[batch->image ? 0 : (batch->whole ? 1 : 2)];
+                ++kind.batches;
+                kind.bands += static_cast<uint64_t>(batch->bandCount);
+                kind.wallNs += doneNs - batch->firstTakenNs;
+                kind.threadNs += batch->threadNs;
+                kind.tailNs += doneNs - batch->lastTakenNs.load(std::memory_order_relaxed);
+                pool.lastDoneNs = doneNs;
+                pool.waitingAtDone = flight.size() > 1u;
+                batch->firstTakenNs = 0;
+                batch->threadNs = 0;
+            }
             flight.pop_front();
             flightPrimitives -= batch->weight;
             batch->primitives.clear();
@@ -2183,7 +2222,7 @@ struct GSCpuBackend::RasterQueue
     }
 
     // PS2X_GS_STATS=1: how the queue is being used, every few thousand batches.
-    static constexpr int kReasonCount = 16;
+    static constexpr int kReasonCount = 17;
     struct Stats
     {
         uint64_t batches = 0, primitives = 0, waits = 0, images = 0, imageBytes = 0;
@@ -2191,11 +2230,42 @@ struct GSCpuBackend::RasterQueue
         uint64_t reason[kReasonCount]{};
         uint64_t waitsFor[kReasonCount]{};
         double waitSecondsFor[kReasonCount]{};
+        // The buffers of the last primitive handed over as one band.
+        uint32_t wholeFbp = 0, wholeZbp = 0;
+        uint8_t wholeZpsm = 0, wholeZtst = 0;
     } stats;
+
+    // PS2X_GS_STATS=1, [gs-pool]: where the pool's time goes, by kind of
+    // batch. A frame's batches are drawn one after another, so the pool is
+    // as full as each batch can keep its threads: an image or a batch of one
+    // band has work for one; a batch in bands has work for as many threads
+    // as it has bands, until the last band is taken, and from then to its
+    // end for fewer and fewer; and between two batches the threads have to
+    // be woken. Under the mutex.
+    struct PoolStats
+    {
+        struct Kind
+        {
+            uint64_t batches = 0, bands = 0;
+            int64_t wallNs = 0;   // first band taken to the batch done
+            int64_t threadNs = 0; // spent in it, all threads together
+            int64_t tailNs = 0;   // last band taken to the batch done
+        };
+        Kind kind[3]; // an image, one band, in bands
+        uint64_t gaps = 0;
+        int64_t gapNs = 0; // a batch done to the first band of the next taken, when the next was waiting
+        int64_t lastDoneNs = 0;
+        bool waitingAtDone = false;
+    } pool;
+
+    static int64_t nowNs()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     static int reasonSlot(const char *why)
     {
-        static const char *const kReasons[kReasonCount] = {"target", "texture", "direct", "full", "upload", "idle", "present", "clut", "sync", "move", "reference", "vram", "snapshot", "clear", "reset", "other"};
+        static const char *const kReasons[kReasonCount] = {"target", "texture", "direct", "full", "upload", "idle", "present", "clut", "sync", "move", "reference", "vram", "snapshot", "clear", "reset", "ahead", "other"};
         if (why)
             for (int i = 0; i < kReasonCount - 1; ++i)
                 if (std::strcmp(why, kReasons[i]) == 0)
@@ -2223,7 +2293,7 @@ struct GSCpuBackend::RasterQueue
 
         if (wantStats())
         {
-            static const char *const kReasons[kReasonCount] = {"target", "texture", "direct", "full", "upload", "idle", "present", "clut", "sync", "move", "reference", "vram", "snapshot", "clear", "reset", "other"};
+            static const char *const kReasons[kReasonCount] = {"target", "texture", "direct", "full", "upload", "idle", "present", "clut", "sync", "move", "reference", "vram", "snapshot", "clear", "reset", "ahead", "other"};
             ++stats.reason[reasonSlot(why)];
             ++stats.batches;
             stats.primitives += pending.size();
@@ -2241,6 +2311,24 @@ struct GSCpuBackend::RasterQueue
                     if (stats.waitsFor[i] != 0u)
                         std::fprintf(stderr, " %s %llu/%.2fs", kReasons[i], (unsigned long long)stats.waitsFor[i], stats.waitSecondsFor[i]);
                 std::fprintf(stderr, "\n");
+                PoolStats now;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    now = pool;
+                }
+                const auto seconds = [](int64_t ns) { return static_cast<double>(ns) * 1.0e-9; };
+                const PoolStats::Kind &images = now.kind[0], &one = now.kind[1], &bands = now.kind[2];
+                std::fprintf(stderr,
+                             "[gs-pool] %zu threads, and the GS thread when it waits; images: %llu batches, %.2fs from the first band taken to done, %.2fs of thread time; "
+                             "one band: %llu, %.2fs, %.2fs (the last: FRAME fbp=0x%x, ZBUF zbp=0x%x psm=0x%x, ztst %u); "
+                             "in bands: %llu batches of %.1f bands, %.2fs, %.2fs of thread time, %.2fs of it after the last band was taken; "
+                             "between a batch done and the first band of one that was waiting: %llu times, %.2fs\n",
+                             workers.size(), (unsigned long long)images.batches, seconds(images.wallNs), seconds(images.threadNs),
+                             (unsigned long long)one.batches, seconds(one.wallNs), seconds(one.threadNs), stats.wholeFbp, stats.wholeZbp,
+                             static_cast<unsigned>(stats.wholeZpsm), static_cast<unsigned>(stats.wholeZtst),
+                             (unsigned long long)bands.batches,
+                             bands.batches ? static_cast<double>(bands.bands) / static_cast<double>(bands.batches) : 0.0, seconds(bands.wallNs),
+                             seconds(bands.threadNs), seconds(bands.tailNs), (unsigned long long)now.gaps, seconds(now.gapNs));
                 if (rasterClassStatsWanted() && stats.batches % 16000u == 0u)
                     printRasterClasses();
             }
@@ -2271,6 +2359,7 @@ struct GSCpuBackend::RasterQueue
         batch->weight = batch->primitives.size();
         batch->number = ++submitted;
         batch->firstRow = top;
+        batch->whole = whole;
         batch->bandHeight = whole ? bottom - top + 1 : kBandHeight;
         batch->bandCount = (bottom - top) / batch->bandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
@@ -2332,6 +2421,7 @@ struct GSCpuBackend::RasterQueue
         batch->weight = bytes / 256u + 1u;
         batch->number = ++submitted;
         batch->firstRow = static_cast<int>(dsay - dsay % static_cast<uint32_t>(kBandHeight));
+        batch->whole = false;
         batch->bandHeight = kBandHeight;
         batch->bandCount = (static_cast<int>(dsay + rrh) - 1 - batch->firstRow) / kBandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
@@ -2381,8 +2471,13 @@ struct GSCpuBackend::RasterQueue
         }
         if (timed)
         {
+            // Too far ahead of the pool: it has more outstanding than it may.
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             ++stats.waits;
-            stats.waitSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            stats.waitSeconds += seconds;
+            const int slot = reasonSlot("ahead");
+            ++stats.waitsFor[slot];
+            stats.waitSecondsFor[slot] += seconds;
         }
     }
 
@@ -4254,6 +4349,10 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
             addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
             queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
                                    static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
+            queue.stats.wholeFbp = ctx.frame.fbp;
+            queue.stats.wholeZbp = ctx.zbuf.zbp;
+            queue.stats.wholeZpsm = static_cast<uint8_t>(ctx.zbuf.psm);
+            queue.stats.wholeZtst = static_cast<uint8_t>(p.ztst);
             // The queued copy must not point at this call's draw state.
             p.drawState = nullptr;
             queue.pending.push_back(primitive);
