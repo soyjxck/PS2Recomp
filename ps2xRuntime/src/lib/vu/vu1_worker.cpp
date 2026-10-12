@@ -57,6 +57,9 @@ namespace
                     return;
                 std::swap(taken, queue);
                 lock.unlock();
+                // With the lag off no vblank comes this way any more.
+                if (GsWorker::lagVBlanks() == 0u)
+                    GsWorker::passVBlank(0u);
 
                 size_t bytes = 0;
                 RecordQueue::Record record;
@@ -68,6 +71,7 @@ namespace
                     {
                         GsWorker::Display display;
                         std::memcpy(&display, record.data, sizeof(display));
+                        GsWorker::passVBlank(display.tick);
                         GsWorker::postVBlank(display);
                         break;
                     }

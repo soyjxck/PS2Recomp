@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_worker.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
@@ -557,7 +558,10 @@ bool GS::skipDrawForFastForward() const
 
     if (m_privRegs == nullptr || (plan.untilTick == 0u && !plan.nearDumpsOnly))
         return false;
-    const uint64_t tick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
+    // On a worker that may lag, the vblank its packets belong to: the EE's
+    // count is up to the lag ahead of that, by how the host ran, and a window
+    // that opened by it opened a frame earlier in one run than in the next.
+    const uint64_t tick = GsWorker::vblankInHand(m_privRegs->vsyncTick.load(std::memory_order_acquire));
     if (tick < plan.untilTick)
         return true;
     if (!plan.nearDumpsOnly)

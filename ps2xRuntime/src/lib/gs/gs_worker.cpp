@@ -111,6 +111,9 @@ namespace
                     return;
                 std::swap(taken, queue);
                 lock.unlock();
+                // With the lag off no vblank comes this way any more.
+                if (GsWorker::lagVBlanks() == 0u)
+                    GsWorker::passVBlank(0u);
 
                 // PS2X_GS_STATS=1: how much of its time the worker spends drawing.
                 static const bool wantStats = []
@@ -129,7 +132,10 @@ namespace
                         {
                             std::lock_guard<std::mutex> guard(mutex);
                             if (record.kind == kVBlank)
+                            {
                                 std::memcpy(&vblankReached, record.data, sizeof(vblankReached));
+                                GsWorker::passVBlank(vblankReached.tick);
+                            }
                             else
                                 interruptMarkReached = record.value;
                         }

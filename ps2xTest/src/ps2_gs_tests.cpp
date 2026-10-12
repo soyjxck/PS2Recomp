@@ -5126,6 +5126,23 @@ void register_ps2_gs_tests()
             t.IsFalse(GsWorker::shownDisplay(shown), "with the lag off the EE's own registers show again");
         });
 
+        tc.Run("a worker that may lag counts vblanks by the one it has come to", [](TestCase &t)
+        {
+            t.Equals(GsWorker::vblankInHand(9u), static_cast<uint64_t>(9u), "a thread that passed no vblank has the EE's count");
+            ps2x::setGsLag(2u);
+            t.Equals(GsWorker::vblankInHand(9u), static_cast<uint64_t>(9u), "also with a lag, before its first vblank");
+            GsWorker::passVBlank(7u);
+            t.Equals(GsWorker::vblankInHand(9u), static_cast<uint64_t>(7u), "the vblank the worker came to, not the EE's count ahead of it");
+            uint64_t elsewhere = 0u;
+            std::thread other([&elsewhere]
+                              { elsewhere = GsWorker::vblankInHand(9u); });
+            other.join();
+            t.Equals(elsewhere, static_cast<uint64_t>(9u), "another thread has its own");
+            GsWorker::passVBlank(0u);
+            t.Equals(GsWorker::vblankInHand(9u), static_cast<uint64_t>(9u), "a worker behind nothing has the EE's count again");
+            ps2x::setGsLag(0u);
+        });
+
         tc.Run("a GS that may lag keeps FINISH from the guest only while it is masked", [](TestCase &t)
         {
             PS2Runtime runtime;

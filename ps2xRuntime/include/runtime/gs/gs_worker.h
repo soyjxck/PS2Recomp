@@ -96,6 +96,33 @@ namespace GsWorker
     // otherwise, or before the first.
     bool shownDisplay(Display &display);
 
+    namespace detail
+    {
+        // The last vblank the calling worker came to in what it was sent.
+        // Zero on a thread that came to none, and on a worker while nothing
+        // may lag.
+        inline thread_local uint64_t t_vblankInHand = 0u;
+    }
+
+    // The EE's vblank count for what the calling thread has in hand. A
+    // worker that may lag is behind the EE's own count, by as much as the
+    // host makes it; what goes by the count (the windows in which a test
+    // run's fast-forward draws) asks here, so that it falls on the same
+    // packets however the host runs. `eeCount` on any other thread, and
+    // without a lag. (Here, not in gs_worker.cpp: the GS front end is also
+    // built without the workers.)
+    inline uint64_t vblankInHand(uint64_t eeCount)
+    {
+        return detail::t_vblankInHand != 0u ? detail::t_vblankInHand : eeCount;
+    }
+
+    // The calling worker has come to that vblank in what it was sent; zero
+    // when it is behind nothing.
+    inline void passVBlank(uint64_t tick)
+    {
+        detail::t_vblankInHand = tick;
+    }
+
     // Returns when the GS has passed that vblank. True if it had to wait.
     bool waitForVBlank(uint64_t tick, Wait why = Wait::VBlank);
 
