@@ -178,6 +178,93 @@ namespace
         return 0u;
     }
 
+    // An UNPACK with no mask, no addition and CL = WL = 1, which is nearly
+    // every one a game sends: each vector is written whole to the next
+    // qword, around the end of the memory. What the loop in unpackVectors
+    // comes to for it, format by format, without that loop's questions for
+    // every vector. False for a form that is left to the loop.
+    bool unpackPlain(uint8_t *vuData, uint32_t addressMask, uint32_t vuAddr, uint32_t vn, uint32_t vl,
+                     bool zeroExtend, uint32_t count, const uint8_t *source)
+    {
+        if (vl == 3u && vn != 3u)
+            return false;
+        if (vl == 0u && vn == 3u)
+        {
+            // V4-32: the qwords as they are.
+            const uint32_t first = std::min(count, addressMask + 1u - vuAddr);
+            std::memcpy(vuData + static_cast<size_t>(vuAddr) * 16u, source, static_cast<size_t>(first) * 16u);
+            std::memcpy(vuData, source + static_cast<size_t>(first) * 16u, static_cast<size_t>(count - first) * 16u);
+            return true;
+        }
+
+        const uint32_t components = vn + 1u;
+        const auto each = [&](uint32_t bytesPerVector, const auto &decode)
+        {
+            for (uint32_t index = 0; index < count; ++index)
+            {
+                uint8_t *target = vuData + static_cast<size_t>((vuAddr + index) & addressMask) * 16u;
+                // A vector of two or three components leaves the other lanes
+                // as they were.
+                uint32_t lanes[4];
+                std::memcpy(lanes, target, sizeof(lanes));
+                decode(source + static_cast<size_t>(index) * bytesPerVector, lanes);
+                std::memcpy(target, lanes, sizeof(lanes));
+            }
+        };
+        // One component goes to all four lanes.
+        const auto spread = [components](uint32_t *lanes, const auto &component)
+        {
+            if (components == 1u)
+                lanes[0] = lanes[1] = lanes[2] = lanes[3] = component(0u);
+            else
+                for (uint32_t c = 0; c < components; ++c)
+                    lanes[c] = component(c);
+        };
+        switch (vl)
+        {
+        case 0u:
+            each(components * 4u, [&](const uint8_t *vector, uint32_t *lanes)
+                 { spread(lanes, [&](uint32_t c)
+                          {
+                              uint32_t raw;
+                              std::memcpy(&raw, vector + c * 4u, sizeof(raw));
+                              return raw;
+                          }); });
+            break;
+        case 1u:
+            each(components * 2u, [&](const uint8_t *vector, uint32_t *lanes)
+                 { spread(lanes, [&](uint32_t c)
+                          {
+                              uint16_t raw;
+                              std::memcpy(&raw, vector + c * 2u, sizeof(raw));
+                              return zeroExtend ? static_cast<uint32_t>(raw)
+                                                : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+                          }); });
+            break;
+        case 2u:
+            each(components, [&](const uint8_t *vector, uint32_t *lanes)
+                 { spread(lanes, [&](uint32_t c)
+                          {
+                              return zeroExtend ? static_cast<uint32_t>(vector[c])
+                                                : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(vector[c])));
+                          }); });
+            break;
+        default:
+            // V4-5: each 5-bit channel in the top of a byte, alpha as 0 or 0x80.
+            each(2u, [](const uint8_t *vector, uint32_t *lanes)
+                 {
+                     uint16_t packed;
+                     std::memcpy(&packed, vector, sizeof(packed));
+                     lanes[0] = (packed & 0x1Fu) << 3;
+                     lanes[1] = ((packed >> 5) & 0x1Fu) << 3;
+                     lanes[2] = ((packed >> 10) & 0x1Fu) << 3;
+                     lanes[3] = ((packed >> 15) & 0x01u) << 7;
+                 });
+            break;
+        }
+        return true;
+    }
+
     // UNPACK: decompress vectors from the VIF stream into VU data memory,
     // honouring STCYCL (skipping and filling writes), the STMASK/STROW/STCOL
     // write masks and the STMOD addition modes. `addressMask` wraps qword
@@ -244,6 +331,14 @@ namespace
         if (vuData && totalBytes > 0 && pos + totalBytes <= sizeBytes)
         {
             const uint8_t *srcBase = data + pos;
+            const uint32_t addition = regs.mode & 3u;
+            if (!maskEnable && cl == 1u && wl == 1u && addition != 1u && addition != 2u &&
+                (addressMask + 1u) * 16u <= vuDataSize &&
+                unpackPlain(vuData, addressMask, vuAddr, vn, vl, zeroExtend, writeVectorCount, srcBase))
+            {
+                pos += totalBytes;
+                return pos <= sizeBytes;
+            }
             uint32_t srcIndex = 0u;
             for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
             {

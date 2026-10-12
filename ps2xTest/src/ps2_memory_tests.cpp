@@ -440,6 +440,87 @@ void register_ps2_memory_tests()
             t.IsTrue(matches, "UNPACK num=0 should copy 256 V4_32 vectors (4096 bytes)");
         });
 
+        tc.Run("VIF plain UNPACK writes what the masked one with every field as data writes", [](TestCase &t)
+        {
+            // An UNPACK with the mask on and every field set to "data" is the
+            // same transfer, taken vector by vector with every question
+            // asked. The plain one, which most are, has to leave the same
+            // memory: every format, both extensions, TOPS, and a run that
+            // goes around the end of the memory.
+            struct Form
+            {
+                uint8_t opcode;
+                uint8_t num;
+                uint16_t imm;
+                uint32_t mode;
+            };
+            const Form forms[] = {
+                {0x6Cu, 7u, 0x0010u, 0u},  // V4-32
+                {0x6Cu, 16u, 0x03F8u, 0u}, // V4-32 around the end
+                {0x6Cu, 0u, 0x0300u, 0u},  // V4-32, 256 of them, around the end
+                {0x6Cu, 5u, 0x8020u, 3u},  // V4-32 from TOPS, with the mode that adds nothing
+                {0x60u, 9u, 0x0040u, 0u},  // S-32
+                {0x61u, 9u, 0x0041u, 0u},  // S-16, signed
+                {0x61u, 9u, 0x4042u, 0u},  // S-16, unsigned
+                {0x62u, 9u, 0x0043u, 0u},  // S-8, signed
+                {0x62u, 9u, 0x4044u, 0u},  // S-8, unsigned
+                {0x64u, 6u, 0x0050u, 0u},  // V2-32
+                {0x65u, 6u, 0x0051u, 0u},  // V2-16
+                {0x66u, 6u, 0x4052u, 0u},  // V2-8
+                {0x68u, 6u, 0x0060u, 0u},  // V3-32
+                {0x69u, 6u, 0x4061u, 0u},  // V3-16
+                {0x6Au, 6u, 0x0062u, 0u},  // V3-8
+                {0x6Du, 11u, 0x03FAu, 0u}, // V4-16 around the end
+                {0x6Eu, 11u, 0xC3FBu, 0u}, // V4-8, unsigned, from TOPS, around the end
+                {0x6Fu, 11u, 0x0070u, 0u}, // V4-5
+            };
+            for (const Form &form : forms)
+            {
+                for (const bool vif0 : {false, true})
+                {
+                    PS2Memory plain, masked;
+                    t.IsTrue(plain.initialize() && masked.initialize(), "PS2Memory initialize should succeed");
+                    const uint32_t vectors = form.num == 0u ? 256u : form.num;
+                    const auto build = [&](bool withMask)
+                    {
+                        std::vector<uint8_t> packet;
+                        appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
+                        appendU32(packet, makeVifCmd(0x05u, 0u, static_cast<uint16_t>(form.mode))); // STMOD
+                        appendU32(packet, makeVifCmd(0x20u, 0u, 0u)); // STMASK: every field is data
+                        appendU32(packet, 0u);
+                        appendU32(packet, makeVifCmd(static_cast<uint8_t>(form.opcode | (withMask ? 0x10u : 0u)), form.num, form.imm));
+                        for (uint32_t byte = 0; byte < vectors * 16u; ++byte)
+                            packet.push_back(static_cast<uint8_t>((byte * 37u + 11u) ^ (byte >> 3)));
+                        return packet;
+                    };
+                    for (PS2Memory *mem : {&plain, &masked})
+                    {
+                        uint8_t *data = vif0 ? mem->getVU0Data() : mem->getVU1Data();
+                        const uint32_t size = vif0 ? PS2_VU0_DATA_SIZE : PS2_VU1_DATA_SIZE;
+                        for (uint32_t byte = 0; byte < size; ++byte)
+                            data[byte] = static_cast<uint8_t>(byte * 7u + 1u);
+                        mem->vif1_regs.tops = 0x3F0u;
+                        const std::vector<uint8_t> packet = build(mem == &masked);
+                        if (vif0)
+                            mem->processVIF0Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                        else
+                            mem->processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                    }
+                    const uint32_t size = vif0 ? PS2_VU0_DATA_SIZE : PS2_VU1_DATA_SIZE;
+                    const uint8_t *a = vif0 ? plain.getVU0Data() : plain.getVU1Data();
+                    const uint8_t *b = vif0 ? masked.getVU0Data() : masked.getVU1Data();
+                    uint32_t changed = 0u;
+                    for (uint32_t byte = 0; byte < size; ++byte)
+                        changed += b[byte] != static_cast<uint8_t>(byte * 7u + 1u) ? 1u : 0u;
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "UNPACK %02x num %u imm %04x on VIF%u", form.opcode, form.num,
+                                  form.imm, vif0 ? 0u : 1u);
+                    t.IsTrue(changed != 0u, std::string(name) + " writes something");
+                    t.IsTrue(std::memcmp(a, b, size) == 0, std::string(name) + " leaves the memory the masked one leaves");
+                }
+            }
+        });
+
         tc.Run("VIF control commands update MARK MASK ROW and COL registers", [](TestCase &t)
         {
             PS2Memory mem;
