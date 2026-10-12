@@ -1516,13 +1516,49 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     static uint64_t statLookups = 0, statCopies = 0, statDecodes = 0, statNoRecord = 0, statOutside = 0, statStale = 0;
-    static uint64_t statBlocks = 0, statBlockDecodes = 0;
+    static uint64_t statBlocks = 0, statBlockDecodes = 0, statRemembered = 0;
     if (wantStats && ++statLookups % 2000000u == 0u)
-        std::fprintf(stderr, "[gs-textures] %llu lookups: %llu from a copy of the uploaded image (%llu decoded), %llu from a copy of uploaded blocks (%llu decoded); from VRAM: %llu not uploaded as such, %llu reach beyond the image, %llu overwritten since; %zu copies, %llu MB\n",
+        std::fprintf(stderr, "[gs-textures] %llu lookups: %llu from a copy of the uploaded image (%llu decoded), %llu from a copy of uploaded blocks (%llu decoded); from VRAM: %llu not uploaded as such, %llu reach beyond the image, %llu overwritten since; %zu copies, %llu MB; %llu of the copies were the texture of one of the last few primitives\n",
                      (unsigned long long)statLookups, (unsigned long long)statCopies, (unsigned long long)statDecodes,
                      (unsigned long long)statBlocks, (unsigned long long)statBlockDecodes,
                      (unsigned long long)statNoRecord, (unsigned long long)statOutside, (unsigned long long)statStale,
-                     m_decodedTextures.size(), (unsigned long long)(m_decodedBytes >> 20));
+                     m_decodedTextures.size(), (unsigned long long)(m_decodedBytes >> 20), (unsigned long long)statRemembered);
+    // The texture of one of the last few primitives, with nothing written to
+    // it since, and this one samples inside the copy that one found: the
+    // same copy.
+    const uint64_t viewId = (static_cast<uint64_t>(p.tbp0) << 40) | (static_cast<uint64_t>(p.tbw) << 32) |
+                            (static_cast<uint64_t>(p.texPsm) << 24) | (static_cast<uint64_t>(p.texW) << 12) | static_cast<uint64_t>(p.texH);
+    const uint64_t conversion = ConversionKey(p);
+    for (const LastTexture &last : m_lastTextures)
+    {
+        if (last.copy != nullptr && last.view == viewId && last.conversion == conversion && last.epoch == m_watchEpoch &&
+            last.forgotten == m_copiesForgotten && p.sampledU0 >= last.u0 && p.sampledV0 >= last.v0 && p.sampledU1 <= last.u1 &&
+            p.sampledV1 <= last.v1)
+        {
+            last.copy->lastUsed = ++m_decodedUseClock;
+            p.decodedU0 = last.originU;
+            p.decodedV0 = last.originV;
+            ++(last.blocks ? statBlocks : statCopies);
+            ++statRemembered;
+            return last.copy;
+        }
+    }
+    const auto remember = [&](const DecodedTexture *copy, int u0, int v0, int u1, int v1, int originU, int originV, bool blocks)
+    {
+        LastTexture &last = m_lastTextures[m_lastTextureNext++ % m_lastTextures.size()];
+        last.view = viewId;
+        last.conversion = conversion;
+        last.epoch = m_watchEpoch;
+        last.forgotten = m_copiesForgotten;
+        last.copy = const_cast<DecodedTexture *>(copy);
+        last.u0 = u0;
+        last.v0 = v0;
+        last.u1 = u1;
+        last.v1 = v1;
+        last.originU = originU;
+        last.originV = originV;
+        last.blocks = blocks;
+    };
     // Not one image: its blocks may say what it is all the same.
     const auto fromBlocks = [&](uint64_t &otherwise) -> const DecodedTexture *
     {
@@ -1534,6 +1570,8 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
         {
             ++statBlocks;
             statBlockDecodes += decodedNow ? 1u : 0u;
+            remember(copy, p.decodedU0, p.decodedV0, p.decodedU0 + copy->width - 1, p.decodedV0 + copy->height - 1, p.decodedU0,
+                     p.decodedV0, true);
         }
         return copy;
     };
@@ -1556,9 +1594,10 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
     }
     if (!intact)
         return fromBlocks(statStale);
+    WatchPages(p.texture, 0, 0, imageW - 1, imageH - 1);
 
     ++statCopies;
-    uint64_t key = mixKey(ConversionKey(p), record.hash);
+    uint64_t key = mixKey(conversion, record.hash);
     key = mixKey(key, (static_cast<uint64_t>(p.texPsm) << 48) | (static_cast<uint64_t>(p.texW) << 32) |
                           (static_cast<uint64_t>(imageW) << 16) | static_cast<uint64_t>(imageH));
     const auto [it, inserted] = m_decodedTextures.try_emplace(key);
@@ -1581,6 +1620,7 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
         m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);
         ForgetOldDecodedTextures();
     }
+    remember(&copy, 0, 0, imageW - 1, imageH - 1, 0, 0, false);
     return &copy;
 }
 
@@ -1671,10 +1711,17 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::BlocksCopy(FastPipeline &p, in
     // Written since: by a transfer or a primitive, or by the graphics card
     // handing back what it alone had drawn there (which marks the pages as
     // drawn into in VRAM and nothing else).
-    if (view.serial == 0u || PagesWrittenSince(p.texture, x0, y0, x1, y1, view.serial) || DrawnSince(p.texture, x0, y0, x1, y1, view.serial))
+    if (view.epoch != m_watchEpoch)
     {
-        view.serial = m_writeSerial;
-        view.key = BlocksKey(p.texture, x0, y0, x1, y1);
+        if (view.serial == 0u || PagesWrittenSince(p.texture, x0, y0, x1, y1, view.serial) ||
+            DrawnSince(p.texture, x0, y0, x1, y1, view.serial))
+        {
+            view.serial = m_writeSerial;
+            view.key = BlocksKey(p.texture, x0, y0, x1, y1);
+        }
+        // Known or not, that stands until one of its pages is written.
+        WatchPages(p.texture, x0, y0, x1, y1);
+        view.epoch = m_watchEpoch;
     }
     if (view.key == 0u)
     {
@@ -1782,6 +1829,7 @@ void GSCpuBackend::ForgetOldDecodedTextures()
     if (m_decodedBytes <= kBudgetBytes)
         return;
     FlushPrimitives();
+    ++m_copiesForgotten;
     // In texture lookups, one per primitive: a few seconds of drawing.
     for (uint64_t unusedFor = 2000000u; m_decodedBytes > kBudgetBytes / 2u && unusedFor >= 2000u; unusedFor /= 10u)
     {

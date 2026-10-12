@@ -204,9 +204,43 @@ private:
     {
         uint64_t key = 0; // 0: not all of it is uploaded images
         uint64_t serial = 0;
+        uint64_t epoch = 0;   // m_watchEpoch when its pages were last looked at
         uint32_t decodes = 0; // copies made of it: how often it was something new
     };
     std::unordered_map<uint64_t, BlocksView> m_blocksViews;
+    // Looking a texture's copy up is asking whether any of its pages has
+    // been written since, page by page, for every primitive. Most primitives
+    // have the texture of the one before and nothing was written to it in
+    // between. So the pages a copy was found good for are watched: a write
+    // to one of them starts a new epoch (and stops watching it), and what
+    // was found in this epoch is still good without a look at any page.
+    std::array<uint8_t, kVramPages> m_pageWatched{};
+    uint64_t m_watchEpoch = 1;
+    void WatchPages(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
+    void PageWritten(uint32_t page)
+    {
+        if (m_pageWatched[page] != 0u)
+        {
+            m_pageWatched[page] = 0u;
+            ++m_watchEpoch;
+        }
+    }
+    // The last few textures a copy was found for, with the texels the copy
+    // has: the answer for the next primitive that samples inside them.
+    struct LastTexture
+    {
+        uint64_t view = 0;       // base, width, format and size
+        uint64_t conversion = 0; // ConversionKey
+        uint64_t epoch = 0;      // m_watchEpoch it was found in
+        uint64_t forgotten = 0;  // m_copiesForgotten then
+        DecodedTexture *copy = nullptr;
+        int u0 = 0, v0 = 0, u1 = -1, v1 = -1;
+        int originU = 0, originV = 0;
+        bool blocks = false;
+    };
+    std::array<LastTexture, 8> m_lastTextures{};
+    uint32_t m_lastTextureNext = 0;
+    uint64_t m_copiesForgotten = 0; // goes up whenever copies are dropped
     // An image that arrives in pieces: the pieces so far as one number.
     uint64_t m_piecesHash = 0;
     bool m_piecesFromStart = false;

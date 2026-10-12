@@ -591,7 +591,10 @@ void GSCpuBackend::GpuDownloadPages(std::vector<uint32_t> &pages)
             // VRAM has changed under whatever was read from these pages.
             ++m_writeSerial;
             for (uint32_t page : mine)
+            {
                 m_pageVramDrawSerial[page] = m_writeSerial;
+                PageWritten(page);
+            }
             ++gpu.statDownloads;
             ++gpu.statWhy[gpu.why];
             gpu.statDownloadedPages += mine.size();

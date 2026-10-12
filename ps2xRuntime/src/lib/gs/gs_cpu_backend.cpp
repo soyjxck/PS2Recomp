@@ -598,6 +598,8 @@ void GSCpuBackend::ResetUnlocked()
     m_uploadAt.clear();
     m_blockContent.fill(0u);
     m_blocksViews.clear();
+    m_lastTextures = {};
+    ++m_copiesForgotten;
     m_clutSnapshots.clear();
     MarkAllWritten();
     m_texturePageCache.Invalidate();
@@ -1702,12 +1704,14 @@ void GSCpuBackend::MarkWritten(const GSMem::SurfaceLayout &layout, int x0, int y
             m_pageDrawSerial[(rowPage + column) % kVramPages] = m_writeSerial;
             if (inVram)
                 m_pageVramDrawSerial[(rowPage + column) % kVramPages] = m_writeSerial;
+            PageWritten((rowPage + column) % kVramPages);
             if (layout.spillsIntoNextPage)
             {
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
                 m_pageDrawSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
                 if (inVram)
                     m_pageVramDrawSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
+                PageWritten((rowPage + column + 1u) % kVramPages);
             }
         }
     }
@@ -1768,8 +1772,12 @@ void GSCpuBackend::MarkUploaded(const GSMem::SurfaceLayout &layout, int x0, int 
         for (uint32_t column = firstColumn; column <= lastColumn; ++column)
         {
             m_pageSerial[(rowPage + column) % kVramPages] = m_writeSerial;
+            PageWritten((rowPage + column) % kVramPages);
             if (layout.spillsIntoNextPage)
+            {
                 m_pageSerial[(rowPage + column + 1u) % kVramPages] = m_writeSerial;
+                PageWritten((rowPage + column + 1u) % kVramPages);
+            }
         }
     }
     const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
@@ -1891,6 +1899,28 @@ void GSCpuBackend::MarkAllWritten()
     m_pageSerial.fill(m_writeSerial);
     m_pageDrawSerial.fill(m_writeSerial);
     m_pageVramDrawSerial.fill(m_writeSerial);
+    m_pageWatched.fill(0u);
+    ++m_watchEpoch;
+}
+
+// A copy was found good for those pixels of a surface: until one of their
+// pages is written it is good (see m_pageWatched).
+void GSCpuBackend::WatchPages(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1)
+{
+    const uint32_t firstColumn = static_cast<uint32_t>(std::max(x0, 0)) >> layout.pageWidthShift;
+    const uint32_t lastColumn = static_cast<uint32_t>(std::max(x1, 0)) >> layout.pageWidthShift;
+    const uint32_t firstRow = static_cast<uint32_t>(std::max(y0, 0)) >> layout.pageHeightShift;
+    const uint32_t lastRow = static_cast<uint32_t>(std::max(y1, 0)) >> layout.pageHeightShift;
+    for (uint32_t row = firstRow; row <= lastRow; ++row)
+    {
+        const uint32_t rowPage = layout.basePage + row * layout.pagesPerRow;
+        for (uint32_t column = firstColumn; column <= lastColumn; ++column)
+        {
+            m_pageWatched[(rowPage + column) % kVramPages] = 1u;
+            if (layout.spillsIntoNextPage)
+                m_pageWatched[(rowPage + column + 1u) % kVramPages] = 1u;
+        }
+    }
 }
 
 bool GSCpuBackend::PagesWrittenSince(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1, uint64_t serial) const
