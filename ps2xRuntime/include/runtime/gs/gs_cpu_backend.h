@@ -275,24 +275,24 @@ private:
         bool fourBit = false;
         uint8_t blockCount = 0;
         std::array<uint16_t, 4> blocks{}; // the blocks its texels are in
-        bool have = false;
+        bool have = false;  // until an upload changes some of its texels
         UploadRecord image; // 16 texels wide; `serial` is when it was taken
     };
     std::vector<ClutPlace> m_clutPlaces;
     std::array<uint8_t, 16384> m_blockHasClutPlace{};
-    // From MarkUploaded for a whole image: the blocks of such places it
-    // covered whole, and the pixel of the image each starts at.
+    // From MarkUploaded: the blocks of such places the image has a part in,
+    // and the pixel of the image each starts at (which may lie outside it).
     struct ClutBlockHit
     {
         uint16_t block = 0;
         int x = 0, y = 0;
     };
     std::vector<ClutBlockHit> m_clutBlocksHit;
-    uint32_t m_clutPlacesUnfilled = 0; // places that have not had their texels yet
+    uint32_t m_clutPlacesUnfilled = 0; // places that do not have their texels
     ClutPlace *ClutPlaceFor(const GSTex0Reg &tex0, bool fourBit);
     void NoteClutBlocksIn(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1);
-    void TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dpsm, uint32_t streamBits, int left, int top, uint32_t rrw,
-                       const uint8_t *data, size_t bytes);
+    void TakeClutsFrom(const GSMem::SurfaceLayout &layout, uint32_t dpsm, uint32_t streamBits, int left, int top, int right, int bottom,
+                       const uint8_t *data, size_t bytes, bool stored);
     std::unordered_map<uint64_t, std::unique_ptr<std::array<uint32_t, 256>>> m_clutSnapshots;
     uint64_t m_clutHashLoad = ~0ull; // m_clutLoads the hash below is of
     uint64_t m_clutHash = 0;

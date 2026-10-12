@@ -1287,7 +1287,7 @@ void register_ps2_gs_tests()
             // (The CLUT's base when none is given is kCbp, said in the body:
             // MSVC takes no local in a default argument, constant or not.)
             const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp, uint32_t rows = 0u, uint64_t clamp = 0ull,
-                                  uint32_t cbp = ~0u)
+                                  uint32_t cbp = ~0u, uint32_t psm = GS_PSM_T8)
             {
                 if (rows == 0u)
                     rows = 1u << rowsLog2;
@@ -1303,7 +1303,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_TEX1_1, 0ull);
                 gs.writeRegister(GS_REG_CLAMP_1, clamp);
                 gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(tbp) | (static_cast<uint64_t>(kWidth) << 14) |
-                                                    (static_cast<uint64_t>(GS_PSM_T8) << 20) | (7ull << 26) |
+                                                    (static_cast<uint64_t>(psm) << 20) | (7ull << 26) |
                                                     (static_cast<uint64_t>(rowsLog2) << 30) | (1ull << 34) | (1ull << 35) |
                                                     (static_cast<uint64_t>(cbp) << 37) | (1ull << 61));
                 gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
@@ -1505,6 +1505,55 @@ void register_ps2_gs_tests()
             t.IsTrue(draw(kPiecesPage * 32u, 6u, 496u, 0u, 0ull, kSameCbp) == sameClut,
                      "a page sent again as it is still gives its CLUT to the place a load made known");
             poke(kSamePage, 1u);
+
+            // --- A place goes by its own texels, not by its blocks. Sixteen
+            // colours are two rows of a block, and here they come as that:
+            // two palettes side by side, 16 by 2 pixels, the second of them
+            // the CLUT of a 4-bit texture.
+            constexpr uint32_t kSmallPage = 200u, kSmallCbp = kSmallPage * 32u + 1u, kFourPage = 210u, kSmallFrame = 504u;
+            const std::vector<uint8_t> sixteen = image(128u, 13u);
+            const auto drawFour = [&]
+            { return draw(kFourPage * 32u, 6u, kSmallFrame, 0u, 0ull, kSmallCbp, GS_PSM_T4); };
+            upload(kFourPage * 32u, 2u, GS_PSM_T4, 0u, 0u, 128u, 64u, image(4096u, 11u));
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, image(128u, 12u));
+            const std::vector<uint32_t> firstSmall = drawFour();
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, sixteen);
+            poke(kSmallPage, 1u);
+            const std::vector<uint32_t> secondSmall = drawFour();
+            poke(kSmallPage, 1u);
+            t.IsTrue(secondSmall != firstSmall, "sanity: the second image brought other colours");
+            drawInto(kSmallPage);
+            t.IsTrue(drawFour() == secondSmall,
+                     "a CLUT that is a part of a block of the image is loaded from the image as it was sent, and is the one VRAM holds");
+
+            // An image beside it in the same block leaves it as it was...
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, sixteen);
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 8u, 4u, 8u, 4u, image(128u, 14u));
+            poke(kSmallPage, 1u);
+            t.IsTrue(drawFour() == secondSmall, "an image in the CLUT's block that covers none of its texels leaves it as it was");
+            poke(kSmallPage, 1u);
+            // ...one over some of its texels takes it away: it is read from
+            // VRAM (here changed behind the GS, so not what the place had)...
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 8u, 0u, 4u, 2u, image(32u, 15u));
+            poke(kSmallPage, 1u);
+            t.IsTrue(drawFour() != secondSmall, "an image over some of a CLUT's texels takes away what the place had");
+            poke(kSmallPage, 1u);
+            // ...and so does one that arrives in pieces...
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, sixteen);
+            poke(kSmallPage, 1u);
+            t.IsTrue(drawFour() == secondSmall, "sanity: the palettes sent again are the CLUT again");
+            poke(kSmallPage, 1u);
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, sixteen, 2u);
+            poke(kSmallPage, 1u);
+            t.IsTrue(drawFour() != secondSmall, "an image in pieces over a CLUT takes away what the place had");
+            poke(kSmallPage, 1u);
+            // ...or one whose pixels are not laid out as the CLUT's texels.
+            upload(kSmallPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 16u, 2u, sixteen);
+            upload(kSmallPage * 32u, 2u, GS_PSM_T8, 0u, 0u, 128u, 64u, image(8192u, 16u));
+            const std::vector<uint32_t> underTexture = drawFour();
+            t.IsTrue(underTexture != secondSmall, "an image of another format over a CLUT takes away what the place had");
+            drawInto(kSmallPage);
+            t.IsTrue(drawFour() == underTexture, "and the CLUT is what VRAM holds there");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)
