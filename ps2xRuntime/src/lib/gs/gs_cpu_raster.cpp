@@ -241,9 +241,13 @@ namespace
 // the frame buffer. From that emulated time, the next <count> (64) triangles
 // and sprites that reach the pixel are reported with what went into it:
 // the vertex colours, the texture and the texel sampled, the blend and the
-// tests, the value before and after. For a model that comes out the wrong
-// colour: is it its vertices, its texture or the state? While a probe is set
-// everything is drawn a pixel at a time (as with PS2X_GS_SCALAR=1).
+// tests, the value before and after; for a sprite also its Z and the depth
+// it is tested against, which is what a pass laid over the picture goes by.
+// For a model that comes out the wrong colour: is it its vertices, its
+// texture or the state? While a probe is set everything is drawn a pixel at
+// a time (as with PS2X_GS_SCALAR=1), and a sprite that samples its own
+// frame by one thread in the general loop. (The pixel is one of any buffer
+// drawn into: "fbp" says which.)
 namespace
 {
     struct PixelProbe
@@ -2153,7 +2157,9 @@ struct GSCpuBackend::RasterQueue
     static Sharing sharingOf(const PreparedPrimitive &primitive)
     {
         const FastPipeline &p = primitive.pipeline;
-        if (!primitive.sprite || primitive.blit || !p.samplesInRows() || !p.blendsTestedInto32())
+        // (With PS2X_GS_PROBE the general loop draws it, which reports, and
+        // which fetches texels of no weight: one thread, then.)
+        if (!primitive.sprite || primitive.blit || !p.samplesInRows() || !p.blendsTestedInto32() || pixelProbe().set)
             return Sharing::Whole;
         // Texel (x, y) has to be pixel (x, y); and the depth it is tested
         // against has to lie elsewhere: the frame's pages against the
@@ -3550,6 +3556,43 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
         const uint32_t z = gsDepthBits(v1.z);
         const int r = v1.r, g = v1.g, b = v1.b, a = v1.a;
         const int fog = v1.fog;
+        // PS2X_GS_PROBE: the sprite's pixel there.
+        PixelProbe &probe = pixelProbe();
+        const auto write = [&](int x, int y, const FastPipeline::Row &frameRow, const FastPipeline::Row &depthRow, float texU,
+                               float texV, uint32_t texel, int pr, int pg, int pb, int pa)
+        {
+            const bool probed = probe.set && x == probe.x && y == probe.y && probe.left.load(std::memory_order_relaxed) > 0 &&
+                                probe.left.fetch_sub(1) > 0;
+            if (!probed) [[likely]]
+            {
+                p.write(x, frameRow, depthRow, z, pr, pg, pb, pa, fog);
+                return;
+            }
+            const uint32_t frameUnit = FastPipeline::unitIn(p.frame, frameRow, x);
+            const uint32_t depthUnit = FastPipeline::unitIn(p.depth, depthRow, x);
+            const uint32_t stored = p.depthKind == DepthKind::Z16 ? p.tread16(depthUnit)
+                                    : p.depthKind == DepthKind::Z24 ? p.tread32(depthUnit) & 0x00FFFFFFu
+                                                                    : p.tread32(depthUnit);
+            const uint32_t before = p.tread32(frameUnit);
+            p.write(x, frameRow, depthRow, z, pr, pg, pb, pa, fog);
+            std::fprintf(stderr,
+                         "[probe] fbp=0x%x sprite pixels (%d,%d)-(%d,%d) corners (%.4f,%.4f) (%.4f,%.4f) rgba %d,%d,%d,%d"
+                         " | tme=%d fst=%d tfx=%u tcc=%d psm=0x%x tbp=0x%x tbw=%u %dx%d wrap=%u,%u region u %d,%d v %d,%d texa=%u/%d/%u copy=%d own=%d linear=%d cpsm=0x%x csm=%u csa=%u uv=%.4f,%.4f texel=%08x"
+                         " | out %d,%d,%d,%d fog=%d/%d abe=%d pabe=%d %u%u%u%u fix=%u fba=%d atest=%d:%u/%u/%u date=%d/%d ztst=%u zmsk=%d z=%u depth=%u fpsm=0x%x fbmsk=0x%x | %08x -> %08x\n",
+                         static_cast<unsigned>(p.frame.basePage), primitive.minX, primitive.minY, primitive.maxX, primitive.maxY,
+                         v0.x, v0.y, v1.x, v1.y, r, g, b, a, p.tme ? 1 : 0, p.tme && p.fst ? 1 : 0, static_cast<unsigned>(p.tfx),
+                         p.tcc ? 1 : 0, static_cast<unsigned>(p.texPsm), p.tbp0, p.tbw, p.texW, p.texH,
+                         static_cast<unsigned>(p.wrapU), static_cast<unsigned>(p.wrapV), p.minU, p.maxU, p.minV, p.maxV,
+                         static_cast<unsigned>(p.texa.ta0), p.texa.aem ? 1 : 0, static_cast<unsigned>(p.texa.ta1),
+                         p.decoded != nullptr ? 1 : 0, p.tme && p.textureIsTarget ? 1 : 0, p.tme && p.linear ? 1 : 0,
+                         static_cast<unsigned>(p.cpsm), static_cast<unsigned>(p.csm), static_cast<unsigned>(p.csa), texU, texV,
+                         texel, pr, pg, pb, pa, fog, p.fge ? 1 : 0, p.abe ? 1 : 0, p.pabe ? 1 : 0, static_cast<unsigned>(p.asel),
+                         static_cast<unsigned>(p.bsel), static_cast<unsigned>(p.csel), static_cast<unsigned>(p.dsel),
+                         static_cast<unsigned>(p.fix), p.fba ? 1 : 0, p.alphaTest ? 1 : 0, static_cast<unsigned>(p.atst),
+                         static_cast<unsigned>(p.aref), static_cast<unsigned>(p.afail), p.date ? 1 : 0, p.datm ? 1 : 0,
+                         static_cast<unsigned>(p.ztst), p.zmask ? 1 : 0, z, stored, static_cast<unsigned>(p.framePsm), p.fbmsk,
+                         before, p.tread32(frameUnit));
+        };
         if (!p.tme)
         {
             for (int y = yFirst; y <= yLast; ++y)
@@ -3557,7 +3600,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
                 const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
                 const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
                 for (int x = primitive.minX; x <= primitive.maxX; ++x)
-                    p.write(x, frameRow, depthRow, z, r, g, b, a, fog);
+                    write(x, y, frameRow, depthRow, 0.0f, 0.0f, 0u, r, g, b, a);
             }
             return;
         }
@@ -3579,7 +3622,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
         // at a time (sampleInRows), MODULATE, the frame read, the depth
         // test, the blend and the store. The pixels are the same and in the
         // same order, each stored before the next is sampled.
-        if (p.samplesInRows() && p.blendsTestedInto32())
+        if (p.samplesInRows() && p.blendsTestedInto32() && !probe.set)
         {
             const bool tcc = p.tcc, fba = p.fba, greaterOrEqual = p.ztst == 2u;
             const DepthKind depthKind = p.depthKind;
@@ -3658,8 +3701,9 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             {
                 const float texU = quantise(rowU + static_cast<float>(x - primitive.minX) * stepU);
                 int pr = r, pg = g, pb = b, pa = a;
-                p.combine(p.sample(texU, texV), pr, pg, pb, pa);
-                p.write(x, frameRow, depthRow, z, pr, pg, pb, pa, fog);
+                const uint32_t texel = p.sample(texU, texV);
+                p.combine(texel, pr, pg, pb, pa);
+                write(x, y, frameRow, depthRow, texU, texV, texel, pr, pg, pb, pa);
             }
         }
         return;
