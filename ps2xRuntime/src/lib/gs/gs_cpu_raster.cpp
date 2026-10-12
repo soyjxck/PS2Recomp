@@ -665,12 +665,45 @@ struct GSCpuBackend::FastPipeline
     // 32-bit ones read straight from VRAM (no decoded copy) with the linear
     // filter and no REGION_REPEAT: the row's coordinate is one for the whole
     // row, so the two rows of texels it falls between are found once, and a
-    // pixel is left with its two columns in each. The same four reads and
-    // the same arithmetic as sample(), read by read: a primitive that samples
-    // what it is drawing sees what sample() would.
+    // pixel is left with its two columns in each. The texels and the
+    // arithmetic are sample()'s, but a texel of no weight is not fetched
+    // (lerpColor(a, b, 0) is a, whatever b): a sprite a whole pixel across
+    // or down from the frame it reads fetches one texel a pixel, and no
+    // pixel of it touches a row or a column it takes nothing from, which is
+    // what lets several threads draw it (RasterQueue::sharingOf).
     bool samplesInRows() const
     {
         return linear && !regionRepeat && decoded == nullptr && texKind == TextureKind::Direct32;
+    }
+
+    // The two texel rows, or columns, a coordinate falls between, wrapped
+    // and clamped as texel() has them, and the weight of the second of 256.
+    struct TexelPair
+    {
+        int first, second;
+        uint32_t weight;
+    };
+
+    [[gnu::always_inline]] inline TexelPair texelRowsAt(float texV) const
+    {
+        const float sv = texV - 0.5f;
+        const int v0 = floorToInt(sv);
+        int upper = v0 & maskV;
+        int lower = (v0 + 1) & maskV;
+        upper = upper < lowV ? lowV : (upper > highV ? highV : upper);
+        lower = lower < lowV ? lowV : (lower > highV ? highV : lower);
+        return {upper, lower, static_cast<uint32_t>((sv - static_cast<float>(v0)) * 256.0f + 0.5f)};
+    }
+
+    [[gnu::always_inline]] inline TexelPair texelColumnsAt(float texU) const
+    {
+        const float su = texU - 0.5f;
+        const int u0 = floorToInt(su);
+        int left = u0 & maskU;
+        int right = (u0 + 1) & maskU;
+        left = left < lowU ? lowU : (left > highU ? highU : left);
+        right = right < lowU ? lowU : (right > highU ? highU : right);
+        return {left, right, static_cast<uint32_t>((su - static_cast<float>(u0)) * 256.0f + 0.5f)};
     }
 
     struct TexelRows
@@ -681,30 +714,32 @@ struct GSCpuBackend::FastPipeline
 
     [[gnu::always_inline]] inline TexelRows texelRows(float texV) const
     {
-        const float sv = texV - 0.5f;
-        const int v0 = floorToInt(sv);
-        int upper = v0 & maskV;
-        int lower = (v0 + 1) & maskV;
-        upper = upper < lowV ? lowV : (upper > highV ? highV : upper);
-        lower = lower < lowV ? lowV : (lower > highV ? highV : lower);
-        return {rowOf(texture, upper), rowOf(texture, lower), static_cast<uint32_t>((sv - static_cast<float>(v0)) * 256.0f + 0.5f)};
+        const TexelPair at = texelRowsAt(texV);
+        return {rowOf(texture, at.first), rowOf(texture, at.second), at.weight};
     }
 
     [[gnu::always_inline]] inline uint32_t sampleInRows(float texU, const TexelRows &rows) const
     {
-        const float su = texU - 0.5f;
-        const int u0 = floorToInt(su);
-        int left = u0 & maskU;
-        int right = (u0 + 1) & maskU;
-        left = left < lowU ? lowU : (left > highU ? highU : left);
-        right = right < lowU ? lowU : (right > highU ? highU : right);
-        const uint32_t c00 = read32(vram, unitIn(texture, rows.upper, left));
-        const uint32_t c10 = read32(vram, unitIn(texture, rows.upper, right));
-        const uint32_t c01 = read32(vram, unitIn(texture, rows.lower, left));
-        const uint32_t c11 = read32(vram, unitIn(texture, rows.lower, right));
+        // The returns before a second column or a second row is fetched are
+        // what lets a sprite be shared among threads (RasterQueue::sharingOf):
+        // fetched first and tested after, the values and every one-thread
+        // test would be the same, and it would race.
+        const TexelPair at = texelColumnsAt(texU);
+        const uint32_t wx = at.weight;
+        const uint32_t c00 = read32(vram, unitIn(texture, rows.upper, at.first));
+        if (wx == 0u)
+        {
+            if (rows.wy == 0u)
+                return c00;
+            return lerpColor(c00, read32(vram, unitIn(texture, rows.lower, at.first)), rows.wy);
+        }
+        const uint32_t c10 = read32(vram, unitIn(texture, rows.upper, at.second));
+        if (rows.wy == 0u)
+            return lerpColor(c00, c10, wx);
+        const uint32_t c01 = read32(vram, unitIn(texture, rows.lower, at.first));
+        const uint32_t c11 = read32(vram, unitIn(texture, rows.lower, at.second));
         if (c00 == c10 && c00 == c01 && c00 == c11)
             return c00;
-        const uint32_t wx = static_cast<uint32_t>((su - static_cast<float>(u0)) * 256.0f + 0.5f);
         return lerpColor(lerpColor(c00, c10, wx), lerpColor(c01, c11, wx), rows.wy);
     }
 
@@ -2067,6 +2102,8 @@ struct GSCpuBackend::PreparedPrimitive
 // the pixels are the ones drawing them one by one would give. A primitive
 // that samples what it draws is a batch by itself and all one band: every
 // pixel of it may read the ones before, so one thread draws its rows in order.
+// (Unless its rows, or its columns, have nothing to do with each other: see
+// sharingOf.)
 //
 // What keeps that safe is knowing which VRAM pages the primitives not yet
 // drawn write and read: anything else that reads or writes VRAM (a transfer, a
@@ -2075,6 +2112,93 @@ struct GSCpuBackend::PreparedPrimitive
 struct GSCpuBackend::RasterQueue
 {
     static constexpr int kBandHeight = 16;
+    // Columns to a strip (Sharing::Strips). A multiple of 8, and strips
+    // start at multiples of it: a 32-bit block is 8 pixels by 8, so no two
+    // strips write one block. sharingOf, which steps each column as its
+    // strip will, and DrawFast, which cuts the strips, both go by it and
+    // have to cut at the same columns.
+    static constexpr int kStripWidth = 32;
+
+    // How the pool draws a batch: its rows shared out in bands; all of it
+    // as one band; or each of its primitives as a band, which are strips of
+    // one sprite side by side, each drawn from its first row to its last.
+    enum class Sharing
+    {
+        Bands,
+        Whole,
+        Strips,
+    };
+
+    // How a sprite that samples the frame it draws may be shared out.
+    //
+    // A pixel of one may read pixels stored before it, so as a rule its
+    // pixels go in order, one thread's work (Whole). But the blur such
+    // sprites are for is often two of them, each a whole pixel across or
+    // down from the frame it reads (a smear to the right, then a smear
+    // down, where the depth test passes): a pixel of the first takes the
+    // one to its left and nothing else, a pixel of the second the one
+    // above it.
+    //  - Where every row reads its own row and no other, rows have nothing
+    //    to do with each other: Bands.
+    //  - Where every column reads its own column and no other, columns have
+    //    nothing to do with each other, whichever rows they read: Strips,
+    //    each drawn top to bottom by one thread.
+    // That goes by the texels the loop addresses, after wrapping and
+    // clamping (clamped to a last row, the rows past it read another row
+    // than their own), for every row and every column drawn; and it holds
+    // only for the loop that fetches no texel of no weight (sampleInRows),
+    // since a fetch from another thread's rows or columns is a read racing
+    // its writes, whatever is done with the value. The depth is tested at
+    // the pixel's own place and not stored.
+    static Sharing sharingOf(const PreparedPrimitive &primitive)
+    {
+        const FastPipeline &p = primitive.pipeline;
+        if (!primitive.sprite || primitive.blit || !p.samplesInRows() || !p.blendsTestedInto32())
+            return Sharing::Whole;
+        // Texel (x, y) has to be pixel (x, y); and the depth it is tested
+        // against has to lie elsewhere: the frame's pages against the
+        // depth's, over the sprite's rectangle (that the depth is not
+        // stored is blendsTestedInto32's).
+        const GSMem::SurfaceLayout &texture = p.texture, &frame = p.frame;
+        if (texture.table != frame.table || texture.basePage != frame.basePage || texture.pagesPerRow != frame.pagesPerRow ||
+            texture.pageWidthShift != frame.pageWidthShift || texture.pageHeightShift != frame.pageHeightShift ||
+            texture.unitsPerPageShift != frame.unitsPerPageShift || texture.spillsIntoNextPage != frame.spillsIntoNextPage)
+            return Sharing::Whole;
+        PageSet drawn{}, tested{};
+        addPages(drawn, frame, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        addPages(tested, p.depth, primitive.minX, primitive.minY, primitive.maxX, primitive.maxY);
+        if (intersects(drawn, tested))
+            return Sharing::Whole;
+
+        // The coordinates as RasteriseRowsScalar steps them.
+        const float stepU = (primitive.tu1 - primitive.tu0) / primitive.spanX;
+        const float stepV = (primitive.tv1 - primitive.tv0) / primitive.spanY;
+        const bool fst = p.fst;
+        auto quantise = [fst](float coordinate)
+        {
+            return fst ? static_cast<float>(clampInt(static_cast<int>((coordinate * 16.0f) + 0.5f), 0, 0xFFFF)) * 0.0625f
+                       : coordinate;
+        };
+        bool ownRows = true;
+        for (int y = primitive.minY; y <= primitive.maxY && ownRows; ++y)
+        {
+            const FastPipeline::TexelPair at =
+                p.texelRowsAt(quantise(primitive.tv0 + (static_cast<float>(y - primitive.originY) + 0.5f) * stepV));
+            ownRows = at.weight == 0u && at.first == y;
+        }
+        if (ownRows)
+            return Sharing::Bands;
+        // A strip steps its columns from its own first one.
+        for (int x = primitive.minX; x <= primitive.maxX; ++x)
+        {
+            const int first = std::max(primitive.minX, x - x % kStripWidth);
+            const float rowU = primitive.tu0 + (static_cast<float>(first - primitive.originX) + 0.5f) * stepU;
+            const FastPipeline::TexelPair at = p.texelColumnsAt(quantise(rowU + static_cast<float>(x - first) * stepU));
+            if (at.weight != 0u || at.first != x)
+                return Sharing::Whole;
+        }
+        return Sharing::Strips;
+    }
     // Bounding-box pixels worth waking an idle pool for.
     static constexpr uint64_t kEagerPixels = 24000u;
     static constexpr size_t kMaxPending = 4096u;
@@ -2116,6 +2240,8 @@ struct GSCpuBackend::RasterQueue
         int bandCount = 0;
         std::atomic<int> nextBand{0};
         int drawing = 0; // threads inside drawBands (under the mutex)
+        // Each primitive is a band: Sharing::Strips.
+        bool strips = false;
         // PS2X_GS_STATS: when its first band was taken and its last, and the
         // time threads have spent in it.
         bool whole = false;
@@ -2154,6 +2280,12 @@ struct GSCpuBackend::RasterQueue
                                      (static_cast<uint32_t>(y0) - batch.dsay) * batch.rrw,
                                      (static_cast<uint32_t>(y1) - batch.dsay + 1u) * batch.rrw, batch.data.data(), batch.data.size(), 0u);
                 }
+                continue;
+            }
+            if (batch.strips)
+            {
+                const PreparedPrimitive &strip = batch.primitives[static_cast<size_t>(band)];
+                Rasterise(strip, strip.minY, strip.maxY);
                 continue;
             }
             for (const PreparedPrimitive &primitive : batch.primitives)
@@ -2341,9 +2473,9 @@ struct GSCpuBackend::RasterQueue
     }
 
     // Hands the pending primitives to the pool. Does not wait for them.
-    // `whole`: as one band, for one thread to draw from the first row to the
-    // last.
-    void submit(const char *why = nullptr, bool whole = false)
+    // Whole: as one band, for one thread to draw from the first row to the
+    // last. Strips: each of them a band, drawn so.
+    void submit(const char *why = nullptr, Sharing sharing = Sharing::Bands)
     {
         if (pending.empty())
             return;
@@ -2416,9 +2548,10 @@ struct GSCpuBackend::RasterQueue
         batch->weight = batch->primitives.size();
         batch->number = ++submitted;
         batch->firstRow = top;
-        batch->whole = whole;
-        batch->bandHeight = whole ? bottom - top + 1 : kBandHeight;
-        batch->bandCount = (bottom - top) / batch->bandHeight + 1;
+        batch->whole = sharing == Sharing::Whole;
+        batch->strips = sharing == Sharing::Strips;
+        batch->bandHeight = sharing == Sharing::Bands ? kBandHeight : bottom - top + 1;
+        batch->bandCount = batch->strips ? static_cast<int>(batch->primitives.size()) : (bottom - top) / batch->bandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
         batch->drawing = 0;
 
@@ -2479,6 +2612,7 @@ struct GSCpuBackend::RasterQueue
         batch->number = ++submitted;
         batch->firstRow = static_cast<int>(dsay - dsay % static_cast<uint32_t>(kBandHeight));
         batch->whole = false;
+        batch->strips = false;
         batch->bandHeight = kBandHeight;
         batch->bandCount = (static_cast<int>(dsay + rrh) - 1 - batch->firstRow) / kBandHeight + 1;
         batch->nextBand.store(0, std::memory_order_relaxed);
@@ -4465,7 +4599,10 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
     // sprite that blurs the whole frame into itself is some milliseconds, and
     // drawn here it was those and as many again of waiting for the pool to
     // get to it, with nothing decoded meanwhile. Otherwise now, on this
-    // thread.
+    // thread. Still a batch of its own with the same pages, it is shared out
+    // among the pool's threads where its rows or its columns do not read
+    // each other (RasterQueue::sharingOf): the two sprites of a blur that
+    // smears right and then down.
     const bool live = p.tme && !p.decoded;
     if (live && p.textureIsTarget)
     {
@@ -4483,14 +4620,32 @@ bool GSCpuBackend::DrawFast(const GSPrimitiveBatch &batch, FastKind kind)
             addPages(queue.read, p.texture, p.sampledU0, p.sampledV0, p.sampledU1, p.sampledV1);
             queue.pendingPixels += static_cast<uint64_t>(primitive.maxX - primitive.minX + 1) *
                                    static_cast<uint64_t>(primitive.maxY - primitive.minY + 1);
-            queue.stats.wholeFbp = ctx.frame.fbp;
-            queue.stats.wholeZbp = ctx.zbuf.zbp;
-            queue.stats.wholeZpsm = static_cast<uint8_t>(ctx.zbuf.psm);
-            queue.stats.wholeZtst = static_cast<uint8_t>(p.ztst);
             // The queued copy must not point at this call's draw state.
             p.drawState = nullptr;
-            queue.pending.push_back(primitive);
-            queue.submit("direct", true);
+            const RasterQueue::Sharing sharing = RasterQueue::sharingOf(primitive);
+            if (sharing == RasterQueue::Sharing::Strips)
+            {
+                const int width = RasterQueue::kStripWidth;
+                for (int first = primitive.minX - primitive.minX % width; first <= primitive.maxX; first += width)
+                {
+                    queue.pending.push_back(primitive);
+                    PreparedPrimitive &strip = queue.pending.back();
+                    strip.minX = std::max(primitive.minX, first);
+                    strip.maxX = std::min(primitive.maxX, first + width - 1);
+                }
+            }
+            else
+            {
+                if (sharing == RasterQueue::Sharing::Whole)
+                {
+                    queue.stats.wholeFbp = ctx.frame.fbp;
+                    queue.stats.wholeZbp = ctx.zbuf.zbp;
+                    queue.stats.wholeZpsm = static_cast<uint8_t>(ctx.zbuf.psm);
+                    queue.stats.wholeZtst = static_cast<uint8_t>(p.ztst);
+                }
+                queue.pending.push_back(primitive);
+            }
+            queue.submit("direct", sharing);
             return true;
         }
         queue.run("direct");

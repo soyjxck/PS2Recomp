@@ -1315,7 +1315,10 @@ void register_ps2_gs_tests()
             // three: the two have to leave the same VRAM, for each way the
             // sprite can read itself and each thing the loop decided once
             // (the depth test and its format, the blend's terms, the
-            // texture's alpha, FBA).
+            // texture's alpha, FBA). The loop does not fetch a texel of no
+            // weight, which the general one fetches and multiplies by
+            // nothing: the first two forms have no weight across and none
+            // down, the two after them one of the two.
             constexpr uint32_t kFbp = 150u, kZbp = 170u, kWidth = 64u, kHeight = 96u;
             constexpr uint64_t kFrame = static_cast<uint64_t>(kFbp) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
             constexpr uint64_t kScissor = (static_cast<uint64_t>(kWidth - 1u) << 16) | (static_cast<uint64_t>(kHeight - 1u) << 48);
@@ -1334,6 +1337,8 @@ void register_ps2_gs_tests()
             const Form forms[] = {
                 {"mixed with the pixel to its left", 8u, 0u, 8u + (kWidth - 1u) * 16u, kHeight * 16u, 0u, 0u, (kWidth - 1u) * 16u, kHeight * 16u},
                 {"the row above", 0u, 16u, kWidth * 16u, kHeight * 16u, 8u, 9u, 8u + kWidth * 16u, 9u + (kHeight - 1u) * 16u},
+                {"the row above, a sixteenth of a pixel across", 9u, 16u, 9u + (kWidth - 1u) * 16u, kHeight * 16u, 0u, 0u, (kWidth - 1u) * 16u, (kHeight - 1u) * 16u},
+                {"the pixel to its left, squeezed by a row", 8u, 0u, 8u + (kWidth - 1u) * 16u, kHeight * 16u, 0u, 0u, (kWidth - 1u) * 16u, (kHeight - 1u) * 16u},
                 {"stretched", 0u, 0u, kWidth * 16u, kHeight * 16u, 37u, 52u, 37u + kWidth * 9u, 52u + kHeight * 15u},
             };
             struct State
@@ -1423,6 +1428,207 @@ void register_ps2_gs_tests()
                     t.IsTrue(drawn > kWidth * kHeight / 2u, what + ": the sprite should have drawn most of the frame");
                     t.Equals(different, 0u, what + ": every pixel as the general loop draws it");
                     t.IsTrue(own == general, what + ": and nothing else in VRAM differs");
+                }
+            }
+        });
+
+        tc.Run("a blur that reads only its own row, or only its own column, is shared among the threads as one thread draws it", [](TestCase &t)
+        {
+            // A depth of field is two sprites over the frame, each sampling
+            // the frame it draws a whole pixel away: half a pixel right of
+            // it, so that every pixel takes the one to its left as it was
+            // just stored (a smear to the right), then half a pixel up (the
+            // one above: a smear down). The first reads no row but its own
+            // and the second no column but its own, so the pool gives the
+            // rows of the one out in bands and the columns of the other in
+            // strips, where a sprite that samples its own frame is otherwise
+            // one thread's work from the first pixel to the last.
+            //
+            // Each has to leave the VRAM one thread leaves, drawing in order;
+            // and so do the sprites that look like them and are not: the
+            // first clamped to the upper half of the frame, whose lower rows
+            // all read the last row above them; the second a sixteenth of a
+            // pixel across, which takes a little of the next column; the
+            // first squeezed by a row, which takes some of the row above.
+            // Shared out like the ones they resemble, those would read rows
+            // or columns another thread is drawing.
+            //
+            // Which is shown without leaving it to the order threads happen
+            // to take: one thread draws each sprite as two halves, the
+            // second half first. Lower half first is the same picture only
+            // where rows are apart, right half first only where columns
+            // are. That is the statement of what may be drawn out of order
+            // and what may not. The rounds with the pool after it are a
+            // smoke test on top: threads that start late draw in order, so
+            // on a busy machine they pass whatever the sprite was taken for.
+            constexpr uint32_t kFbp = 150u, kZbp = 170u, kFbw = 4u, kWidth = 256u, kHeight = 128u;
+            constexpr int kOffsetX = 1792 * 16, kOffsetY = 1824 * 16;
+            constexpr uint64_t kFrame = static_cast<uint64_t>(kFbp) | (static_cast<uint64_t>(kFbw) << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf = static_cast<uint64_t>(kZbp) | (1ull << 24) | (1ull << 32); // Z24, not written
+            constexpr uint64_t kScissor = (static_cast<uint64_t>(kWidth - 1u) << 16) | (static_cast<uint64_t>(kHeight - 1u) << 48);
+            constexpr uint64_t kDepthGreater = (1ull << 16) | (3ull << 17);
+            constexpr uint64_t kHalf = 0x44ull;                        // (Cs - Cd) * As + Cd
+            constexpr uint64_t kSourceAlone = 0xA8ull | (0x80ull << 32); // (Cs - 0) * FIX + 0, FIX 0x80
+            constexpr uint64_t kLinear = (1ull << 5) | (1ull << 6);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 6) | (1ull << 8);
+            constexpr uint64_t kClampDown = 1ull << 2; // WMT CLAMP
+            constexpr int kAcross = static_cast<int>(kWidth) * 16, kDown = static_cast<int>(kHeight) * 16;
+
+            struct Form
+            {
+                const char *name;
+                int x0, y0, x1, y1;      // sixteenths of a pixel from the frame's corner
+                uint32_t u0, v0, u1, v1; // 12.4
+                uint32_t th;             // TEX0's TH: 7 is the frame's 128 rows
+                uint64_t clamp;
+                bool rowsApart;    // no row reads another
+                bool columnsApart; // no column reads another
+            };
+            const Form left{"the pixel to its left", 8, -9, kAcross + 8, kDown - 9, 0u, 0u, kWidth * 16u, kHeight * 16u, 7u, 0ull, true, false};
+            const Form above{"the pixel above", -8, 7, kAcross - 8, kDown + 7, 0u, 0u, kWidth * 16u, kHeight * 16u, 7u, 0ull, false, true};
+            const Form abovePart{"the pixel above, columns 20 to 219", 20 * 16 - 8, 7, 220 * 16 - 8, kDown + 7,
+                                 20u * 16u, 0u, 220u * 16u, kHeight * 16u, 7u, 0ull, false, true};
+            const Form leftClamped{"the pixel to its left, clamped to the upper half", 8, -9, kAcross + 8, kDown - 9,
+                                   0u, 0u, kWidth * 16u, kHeight * 16u, 6u, kClampDown, false, false};
+            const Form aboveAcross{"the pixel above, a sixteenth of a pixel across", -7, 7, kAcross - 7, kDown + 7,
+                                   0u, 0u, kWidth * 16u, kHeight * 16u, 7u, 0ull, false, false};
+            const Form leftSqueezed{"the pixel to its left, squeezed by a row", 8, -9, kAcross + 8, kDown - 9,
+                                    0u, 0u, kWidth * 16u, (kHeight - 1u) * 16u, 7u, 0ull, false, false};
+
+            const auto fill = [&](std::vector<uint8_t> &vram, bool depth)
+            {
+                uint32_t seed = 97531u;
+                for (uint32_t y = 0u; y < kHeight; ++y)
+                    for (uint32_t x = 0u; x < kWidth; ++x)
+                    {
+                        seed = seed * 1664525u + 1013904223u;
+                        writeReferenceFramePSMCT32Pixel(vram, kFbp, kFbw, x, y, seed);
+                        // Depth above the sprite's here and there: pixels it leaves.
+                        if (depth && (seed >> 28) == 0u)
+                            GSMem::WriteZ24(vram.data(), kZbp * 32u, kFbw, x, y, 0x00FFFFFFu);
+                    }
+            };
+            // halves 0: the sprite; 1: its lower half, then its upper; 2:
+            // its right half, then its left. A half has the pixels and the
+            // texel coordinates the whole sprite has there.
+            const auto draw = [&](const Form &form, const char *threads, uint64_t alpha, uint64_t rgbaq, bool depth, int halves = 0)
+            {
+                ps2x::setSetting("performance.raster_threads", threads);
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                fill(vram, depth);
+                {
+                    GS gs;
+                    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                    gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                    gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+                    gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                    gs.writeRegister(GS_REG_XYOFFSET_1, static_cast<uint64_t>(kOffsetX) | (static_cast<uint64_t>(kOffsetY) << 32));
+                    gs.writeRegister(GS_REG_TEST_1, kDepthGreater);
+                    gs.writeRegister(GS_REG_ALPHA_1, alpha);
+                    gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(kFbp * 32u) | (static_cast<uint64_t>(kFbw) << 14) |
+                                                        (static_cast<uint64_t>(GS_PSM_CT32) << 20) | (8ull << 26) |
+                                                        (static_cast<uint64_t>(form.th) << 30));
+                    gs.writeRegister(GS_REG_TEX1_1, kLinear);
+                    gs.writeRegister(GS_REG_CLAMP_1, form.clamp);
+                    gs.writeRegister(GS_REG_PRIM, kPrim);
+                    gs.writeRegister(GS_REG_RGBAQ, rgbaq);
+                    const auto sprite = [&](const Form &at)
+                    {
+                        gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(at.u0) | (static_cast<uint64_t>(at.v0) << 16));
+                        gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(kOffsetX + at.x0) | (static_cast<uint64_t>(kOffsetY + at.y0) << 16) |
+                                                          (0x1000ull << 32));
+                        gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(at.u1) | (static_cast<uint64_t>(at.v1) << 16));
+                        gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(kOffsetX + at.x1) | (static_cast<uint64_t>(kOffsetY + at.y1) << 16) |
+                                                          (0x1000ull << 32));
+                    };
+                    Form first = form, second = form;
+                    if (halves == 1)
+                    {
+                        second.y1 = first.y0 = (form.y0 + form.y1) / 2;
+                        second.v1 = first.v0 = (form.v0 + form.v1) / 2u;
+                    }
+                    else if (halves == 2)
+                    {
+                        second.x1 = first.x0 = (form.x0 + form.x1) / 2;
+                        second.u1 = first.u0 = (form.u0 + form.u1) / 2u;
+                    }
+                    sprite(first);
+                    if (halves != 0)
+                        sprite(second);
+                }
+                ps2x::setSetting("performance.raster_threads", "");
+                return vram;
+            };
+
+            std::vector<uint8_t> untouched(PS2_GS_VRAM_SIZE, 0u);
+            fill(untouched, false);
+            const auto was = [&](uint32_t x, uint32_t y)
+            {
+                return readReferenceFramePSMCT32Pixel(untouched, kFbp, kFbw, x, y) & 0x00FFFFFFu;
+            };
+
+            // That the forms are what their names say: with the texel stored
+            // as it is read, the first spreads a row's first pixel along
+            // the row and the second the first row down every column; and
+            // clamped, the lower half is all the last row of the upper.
+            {
+                const auto colour = [&](const std::vector<uint8_t> &vram, uint32_t x, uint32_t y)
+                {
+                    return readReferenceFramePSMCT32Pixel(vram, kFbp, kFbw, x, y) & 0x00FFFFFFu;
+                };
+                const std::vector<uint8_t> right = draw(left, "1", kSourceAlone, 0x80808080ull, false);
+                const std::vector<uint8_t> down = draw(above, "1", kSourceAlone, 0x80808080ull, false);
+                const std::vector<uint8_t> part = draw(abovePart, "1", kSourceAlone, 0x80808080ull, false);
+                const std::vector<uint8_t> clamped = draw(leftClamped, "1", kSourceAlone, 0x80808080ull, false);
+                uint32_t wrongRight = 0u, wrongDown = 0u, wrongPart = 0u, wrongClamped = 0u;
+                for (uint32_t y = 0u; y < kHeight; ++y)
+                    for (uint32_t x = 0u; x < kWidth; ++x)
+                    {
+                        if (colour(right, x, y) != was(0u, y))
+                            ++wrongRight;
+                        if (colour(down, x, y) != was(x, 0u))
+                            ++wrongDown;
+                        if (colour(part, x, y) != (x >= 20u && x < 220u ? was(x, 0u) : was(x, y)))
+                            ++wrongPart;
+                        // (Column 0 is left of the sprite.)
+                        if (colour(clamped, x, y) != was(0u, x == 0u ? y : std::min(y, 63u)))
+                            ++wrongClamped;
+                    }
+                t.Equals(wrongRight, 0u, "the pixel to its left: every row is its first pixel");
+                t.Equals(wrongDown, 0u, "the pixel above: every column is its first row");
+                t.Equals(wrongPart, 0u, "the pixel above, columns 20 to 219: those columns are their first row and the others untouched");
+                t.Equals(wrongClamped, 0u, "clamped to the upper half: the lower half is the first pixel of row 63");
+            }
+
+            for (const Form *form : {&left, &above, &abovePart, &leftClamped, &aboveAcross, &leftSqueezed})
+            {
+                const std::vector<uint8_t> inOrder = draw(*form, "1", kHalf, 0x40908070ull, true);
+                uint32_t drawn = 0u, kept = 0u;
+                for (uint32_t y = 1u; y < kHeight; ++y)
+                    for (uint32_t x = 20u; x < 220u; ++x)
+                    {
+                        if ((readReferenceFramePSMCT32Pixel(inOrder, kFbp, kFbw, x, y) & 0x00FFFFFFu) != was(x, y))
+                            ++drawn;
+                        else
+                            ++kept;
+                    }
+                t.IsTrue(drawn > 200u * (kHeight - 1u) / 2u, std::string(form->name) + ": the sprite should have drawn most of the frame");
+                t.IsTrue(kept > 0u, std::string(form->name) + ": and left the pixels behind the depth it fails against");
+                t.Equals(draw(*form, "1", kHalf, 0x40908070ull, true, 1) == inOrder, form->rowsApart,
+                         std::string(form->name) + ": the lower half drawn first is the same picture only if no row reads another");
+                t.Equals(draw(*form, "1", kHalf, 0x40908070ull, true, 2) == inOrder, form->columnsApart,
+                         std::string(form->name) + ": the right half drawn first is the same picture only if no column reads another");
+                // The pool, several times over: an order left to chance does not go wrong every time.
+                for (int round = 0; round < 6; ++round)
+                {
+                    const std::vector<uint8_t> pooled = draw(*form, "8", kHalf, 0x40908070ull, true);
+                    uint32_t different = 0u;
+                    for (uint32_t y = 0u; y < kHeight; ++y)
+                        for (uint32_t x = 0u; x < kWidth; ++x)
+                            if (readReferenceFramePSMCT32Pixel(pooled, kFbp, kFbw, x, y) != readReferenceFramePSMCT32Pixel(inOrder, kFbp, kFbw, x, y))
+                                ++different;
+                    t.Equals(different, 0u, std::string(form->name) + ": every pixel as one thread draws it");
+                    t.IsTrue(pooled == inOrder, std::string(form->name) + ": and nothing else in VRAM differs");
                 }
             }
         });
