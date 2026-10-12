@@ -16,6 +16,7 @@ namespace
     {
         bool path3 = false;
         GsWorker::Display vblank; // tick not 0: no data, a vblank of the EE's
+        uint64_t interruptMark = 0; // not 0: no data, GsWorker::postInterruptMark's
         std::vector<uint8_t> data;
     };
 
@@ -54,6 +55,8 @@ namespace
                 const uint32_t size = static_cast<uint32_t>(item.data.size());
                 if (item.vblank.tick != 0u)
                     GsWorker::postVBlank(item.vblank);
+                else if (item.interruptMark != 0u)
+                    GsWorker::postInterruptMark(item.interruptMark);
                 else if (item.path3)
                     memory->submitGifPacket(GifPathId::Path3, item.data.data(), size, true);
                 else
@@ -61,7 +64,7 @@ namespace
 
                 lock.lock();
                 ++completed;
-                if (spare.size() < 64u && item.vblank.tick == 0u)
+                if (spare.size() < 64u && !item.data.empty())
                     spare.push_back(std::move(item.data));
                 workDone.notify_all();
             }
@@ -176,6 +179,19 @@ namespace Vu1Worker
             std::lock_guard<std::mutex> lock(w.mutex);
             Item item;
             item.vblank = display;
+            w.queue.push_back(std::move(item));
+            ++w.posted;
+        }
+        w.workReady.notify_one();
+    }
+
+    void postInterruptMark(uint64_t mark)
+    {
+        Worker &w = worker();
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            Item item;
+            item.interruptMark = mark;
             w.queue.push_back(std::move(item));
             ++w.posted;
         }

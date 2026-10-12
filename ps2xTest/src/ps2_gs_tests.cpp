@@ -4896,6 +4896,15 @@ void register_ps2_gs_tests()
             t.Equals(static_cast<uint32_t>(runtime.memory().gs().csr.load() & 0x2u), 0u,
                      "a FINISH that was queued when the guest cleared CSR should not turn up afterwards");
 
+            // And a read of CSR sees a FINISH that was sent before it, with
+            // nothing else to make the queue empty first.
+            GsWorker::post(packet.data(), static_cast<uint32_t>(packet.size()));
+            t.Equals(runtime.memory().read32(PS2_GS_PRIV_REG_BASE + 0x1000u) & 0x2u, 0x2u,
+                     "a read of CSR should wait for a FINISH that is queued");
+            t.IsFalse(GsWorker::settleInterrupts(GsWorker::Wait::Csr),
+                      "with every interrupt's packet processed there is nothing to wait for");
+            runtime.memory().write32(PS2_GS_PRIV_REG_BASE + 0x1000u, 0x2u);
+
             ps2x::setGsLag(0u);
         });
 

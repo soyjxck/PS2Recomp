@@ -148,7 +148,7 @@ namespace
     inline void settleCsrStatus(uint64_t value)
     {
         if ((value & 0x3ull) != 0u && GsWorker::lagVBlanks() != 0u)
-            GsWorker::drain(GsWorker::Wait::Csr);
+            GsWorker::settleInterrupts(GsWorker::Wait::Csr);
     }
 
     constexpr std::array<uint32_t, 4> kEeTimerBases = {
@@ -795,7 +795,7 @@ uint32_t PS2Memory::read32(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
+            GsWorker::settleInterrupts(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             uint64_t val = gs_regs.csr.load();
             return (uint32_t)(val >> (off * 8));
         }
@@ -843,7 +843,7 @@ uint64_t PS2Memory::read64(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
+            GsWorker::settleInterrupts(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             return gs_regs.csr.load();
         }
         uint64_t *reg = gsRegPtr(gs_regs, address);
@@ -2522,7 +2522,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
-            GsWorker::drain(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
+            GsWorker::settleInterrupts(GsWorker::Wait::Csr); // SIGNAL and FINISH come out of queued packets
             return static_cast<uint32_t>((gs_regs.csr.load() >> (off * 8u)) & 0xFFFFFFFFull);
         }
         if (uint64_t *reg = gsRegPtr(gs_regs, address))

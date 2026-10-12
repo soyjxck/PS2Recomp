@@ -77,10 +77,12 @@ namespace
         {
             std::vector<uint8_t> data;
             GsWorker::Display vblank; // tick not 0: no packet, a vblank of the EE's
+            uint64_t interruptMark = 0; // not 0: no packet, the mark after one that raises an interrupt
         };
         std::deque<Packet> queue;
         std::vector<std::vector<uint8_t>> spare; // buffers to reuse
         GsWorker::Display vblankReached;
+        uint64_t interruptMarkReached = 0;
         size_t queuedBytes = 0;
         uint64_t posted = 0;
         uint64_t completed = 0;
@@ -118,11 +120,14 @@ namespace
                 size_t bytes = 0;
                 for (const Packet &packet : taken)
                 {
-                    if (packet.vblank.tick != 0u)
+                    if (packet.vblank.tick != 0u || packet.interruptMark != 0u)
                     {
                         {
                             std::lock_guard<std::mutex> guard(mutex);
-                            vblankReached = packet.vblank;
+                            if (packet.vblank.tick != 0u)
+                                vblankReached = packet.vblank;
+                            else
+                                interruptMarkReached = packet.interruptMark;
                         }
                         workDone.notify_all();
                         continue;
@@ -160,7 +165,7 @@ namespace
                 queuedBytes -= bytes;
                 while (!taken.empty())
                 {
-                    if (spare.size() < 256u && taken.front().vblank.tick == 0u)
+                    if (spare.size() < 256u && !taken.front().data.empty())
                         spare.push_back(std::move(taken.front().data));
                     taken.pop_front();
                 }
@@ -181,6 +186,7 @@ namespace
     std::atomic<void (*)()> g_interruptSentHook{nullptr};
     std::atomic<uint32_t> g_lagVBlanks{0u}; // what the game asked for
     std::atomic<const GSRegisters *> g_registers{nullptr};
+    std::atomic<uint64_t> g_interruptMarks{0u}; // marks posted (postInterruptMark)
 }
 
 void ps2x::setGsLag(uint32_t vblanks)
@@ -197,6 +203,9 @@ namespace GsWorker
 
     void interruptSent()
     {
+        // What reads CSR later waits for this packet and no further.
+        if (lagVBlanks() != 0u)
+            postInterruptMark(g_interruptMarks.fetch_add(1u, std::memory_order_acq_rel) + 1u);
         if (lagsInterrupts())
             return;
         if (void (*hook)() = g_interruptSentHook.load(std::memory_order_acquire))
@@ -279,6 +288,8 @@ namespace GsWorker
         {
             std::lock_guard<std::mutex> lock(w.mutex);
             w.vblankReached = {};
+            w.interruptMarkReached = 0u;
+            g_interruptMarks.store(0u, std::memory_order_release);
         }
         const char *value = std::getenv("PS2X_GS_THREAD");
         if (value != nullptr && value[0] == '0')
@@ -339,7 +350,7 @@ namespace GsWorker
             std::lock_guard<std::mutex> lock(w.mutex);
             wasEmpty = w.queue.empty();
             w.queuedBytes += packet.size();
-            w.queue.push_back(Worker::Packet{std::move(packet), {}});
+            w.queue.push_back(Worker::Packet{std::move(packet), {}, 0u});
             ++w.posted;
         }
         // The worker only sleeps on an empty queue.
@@ -396,7 +407,7 @@ namespace GsWorker
             if (queued)
             {
                 wasEmpty = w.queue.empty();
-                w.queue.push_back(Worker::Packet{{}, display});
+                w.queue.push_back(Worker::Packet{{}, display, 0u});
                 ++w.posted;
             }
             else
@@ -408,6 +419,58 @@ namespace GsWorker
             w.workDone.notify_all();
         else if (wasEmpty)
             w.workReady.notify_one();
+    }
+
+    void postInterruptMark(uint64_t mark)
+    {
+        // Behind what VU1 has still to send.
+        if (Vu1Worker::defers())
+        {
+            Vu1Worker::postInterruptMark(mark);
+            return;
+        }
+        Worker &w = worker();
+        const bool queued = w.active.load(std::memory_order_acquire) && std::this_thread::get_id() != w.threadId;
+        bool wasEmpty = false;
+        {
+            std::lock_guard<std::mutex> lock(w.mutex);
+            if (queued)
+            {
+                wasEmpty = w.queue.empty();
+                w.queue.push_back(Worker::Packet{{}, {}, mark});
+                ++w.posted;
+            }
+            else
+            {
+                w.interruptMarkReached = mark;
+            }
+        }
+        if (!queued)
+            w.workDone.notify_all();
+        else if (wasEmpty)
+            w.workReady.notify_one();
+    }
+
+    bool settleInterrupts(Wait why)
+    {
+        if (lagVBlanks() == 0u)
+            return drain(why);
+        Worker &w = worker();
+        if (std::this_thread::get_id() == w.threadId || Vu1Worker::onWorkerThread())
+            return false;
+        const uint64_t mark = g_interruptMarks.load(std::memory_order_acquire);
+        const bool wantStats = statsWanted();
+        const auto start = wantStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        {
+            std::unique_lock<std::mutex> lock(w.mutex);
+            if (w.interruptMarkReached >= mark)
+                return false;
+            w.workDone.wait(lock, [&]
+                            { return w.interruptMarkReached >= mark; });
+        }
+        if (wantStats)
+            countWait(why, start);
+        return true;
     }
 
     bool waitForVBlank(uint64_t tick, Wait why)

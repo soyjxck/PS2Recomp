@@ -68,7 +68,7 @@ namespace ps2_syscalls
             // A GS that may lag: what is queued raises its interrupts under
             // the mask it was sent with.
             if (GsWorker::lagVBlanks() != 0u)
-                GsWorker::drain();
+                GsWorker::settleInterrupts(GsWorker::Wait::Other);
             oldImr = runtime->memory().gs().imr;
             runtime->memory().gs().imr = newImr;
         }

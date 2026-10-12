@@ -63,9 +63,13 @@ namespace GsWorker
     // The guest cannot tell: the paths read as idle either way, the picture
     // is shown with the display registers of the vblank the GS has reached
     // (postVBlank), the library's register writes take their turn in the
-    // queue, and whatever reads the GS's or VU1's state (CSR, a stored image,
-    // VU1's memory) or changes the interrupt mask still waits for the queue.
-    // So emulated timing still does not depend on how fast the host draws.
+    // queue, and whatever reads the GS's or VU1's state still waits for it:
+    // a stored image and VU1's memory for the queue, and CSR, a clear of its
+    // status bits or a change of the interrupt mask for the packets sent so
+    // far that raise SIGNAL or FINISH (settleInterrupts), which is all of the
+    // queue those can tell about. (Many games read CSR every vblank, for the
+    // field.) So emulated timing still does not depend on how fast the host
+    // draws.
     // What changes is the host's: the picture is up to n vblanks late when
     // the host cannot keep up, and not at all when it can.
     uint32_t lagVBlanks();
@@ -74,6 +78,13 @@ namespace GsWorker
     // SIGNAL and FINISH, masked: nothing queued can then interrupt the guest,
     // and what it reads of the two in CSR waits for the queue by itself.
     bool lagsInterrupts();
+
+    // What reading SIGNAL and FINISH in CSR, clearing them or changing their
+    // mask waits for. A GS that never lags: its queue, as drain(). One that
+    // may: only the packets sent so far that raise either (each is followed
+    // in the queue by a mark, postInterruptMark, when it is sent).
+    bool settleInterrupts(Wait why);
+    void postInterruptMark(uint64_t mark);
 
     // The EE's vblank, with the display registers as they are at it, in its
     // place among what was posted.

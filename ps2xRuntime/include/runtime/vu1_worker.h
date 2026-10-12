@@ -39,6 +39,10 @@ namespace Vu1Worker
     // posted (GsWorker::postVBlank).
     void postVBlank(const GsWorker::Display &display);
 
+    // The same for the mark after a packet that raises an interrupt
+    // (GsWorker::postInterruptMark).
+    void postInterruptMark(uint64_t mark);
+
     // Returns when everything posted so far has been handled. True if there
     // was anything to wait for.
     bool drain();
