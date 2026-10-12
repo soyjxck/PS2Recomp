@@ -1864,22 +1864,36 @@ void EeScheduler::processPendingEvents()
         dispatchIrq(false, 0u); // INTC_GS
     }
     m_gsIrqLatched = gsInterrupts;
-    std::deque<EeEvent> pending;
-    {
-        std::lock_guard lock(m_eventMutex);
-        pending.swap(m_events);
-    }
-    for (const EeEvent &event : pending)
-    {
-        processEvent(event);
-    }
 
+    // This runs twice for every piece of guest code the scheduler starts,
+    // and guest code that comes back to it at every turn of a loop (a wait
+    // that reads a timer, resumed in the middle of its function) does so
+    // millions of times a second. Nearly every visit finds nothing posted:
+    // m_checkpointPending says so, set under the lock by whoever posts an
+    // event, so the queue is only looked at when it is set. (Taking the
+    // lock twice and building the queue to swap with, which allocates in
+    // MSVC's library even when empty, was 38% of the EE thread in such a
+    // wait.) An event posted just after the flag is read is found at the
+    // next visit, as one posted just after the swap always was.
+    if (m_checkpointPending.load(std::memory_order_acquire))
     {
-        std::lock_guard lock(m_eventMutex);
-        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-        const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
-        const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
-        m_checkpointPending.store(pendingWork, std::memory_order_release);
+        std::deque<EeEvent> pending;
+        {
+            std::lock_guard lock(m_eventMutex);
+            pending.swap(m_events);
+        }
+        for (const EeEvent &event : pending)
+        {
+            processEvent(event);
+        }
+
+        {
+            std::lock_guard lock(m_eventMutex);
+            const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+            const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
+            const bool pendingWork = !m_events.empty() || cycleEventDue || m_stopRequested.load(std::memory_order_acquire);
+            m_checkpointPending.store(pendingWork, std::memory_order_release);
+        }
     }
     applyPendingPreemption();
 }
