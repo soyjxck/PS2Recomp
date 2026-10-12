@@ -20,6 +20,11 @@ const char *ps2xInputDeviceName();
 // word (0x4000 cross, 0x2000 circle, 0x8000 square, 0x1000 triangle, ...).
 const char *ps2xInputKeyLabel(uint16_t button);
 
+// The same key named in full, for a sentence: "Q", "F5", "Space", "Enter",
+// "Left Shift", "Up Arrow", "Numpad 0", "Left Mouse Button", "Mouse Button
+// 4"; "" when nothing is bound.
+const char *ps2xInputKeyName(uint16_t button);
+
 // The pad as it is now, for a menu of the host's own: a bit set for each
 // button that is down (the pad word's bits, as above), and the left stick
 // past half-way counted as the directional buttons. It reads the devices

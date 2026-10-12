@@ -189,6 +189,45 @@ namespace
         }
     }
 
+    // A key as a sentence can name it: see runtime/ps2_input.h.
+    std::string keyName(int key)
+    {
+        if ((key >= KEY_A && key <= KEY_Z) || (key >= KEY_ZERO && key <= KEY_NINE) || (key >= KEY_F1 && key <= KEY_F12))
+            return keyLabel(key);
+        if (key >= KEY_KP_0 && key <= KEY_KP_9)
+            return "Numpad " + std::to_string(key - KEY_KP_0);
+        switch (key)
+        {
+        case kMouseBase + MOUSE_BUTTON_LEFT: return "Left Mouse Button";
+        case kMouseBase + MOUSE_BUTTON_RIGHT: return "Right Mouse Button";
+        case kMouseBase + MOUSE_BUTTON_MIDDLE: return "Middle Mouse Button";
+        case kMouseBase + MOUSE_BUTTON_SIDE: return "Mouse Button 4";
+        case kMouseBase + MOUSE_BUTTON_EXTRA: return "Mouse Button 5";
+        case KEY_SPACE: return "Space";
+        case KEY_ENTER: return "Enter";
+        case KEY_TAB: return "Tab";
+        case KEY_ESCAPE: return "Escape";
+        case KEY_BACKSPACE: return "Backspace";
+        case KEY_UP: return "Up Arrow";
+        case KEY_DOWN: return "Down Arrow";
+        case KEY_LEFT: return "Left Arrow";
+        case KEY_RIGHT: return "Right Arrow";
+        case KEY_LEFT_SHIFT: return "Left Shift";
+        case KEY_RIGHT_SHIFT: return "Right Shift";
+        case KEY_LEFT_CONTROL: return "Left Ctrl";
+        case KEY_RIGHT_CONTROL: return "Right Ctrl";
+        case KEY_LEFT_ALT: return "Left Alt";
+        case KEY_RIGHT_ALT: return "Right Alt";
+        case KEY_INSERT: return "Insert";
+        case KEY_DELETE: return "Delete";
+        case KEY_HOME: return "Home";
+        case KEY_END: return "End";
+        case KEY_PAGE_UP: return "Page Up";
+        case KEY_PAGE_DOWN: return "Page Down";
+        default: return "";
+        }
+    }
+
     // The keys of [input] <name>, or of `otherwise` where the file has none.
     Keys bound(const char *name, const char *otherwise)
     {
@@ -214,6 +253,7 @@ namespace
             uint16_t mask;
             Keys keys;
             std::string label; // of the first key, for a prompt
+            std::string name;  // and for a sentence
         };
         std::vector<Button> buttons;
         Keys stick[4]; // up, down, left, right
@@ -243,7 +283,10 @@ namespace
             };
             for (Button &button : buttons)
                 if (!button.keys.empty())
+                {
                     button.label = keyLabel(button.keys.front());
+                    button.name = keyName(button.keys.front());
+                }
             stick[0] = bound("stick_up", "w");
             stick[1] = bound("stick_down", "s");
             stick[2] = bound("stick_left", "a");
@@ -495,6 +538,14 @@ const char *ps2xInputKeyLabel(uint16_t button)
     for (const Bindings::Button &bound : bindings().buttons)
         if (bound.mask == button)
             return bound.label.c_str();
+    return "";
+}
+
+const char *ps2xInputKeyName(uint16_t button)
+{
+    for (const Bindings::Button &bound : bindings().buttons)
+        if (bound.mask == button)
+            return bound.name.c_str();
     return "";
 }
 
