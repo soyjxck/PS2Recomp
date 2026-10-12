@@ -1284,11 +1284,15 @@ void register_ps2_gs_tests()
             // The texture at `tbp`, 128 texels wide and two to the
             // `rowsLog2` high, its first `rows` rows (all of them if 0) drawn
             // one texel a pixel into the frame at `fbp`; returns the frame.
+            // (The CLUT's base when none is given is kCbp, said in the body:
+            // MSVC takes no local in a default argument, constant or not.)
             const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp, uint32_t rows = 0u, uint64_t clamp = 0ull,
-                                  uint32_t cbp = kCbp)
+                                  uint32_t cbp = ~0u)
             {
                 if (rows == 0u)
                     rows = 1u << rowsLog2;
+                if (cbp == ~0u)
+                    cbp = kCbp;
                 gs.writeRegister(GS_REG_FRAME_1, static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(kWidth) << 16) |
                                                      (static_cast<uint64_t>(GS_PSM_CT32) << 24));
                 gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
