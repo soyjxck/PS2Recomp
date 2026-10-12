@@ -1025,7 +1025,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1062,7 +1062,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(x) / 16.0f;
         vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
+        vtx.z = static_cast<double>(z);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1096,7 +1096,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>((hi >> 4) & 0xFFFFFF);
+        vtx.z = static_cast<double>((hi >> 4) & 0xFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;
@@ -1127,7 +1127,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
         vtx.x = static_cast<float>(lo & 0xFFFF) / 16.0f;
         vtx.y = static_cast<float>((lo >> 32) & 0xFFFF) / 16.0f;
-        vtx.z = static_cast<float>(hi & 0xFFFFFFFF);
+        vtx.z = static_cast<double>(hi & 0xFFFFFFFF);
         vtx.r = m_curR;
         vtx.g = m_curG;
         vtx.b = m_curB;

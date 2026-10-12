@@ -3295,7 +3295,7 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
                 }
                 const double z = (v0.z + (v1.z - v0.z) * t);
                 const int fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-                p.write(x0, FastPipeline::rowOf(p.frame, y0), FastPipeline::rowOf(p.depth, y0), static_cast<uint32_t>(z), r, g, b, a, fog);
+                p.write(x0, FastPipeline::rowOf(p.frame, y0), FastPipeline::rowOf(p.depth, y0), gsDepthBits(z), r, g, b, a, fog);
                 if (tally)
                     ++tally->pixels;
             }
@@ -3344,7 +3344,7 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
         for (int i = 0; i < kLanes; ++i)
         {
             block.dx[i] = 0.0f;
-            block.z[i] = static_cast<uint32_t>(v1.z);
+            block.z[i] = gsDepthBits(v1.z);
             block.r[i] = v1.r;
             block.g[i] = v1.g;
             block.b[i] = v1.b;
@@ -3485,7 +3485,7 @@ void GSCpuBackend::RasteriseRows(const PreparedPrimitive &primitive, int yFirst,
             for (int i = 0; i < kLanes; ++i)
                 block.dx[i] = (static_cast<float>(x + i) + 0.5f) - fx2;
             for (int i = 0; i < kLanes; ++i)
-                block.z[i] = static_cast<uint32_t>(rowZ + stepZ * static_cast<double>(block.dx[i]) + 0.5);
+                block.z[i] = gsDepthBits(rowZ + stepZ * static_cast<double>(block.dx[i]) + 0.5);
             if (gouraud)
             {
                 for (int i = 0; i < kLanes; ++i)
@@ -3547,7 +3547,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
 
     if (primitive.sprite)
     {
-        const uint32_t z = static_cast<uint32_t>(v1.z);
+        const uint32_t z = gsDepthBits(v1.z);
         const int r = v1.r, g = v1.g, b = v1.b, a = v1.a;
         const int fog = v1.fog;
         if (!p.tme)
@@ -3800,7 +3800,7 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             const bool probed = probe.set && x == probe.x && y == probe.y && probe.left.load(std::memory_order_relaxed) > 0 &&
                                 probe.left.fetch_sub(1) > 0;
             const uint32_t before = probed ? p.tread32(FastPipeline::unitIn(p.frame, frameRow, x)) : 0u;
-            p.write(x, frameRow, depthRow, static_cast<uint32_t>(z + 0.5), r, g, b, a, fog);
+            p.write(x, frameRow, depthRow, gsDepthBits(z + 0.5), r, g, b, a, fog);
             if (probed)
             {
                 std::fprintf(stderr,

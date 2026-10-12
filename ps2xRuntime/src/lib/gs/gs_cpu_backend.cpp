@@ -1237,7 +1237,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         const auto &ctx = state.context;
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+        WritePixel(state, px, py, gsDepthBits(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
@@ -1570,7 +1570,7 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     int y0 = gsSpriteEdge(v0.y, ctx.xyoffset.ofy);
     int x1 = gsSpriteEdge(v1.x, ctx.xyoffset.ofx);
     int y1 = gsSpriteEdge(v1.y, ctx.xyoffset.ofy);
-    u32 z1 = static_cast<u32>(v1.z);
+    u32 z1 = gsDepthBits(v1.z);
 
     if (x0 > x1)
         std::swap(x0, x1);
@@ -1785,7 +1785,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             }
 
             const uint8_t fog = clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2));
-            WritePixel(state, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+            WritePixel(state, x, y, gsDepthBits(z + 0.5), r, g, b, a, fog);
         }
     }
 }
@@ -1837,7 +1837,7 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+        WritePixel(state, x0, y0, gsDepthBits(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;

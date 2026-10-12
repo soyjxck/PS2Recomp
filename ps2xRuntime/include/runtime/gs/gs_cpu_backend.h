@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_backend.h"
 #include "runtime/gs/gs_texture_page_cache.h"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <mutex>
@@ -17,6 +18,19 @@ namespace GSMem
 namespace GSGpu
 {
     struct Pipeline;
+}
+
+// A depth held or interpolated as a number (GSVertex::z is a double, which
+// holds all 32 bits of a Z; a float does not), as the GS's 32 bits. Past
+// either end it is that end. A cast alone leaves that to the processor: one
+// saturates, another answers 0 for 2^32. The largest Z there is, sent packed,
+// was once stored through a float and so became 2^32: a sprite at it then
+// passed its depth test everywhere on arm64 and nowhere on x86. (Without a
+// branch, for the triangle's lanes; in this order something that is not a
+// number is 0.)
+inline uint32_t gsDepthBits(double z)
+{
+    return static_cast<uint32_t>(std::min(4294967295.0, std::max(0.0, z)));
 }
 
 class GSCpuBackend final : public GSRasterBackend
