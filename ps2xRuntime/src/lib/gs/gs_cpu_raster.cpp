@@ -369,8 +369,12 @@ struct GSCpuBackend::FastPipeline
     int maskU = -1, maskV = -1;
     int lowU = 0, highU = 0, lowV = 0, highV = 0;
     // The decoded copy, when the texture can use one. It never changes.
+    // `decoded` is where texel (0, 0) would be: a copy of part of a texture
+    // has no such texel, and is only ever asked for the ones it has.
     const uint32_t *decoded = nullptr;
+    int decodedStride = 0;                 // texels in a row of it
     DecodedTexture *decodedCopy = nullptr; // what `decoded` is the pixels of
+    int decodedU0 = 0, decodedV0 = 0;      // the texel its first pixel is
     // For an indexed texture sampled from VRAM: the CLUT as it was when the
     // primitive was queued (see ClutSnapshotFor). Without one, the backend's
     // live CLUT is used, on the GS thread only.
@@ -379,7 +383,10 @@ struct GSCpuBackend::FastPipeline
     // the render target.
     int boundsX0 = 0, boundsY0 = 0, boundsX1 = 0, boundsY1 = 0;
     bool textureIsTarget = false;
-    // The texels the primitive can sample (the whole texture when it wraps).
+    // The texels the primitive can sample (the whole texture when it wraps):
+    // where its coordinates are taken to, so with a region mode the part of
+    // the region they reach, which need not be inside the texture's own
+    // rectangle.
     int sampledU0 = 0, sampledV0 = 0, sampledU1 = 0, sampledV1 = 0;
     // The same where a REPEAT axis runs past an end of the texture, as the
     // coordinates are before they wrap (so below 0 or past the size); the
@@ -404,10 +411,26 @@ struct GSCpuBackend::FastPipeline
             std::swap(u0, u1);
         if (v0 > v1)
             std::swap(v0, v1);
-        auto range = [this, slack](float low, float high, int size, uint8_t wrap, int &first, int &last, int &reachFirst, int &reachLast)
+        auto range = [this, slack](float low, float high, int size, uint8_t wrap, int regionMin, int regionMax, int &first, int &last,
+                                   int &reachFirst, int &reachLast)
         {
-            if (!(low > -32768.0f && high < 32768.0f))
+            // REGION_REPEAT keeps the bits of MIN and sets those of MAX:
+            // whatever the coordinates, from MAX to MAX | MIN.
+            if (wrap == 3u)
+            {
+                first = regionMax;
+                last = regionMax | regionMin;
                 return;
+            }
+            if (!(low > -32768.0f && high < 32768.0f))
+            {
+                if (wrap == 2u)
+                {
+                    first = std::min(regionMin, regionMax);
+                    last = std::max(regionMin, regionMax);
+                }
+                return;
+            }
             // sample() reads the texel a coordinate truncates to or, when
             // filtering, the one half a texel before it and the next.
             int lo, hi;
@@ -420,6 +443,14 @@ struct GSCpuBackend::FastPipeline
             {
                 lo = floorToInt(low - slack);
                 hi = static_cast<int>(high + slack);
+            }
+            // REGION_CLAMP holds them between MIN and MAX.
+            if (wrap == 2u)
+            {
+                const int regionLow = std::min(regionMin, regionMax), regionHigh = std::max(regionMin, regionMax);
+                first = regionMin <= regionMax ? std::min(std::max(lo, regionLow), regionHigh) : regionLow;
+                last = regionMin <= regionMax ? std::min(std::max(hi, regionLow), regionHigh) : regionHigh;
+                return;
             }
             if (lo < 0 || hi > size - 1)
             {
@@ -437,8 +468,8 @@ struct GSCpuBackend::FastPipeline
             first = lo;
             last = hi;
         };
-        range(u0, u1, texW, wrapU, sampledU0, sampledU1, reachU0, reachU1);
-        range(v0, v1, texH, wrapV, sampledV0, sampledV1, reachV0, reachV1);
+        range(u0, u1, texW, wrapU, minU, maxU, sampledU0, sampledU1, reachU0, reachU1);
+        range(v0, v1, texH, wrapV, minV, maxV, sampledV0, sampledV1, reachV0, reachV1);
     }
 
     bool setup(GSCpuBackend &owner, const GSDrawState &state);
@@ -468,18 +499,19 @@ struct GSCpuBackend::FastPipeline
                 return;
             }
         }
-        // Region wrap modes address texels outside the texture's own
-        // rectangle; those sample VRAM.
-        if (wrapU < 2u && wrapV < 2u)
+        // The copy has the texels the primitive samples, wherever its wrap
+        // mode takes its coordinates (DecodedTextureFor sees to that).
+        decodedU0 = decodedV0 = 0;
+        if (const DecodedTexture *copy = backend->DecodedTextureFor(*this))
         {
-            if (const DecodedTexture *copy = backend->DecodedTextureFor(*this))
-            {
-                decoded = copy->pixels.data();
-                decodedCopy = const_cast<DecodedTexture *>(copy);
-                // The copy ends with its image; nothing the primitive samples
-                // is further down.
-                highV = std::min(highV, copy->height - 1);
-            }
+            decodedCopy = const_cast<DecodedTexture *>(copy);
+            decodedStride = copy->width;
+            decoded = reinterpret_cast<const uint32_t *>(
+                reinterpret_cast<uintptr_t>(copy->pixels.data()) -
+                (static_cast<uintptr_t>(decodedV0) * static_cast<uintptr_t>(copy->width) + static_cast<uintptr_t>(decodedU0)) * sizeof(uint32_t));
+            // The copy ends with its image; nothing the primitive samples
+            // is further down.
+            highV = std::min(highV, decodedV0 + copy->height - 1);
         }
         if (!decoded && texKind >= TextureKind::Index8)
             clut = backend->ClutSnapshotFor(*this);
@@ -543,7 +575,7 @@ struct GSCpuBackend::FastPipeline
             v = v < lowV ? lowV : (v > highV ? highV : v);
         }
         if (decoded)
-            return decoded[v * texW + u];
+            return decoded[v * decodedStride + u];
         return fetch(u, v);
     }
 
@@ -1011,7 +1043,7 @@ struct GSCpuBackend::FastPipeline
     {
         uint32_t texels[N];
         const uint32_t *const pixels = decoded;
-        const int width = texW;
+        const int width = decodedStride;
         auto wrap = [&](int32_t *u, int32_t *v)
         {
             if (regionRepeat) [[unlikely]]
@@ -1552,18 +1584,30 @@ const uint32_t *GSCpuBackend::ClutSnapshotFor(FastPipeline &p)
     return &copy;
 }
 
-// A decoded copy of the whole texture when every block of it holds uploaded
-// images and nothing drawn: several images side by side, a part of a larger
-// one addressed by a base of its own, an image stored as one format and
-// looked at as another (a page of 8-bit texels sent as 32-bit pixels). What
-// the blocks hold is known by number (MarkUploaded), so the copy is found by
-// those numbers and how the texture is looked at, and the same images stored
-// again the same way are the same copy without a texel being read: a game
-// that swaps whole pages of textures in and out during a frame decodes each
-// page once.
+// A decoded copy of a texture that is not one image, when every block of it
+// holds uploaded images and nothing drawn: several images side by side, a
+// part of a larger one addressed by a base of its own, an image stored as
+// one format and looked at as another (a page of 8-bit texels sent as 32-bit
+// pixels). What the blocks hold is known by number (MarkUploaded), so the
+// copy is found by those numbers and how the texture is looked at, and the
+// same images stored again the same way are the same copy without a texel
+// being read: a game that swaps whole pages of textures in and out during a
+// frame decodes each page once.
 //
-// The numbers are put together again only when one of the texture's pages
-// has been written since they last were.
+// The whole texture if it can be: every primitive that samples inside it
+// then shares one copy, and the graphics card one texture (a model whose
+// triangles had a texture each would be drawn a triangle at a time).
+//
+// Failing that, the part the primitive samples, chosen so that primitives
+// share parts: on each axis the smallest span of a power of two of texels,
+// starting at a multiple of its length, that has all the primitive samples
+// (never less than a page, never more of the texture's own rectangle than
+// there is). That is for a texture said to be 1024 by 1024 of which one
+// corner was ever uploaded, an image smaller than the size its texture is
+// given, a region that lies beyond the texture's own rectangle; and for a
+// texture whose rectangle takes in neighbours that keep being replaced,
+// which as a whole would be a new texture every time: one that has been
+// decoded whole kMostWholeDecodes times is not decoded whole again.
 //
 // PS2X_GS_BLOCK_COPIES=0 turns this off, to compare.
 const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline &p, bool &decodedNow)
@@ -1573,18 +1617,61 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline
         const char *value = std::getenv("PS2X_GS_BLOCK_COPIES");
         return value == nullptr || value[0] != '0';
     }();
+    if (!enabled || !p.texture.table || p.texW <= 0 || p.texH <= 0 || p.sampledU0 < 0 || p.sampledV0 < 0 ||
+        p.sampledU1 < p.sampledU0 || p.sampledV1 < p.sampledV0 || p.sampledU1 > 2047 || p.sampledV1 > 2047)
+        return nullptr;
+
+    constexpr uint32_t kMostWholeDecodes = 16u;
+    if (p.sampledU1 < p.texW && p.sampledV1 < p.texH)
+    {
+        if (const DecodedTexture *copy = BlocksCopy(p, 0, 0, p.texW - 1, p.texH - 1, decodedNow, kMostWholeDecodes))
+            return copy;
+    }
+
+    const auto span = [](int first, int last, int size, int page, int &from, int &to)
+    {
+        int length = last < size ? std::min(page, size) : page;
+        while ((first & ~(length - 1)) != (last & ~(length - 1)))
+            length <<= 1;
+        from = first & ~(length - 1);
+        to = from + length - 1;
+    };
+    int u0 = 0, u1 = 0, v0 = 0, v1 = 0;
+    span(p.sampledU0, p.sampledU1, p.texW, 1 << p.texture.pageWidthShift, u0, u1);
+    span(p.sampledV0, p.sampledV1, p.texH, 1 << p.texture.pageHeightShift, v0, v1);
+    if (u0 == 0 && v0 == 0 && u1 == p.texW - 1 && v1 == p.texH - 1)
+        return nullptr; // the whole texture, turned away above
+    const DecodedTexture *copy = BlocksCopy(p, u0, v0, u1, v1, decodedNow);
+    if (copy != nullptr)
+    {
+        p.decodedU0 = u0;
+        p.decodedV0 = v0;
+    }
+    return copy;
+}
+
+// The copy of those texels of the texture, if their blocks are all known.
+// The numbers are put together again only when one of the pages they are in
+// has been written since they last were. With `mostDecodes`, no more copies
+// than that are ever made of these texels: after that many they are only
+// found, not decoded.
+const GSCpuBackend::DecodedTexture *GSCpuBackend::BlocksCopy(FastPipeline &p, int x0, int y0, int x1, int y1, bool &decodedNow,
+                                                             uint32_t mostDecodes)
+{
     constexpr int kMostTexels = 1024 * 1024;
-    if (!enabled || !p.texture.table || p.texW <= 0 || p.texH <= 0 || p.texW * p.texH > kMostTexels)
+    const int width = x1 - x0 + 1, height = y1 - y0 + 1;
+    if (width * height > kMostTexels)
         return nullptr;
     const uint64_t viewKey = mixKey((static_cast<uint64_t>(p.tbp0) << 32) | (static_cast<uint64_t>(p.tbw) << 8) | p.texPsm,
-                                    (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
-    if (m_blocksViews.size() > 4096u)
+                                    (static_cast<uint64_t>(x0) << 48) | (static_cast<uint64_t>(y0) << 32) |
+                                        (static_cast<uint64_t>(x1) << 16) | static_cast<uint64_t>(y1));
+    if (m_blocksViews.size() > 16384u)
         m_blocksViews.clear();
     BlocksView &view = m_blocksViews[viewKey];
-    if (view.serial == 0u || PagesWrittenSince(p.texture, 0, 0, p.texW - 1, p.texH - 1, view.serial))
+    if (view.serial == 0u || PagesWrittenSince(p.texture, x0, y0, x1, y1, view.serial))
     {
         view.serial = m_writeSerial;
-        view.key = BlocksKey(p.texture, p.texW, p.texH);
+        view.key = BlocksKey(p.texture, x0, y0, x1, y1);
     }
     if (view.key == 0u)
     {
@@ -1601,7 +1688,7 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline
             {
                 uint64_t count = 0;
                 uint32_t tbp0 = 0, tbw = 0, psm = 0;
-                int width = 0, height = 0, blocks = 0, never = 0, drawn = 0, pieces = 0;
+                int x0 = 0, y0 = 0, x1 = 0, y1 = 0, blocks = 0, never = 0, drawn = 0, pieces = 0;
             };
             static std::unordered_map<uint64_t, Why> whys;
             static uint64_t turnedAway = 0;
@@ -1611,14 +1698,16 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline
                 why.tbp0 = p.tbp0;
                 why.tbw = p.tbw;
                 why.psm = p.texPsm;
-                why.width = p.texW;
-                why.height = p.texH;
+                why.x0 = x0;
+                why.y0 = y0;
+                why.x1 = x1;
+                why.y1 = y1;
                 why.blocks = why.never = why.drawn = why.pieces = 0;
                 const int tileW = p.texture.unitBits == 32u ? 8 : (p.texture.unitBits == 4u ? 32 : 16);
                 const int tileH = p.texture.unitBits >= 16u ? 8 : 16;
-                for (int y = 0; y < p.texH; y += tileH)
+                for (int y = y0 & ~(tileH - 1); y <= y1; y += tileH)
                 {
-                    for (int x = 0; x < p.texW; x += tileW)
+                    for (int x = x0 & ~(tileW - 1); x <= x1; x += tileW)
                     {
                         const uint32_t block = ((p.texture.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * p.texture.unitBits) >> 11) & 0x3FFFu;
                         ++why.blocks;
@@ -1638,12 +1727,13 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline
                     most.push_back(&entry.second);
                 std::sort(most.begin(), most.end(), [](const Why *left, const Why *right)
                           { return left->count > right->count; });
-                std::fprintf(stderr, "[gs-blocks] %llu lookups of %zu textures that are not all uploaded images:\n",
+                std::fprintf(stderr, "[gs-blocks] %llu times %zu textures or parts of one were not all uploaded images:\n",
                              static_cast<unsigned long long>(turnedAway), most.size());
                 for (size_t i = 0; i < most.size() && i < 12u; ++i)
-                    std::fprintf(stderr, "[gs-blocks]   %9llu  tbp0=%04x tbw=%u psm=%02x %dx%d: of %d blocks %d never uploaded, %d drawn over, %d not known (cut short, or part of a block)\n",
+                    std::fprintf(stderr, "[gs-blocks]   %9llu  tbp0=%04x tbw=%u psm=%02x (%d,%d)-(%d,%d): of %d blocks %d never uploaded, %d drawn over, %d not known (cut short, or part of a block)\n",
                                  static_cast<unsigned long long>(most[i]->count), most[i]->tbp0, most[i]->tbw, most[i]->psm,
-                                 most[i]->width, most[i]->height, most[i]->blocks, most[i]->never, most[i]->drawn, most[i]->pieces);
+                                 most[i]->x0, most[i]->y0, most[i]->x1, most[i]->y1, most[i]->blocks, most[i]->never, most[i]->drawn,
+                                 most[i]->pieces);
             }
         }
         return nullptr;
@@ -1651,23 +1741,26 @@ const GSCpuBackend::DecodedTexture *GSCpuBackend::DecodedFromBlocks(FastPipeline
 
     uint64_t key = mixKey(ConversionKey(p), view.key);
     key = mixKey(key, (1ull << 63) | (static_cast<uint64_t>(p.texPsm) << 48) | (static_cast<uint64_t>(p.tbw) << 32) |
-                          (static_cast<uint64_t>(p.texW) << 16) | static_cast<uint64_t>(p.texH));
+                          (static_cast<uint64_t>(width) << 16) | static_cast<uint64_t>(height));
+    if (mostDecodes != 0u && view.decodes >= mostDecodes && m_decodedTextures.find(key) == m_decodedTextures.end())
+        return nullptr;
     const auto [it, inserted] = m_decodedTextures.try_emplace(key);
     DecodedTexture &copy = it->second;
     copy.lastUsed = ++m_decodedUseClock;
     if (inserted)
     {
         decodedNow = true;
+        ++view.decodes;
         // The images are on their way into VRAM, if they are not there yet.
-        FlushPrimitivesTouching(p.texture, 0, 0, p.texW - 1, p.texH - 1, false, "texture");
-        copy.width = p.texW;
-        copy.height = p.texH;
-        copy.pixels.assign(static_cast<size_t>(p.texW) * static_cast<size_t>(p.texH), 0u);
-        for (int v = 0; v < p.texH; ++v)
+        FlushPrimitivesTouching(p.texture, x0, y0, x1, y1, false, "texture");
+        copy.width = width;
+        copy.height = height;
+        copy.pixels.assign(static_cast<size_t>(width) * static_cast<size_t>(height), 0u);
+        for (int v = y0; v <= y1; ++v)
         {
-            uint32_t *out = copy.pixels.data() + static_cast<size_t>(v) * static_cast<size_t>(p.texW);
-            for (int u = 0; u < p.texW; ++u)
-                out[u] = p.fetch(u, v);
+            uint32_t *out = copy.pixels.data() + static_cast<size_t>(v - y0) * static_cast<size_t>(width);
+            for (int u = x0; u <= x1; ++u)
+                out[u - x0] = p.fetch(u, v);
         }
         m_decodedBytes += copy.pixels.size() * sizeof(uint32_t);
         ForgetOldDecodedTextures();

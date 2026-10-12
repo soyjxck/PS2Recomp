@@ -115,7 +115,8 @@ private:
     bool HasQueuedPrimitives() const;
     const DecodedTexture *DecodedTextureFor(FastPipeline &pipeline);
     const DecodedTexture *DecodedFromBlocks(FastPipeline &pipeline, bool &decodedNow);
-    uint64_t BlocksKey(const GSMem::SurfaceLayout &layout, int width, int height) const;
+    const DecodedTexture *BlocksCopy(FastPipeline &pipeline, int x0, int y0, int x1, int y1, bool &decodedNow, uint32_t mostDecodes = 0);
+    uint64_t BlocksKey(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1) const;
     void ForgetOldDecodedTextures();
     uint64_t ConversionKey(const FastPipeline &pipeline);
     const uint32_t *ClutSnapshotFor(FastPipeline &pipeline);
@@ -203,6 +204,7 @@ private:
     {
         uint64_t key = 0; // 0: not all of it is uploaded images
         uint64_t serial = 0;
+        uint32_t decodes = 0; // copies made of it: how often it was something new
     };
     std::unordered_map<uint64_t, BlocksView> m_blocksViews;
     // An image that arrives in pieces: the pieces so far as one number.

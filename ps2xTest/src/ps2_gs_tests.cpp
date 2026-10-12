@@ -1281,11 +1281,13 @@ void register_ps2_gs_tests()
                 }
                 return bytes;
             };
-            // The texture at `tbp`, 128 texels wide and `rows` high, drawn
+            // The texture at `tbp`, 128 texels wide and two to the
+            // `rowsLog2` high, its first `rows` rows (all of them if 0) drawn
             // one texel a pixel into the frame at `fbp`; returns the frame.
-            const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp)
+            const auto draw = [&](uint32_t tbp, uint32_t rowsLog2, uint32_t fbp, uint32_t rows = 0u, uint64_t clamp = 0ull)
             {
-                const uint32_t rows = 1u << rowsLog2;
+                if (rows == 0u)
+                    rows = 1u << rowsLog2;
                 gs.writeRegister(GS_REG_FRAME_1, static_cast<uint64_t>(fbp) | (static_cast<uint64_t>(kWidth) << 16) |
                                                      (static_cast<uint64_t>(GS_PSM_CT32) << 24));
                 gs.writeRegister(GS_REG_ZBUF_1, 300ull | (1ull << 32));
@@ -1294,7 +1296,7 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
                 gs.writeRegister(GS_REG_ALPHA_1, 0ull);
                 gs.writeRegister(GS_REG_TEX1_1, 0ull);
-                gs.writeRegister(GS_REG_CLAMP_1, 0ull);
+                gs.writeRegister(GS_REG_CLAMP_1, clamp);
                 gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(tbp) | (static_cast<uint64_t>(kWidth) << 14) |
                                                     (static_cast<uint64_t>(GS_PSM_T8) << 20) | (7ull << 26) |
                                                     (static_cast<uint64_t>(rowsLog2) << 30) | (1ull << 34) | (1ull << 35) |
@@ -1421,6 +1423,45 @@ void register_ps2_gs_tests()
             poke(kPiecesPage, 1u);
             drawInto(kPiecesPage);
             t.IsTrue(draw(kPiecesPage * 32u, 6u, 288u) == whole, "the picture VRAM gives");
+
+            // --- What lies beside the sampled part does not matter: half of
+            // this texture was never an image, and a primitive that samples
+            // the other half is drawn from a copy of that half.
+            constexpr uint32_t kPartPage = 130u;
+            upload(kPartPage * 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, bottom);
+            drawInto(kPartPage + 1u);
+            const std::vector<uint32_t> upper = draw(kPartPage * 32u, 7u, 320u, 64u);
+            poke(kPartPage, 2u);
+            t.IsTrue(draw(kPartPage * 32u, 7u, 336u, 64u) == upper, "the half that is all images is drawn from a copy of it");
+            poke(kPartPage, 2u);
+            const std::vector<uint32_t> both = draw(kPartPage * 32u, 7u, 352u);
+            poke(kPartPage, 2u);
+            t.IsTrue(draw(kPartPage * 32u, 7u, 368u) != both, "the whole of it is not: it is sampled from VRAM");
+            poke(kPartPage, 2u);
+
+            // --- Region modes take the coordinates somewhere else, and that
+            // is where the copy has to be: here across to texels 64..95
+            // (REGION_REPEAT, the low five bits kept and 64 set) and down
+            // between rows 70 and 100 (REGION_CLAMP), all of it in the second
+            // page. The first page was never an image.
+            constexpr uint32_t kRegionPage = 170u;
+            constexpr uint64_t kRegion = 3ull | (2ull << 2) | (31ull << 4) | (64ull << 14) | (70ull << 24) | (100ull << 34);
+            drawInto(kRegionPage);
+            upload(kRegionPage * 32u + 32u, 1u, GS_PSM_CT32, 0u, 0u, 64u, 32u, other);
+            const std::vector<uint32_t> region = draw(kRegionPage * 32u, 7u, 384u, 0u, kRegion);
+            uint32_t regionColours = 0u;
+            for (size_t i = 1; i < region.size(); ++i)
+                regionColours += region[i] != region[0] ? 1u : 0u;
+            t.IsTrue(regionColours > 1000u, "sanity: the region should be drawn, and be many colours");
+            t.IsTrue(std::equal(region.begin(), region.begin() + 128, region.begin() + 128 * 70),
+                     "sanity: rows above the region repeat its first row");
+            poke(kRegionPage, 2u);
+            t.IsTrue(draw(kRegionPage * 32u, 7u, 400u, 0u, kRegion) == region, "a region is drawn from a copy of the texels it is taken to");
+            poke(kRegionPage, 2u);
+            drawInto(kRegionPage + 1u);
+            t.IsTrue(draw(kRegionPage * 32u, 7u, 416u, 0u, kRegion) == region, "the picture VRAM gives");
+            poke(kRegionPage, 2u);
+            t.IsTrue(draw(kRegionPage * 32u, 7u, 432u, 0u, kRegion) != region, "which it follows once its page has been drawn into");
         });
 
         tc.Run("fullscreen display copy tracks the preferred presentation source frame", [](TestCase &t)

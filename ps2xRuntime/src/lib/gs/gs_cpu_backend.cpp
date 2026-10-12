@@ -1825,19 +1825,19 @@ void GSCpuBackend::NoteBlocksOfPieces(const GSMem::SurfaceLayout &layout, int x0
     }
 }
 
-// The blocks a texture of that size is made of, as one number: the same
+// The blocks those texels of a surface are in, as one number: the same
 // whenever they hold the same bytes, 0 unless every one of them holds
 // uploaded images that nothing was drawn over.
-uint64_t GSCpuBackend::BlocksKey(const GSMem::SurfaceLayout &layout, int width, int height) const
+uint64_t GSCpuBackend::BlocksKey(const GSMem::SurfaceLayout &layout, int x0, int y0, int x1, int y1) const
 {
-    if (!layout.table || width <= 0 || height <= 0)
+    if (!layout.table || x0 < 0 || y0 < 0 || x1 < x0 || y1 < y0)
         return 0u;
     const int tileW = layout.unitBits == 32u ? 8 : (layout.unitBits == 4u ? 32 : 16);
     const int tileH = layout.unitBits >= 16u ? 8 : 16;
     uint64_t key = 0x6A09E667F3BCC908ull;
-    for (int y = 0; y < height; y += tileH)
+    for (int y = y0 & ~(tileH - 1); y <= y1; y += tileH)
     {
-        for (int x = 0; x < width; x += tileW)
+        for (int x = x0 & ~(tileW - 1); x <= x1; x += tileW)
         {
             const uint32_t block = ((layout.unit(static_cast<uint32_t>(x), static_cast<uint32_t>(y)) * layout.unitBits) >> 11) & 0x3FFFu;
             const uint64_t content = m_blockContent[block];

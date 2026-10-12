@@ -1000,6 +1000,9 @@ void GSCpuBackend::GpuTexture(PreparedPrimitive &q, const GSContext &ctx, GSGpu:
         gpu.textureMaxAlpha = copy.gpuMaxAlpha;
         state.texture = copy.gpuTexture;
         state.textureMode = GSGpu::TextureTexels;
+        // It may be a part of the texture, from that texel on.
+        state.texOrigin[0] = static_cast<int16_t>(p.decodedU0);
+        state.texOrigin[1] = static_cast<int16_t>(p.decodedV0);
         state.texExtent[0] = static_cast<int16_t>(copy.width);
         state.texExtent[1] = static_cast<int16_t>(copy.height);
         ++gpu.statCopyTextures;
