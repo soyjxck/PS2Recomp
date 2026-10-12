@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -361,19 +362,56 @@ Run::PendingFlags *Run::commitFlags(PendingFlags *head, PendingFlags *tail, uint
     if (end == head)
         return head;
 
-    // Usually every one is an FMAC result: the last sets MAC and the current
-    // status bits, and all of them add to the sticky bits. That loop vectorizes.
-    uint32_t conditions = 0u, other = 0u;
+    // One pass over what is due: what any of them writes, and the conditions
+    // of those that set status bits (FMAC results; a CLIP's value is no
+    // condition). A program that clips reads the CLIP flags once a vertex,
+    // and what is due then is some forty FMAC results and one CLIP.
+    uint32_t writes = 0u, conditions = 0u;
+#if PS2_VU_PROGRAM_SSE
+    {
+        static_assert(sizeof(PendingFlags) == 16u && offsetof(PendingFlags, writes) == 4u &&
+                      offsetof(PendingFlags, value) == 8u && offsetof(PendingFlags, sticky) == 12u);
+        const __m128i setsStatus = _mm_set_epi32(0, 0, 2, 0);
+        __m128i all = _mm_setzero_si128(), ofStatus = _mm_setzero_si128();
+        for (const PendingFlags *entry = head; entry != end; ++entry)
+        {
+            const __m128i fields = _mm_loadu_si128(reinterpret_cast<const __m128i *>(entry));
+            all = _mm_or_si128(all, fields);
+            const __m128i sets = _mm_shuffle_epi32(_mm_cmpeq_epi32(_mm_and_si128(fields, setsStatus), setsStatus), _MM_SHUFFLE(1, 1, 1, 1));
+            ofStatus = _mm_or_si128(ofStatus, _mm_and_si128(fields, sets));
+        }
+        writes = static_cast<uint32_t>(_mm_extract_epi32(all, 1));
+        conditions = static_cast<uint32_t>(_mm_extract_epi32(ofStatus, 2)) | static_cast<uint32_t>(_mm_extract_epi32(ofStatus, 3));
+    }
+#else
     for (const PendingFlags *entry = head; entry != end; ++entry)
     {
-        conditions |= entry->value | entry->sticky;
-        other |= entry->writes ^ 3u;
+        writes |= entry->writes;
+        conditions |= (entry->value | entry->sticky) & (0u - ((entry->writes >> 1u) & 1u));
     }
-    if (other == 0u)
+#endif
+    if ((writes & 4u) == 0u)
     {
-        const uint32_t now = statusOf(end[-1].value);
-        m_state.mac = end[-1].value;
-        m_state.status = (m_state.status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
+        // No FSSET among them, so nothing depends on their order but which
+        // came last: MAC, the current status bits and CLIP are the last
+        // result that writes each, and every FMAC result adds to the sticky
+        // bits.
+        const auto last = [end](uint32_t kind)
+        {
+            const PendingFlags *entry = end - 1;
+            while ((entry->writes & kind) == 0u)
+                --entry;
+            return entry->value;
+        };
+        if ((writes & 1u) != 0u)
+            m_state.mac = last(1u);
+        if ((writes & 2u) != 0u)
+        {
+            const uint32_t now = statusOf(last(2u));
+            m_state.status = (m_state.status & 0xFF0u) | now | ((now | statusOf(conditions)) << 6u);
+        }
+        if ((writes & 8u) != 0u)
+            m_state.clip = last(8u);
         return end;
     }
 
