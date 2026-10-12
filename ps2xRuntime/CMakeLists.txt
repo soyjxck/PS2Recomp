@@ -485,9 +485,23 @@ if(PS2X_VU_AOT_IMAGES OR PS2X_VU_AOT_PAIR_IMAGES OR PS2X_VU_AOT_LOOP_IMAGES)
 
     if(PS2X_VU_AOT_BY_CLANG_CL)
         # What the runtime's own sources get in a release build
-        # (cmake/ReleaseMode.cmake), less what only MSVC has.
-        set(PS2X_VU_AOT_CLANG_FLAGS /nologo /c /TP /std:c++20 /EHsc /MD /O2 /Ob2 /Oi /Gy /GF /Zc:inline
-            /fp:precise /GS- /DNDEBUG -Wno-everything)
+        # (cmake/ReleaseMode.cmake), less what only MSVC has, and with the
+        # C runtime the project links (the DLL one unless it says otherwise).
+        # -ffp-contract=off: under /fp:precise clang makes one fused
+        # operation of a product and a sum written as two (x*x + y*y), and
+        # cl does not. The VU's product sums ask for fusing themselves
+        # (std::fma, the intrinsics) and keep it; what would change is the
+        # arithmetic written plainly, ESADD, ELENG and their like and the
+        # polynomials of EATAN, ESIN and EEXP in ps2_vu1_lower.inl. A
+        # compiled block has to round as the interpreter in the same
+        # program does, and where both compilers emit one inline function
+        # the linker keeps either.
+        set(PS2X_VU_AOT_CLANG_CRT /MD)
+        if(CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+            set(PS2X_VU_AOT_CLANG_CRT /MT)
+        endif()
+        set(PS2X_VU_AOT_CLANG_FLAGS /nologo /c /TP /std:c++20 /EHsc ${PS2X_VU_AOT_CLANG_CRT} /O2 /Ob2 /Oi /Gy /GF
+            /Zc:inline /fp:precise /clang:-ffp-contract=off /GS- /DNDEBUG -Wno-everything)
         if(PS2X_X86_AVX2)
             list(APPEND PS2X_VU_AOT_CLANG_FLAGS /arch:AVX2 -mfma)
         endif()
