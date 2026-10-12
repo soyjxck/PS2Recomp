@@ -661,6 +661,63 @@ struct GSCpuBackend::FastPipeline
                row.table[ux & ((1u << layout.pageWidthShift) - 1u)];
     }
 
+    // sample() for the pixels of one row of a sprite, when the texels are
+    // 32-bit ones read straight from VRAM (no decoded copy) with the linear
+    // filter and no REGION_REPEAT: the row's coordinate is one for the whole
+    // row, so the two rows of texels it falls between are found once, and a
+    // pixel is left with its two columns in each. The same four reads and
+    // the same arithmetic as sample(), read by read: a primitive that samples
+    // what it is drawing sees what sample() would.
+    bool samplesInRows() const
+    {
+        return linear && !regionRepeat && decoded == nullptr && texKind == TextureKind::Direct32;
+    }
+
+    struct TexelRows
+    {
+        Row upper, lower; // texel rows v0 and v0 + 1, wrapped as texel() wraps them
+        uint32_t wy;      // the weight of the lower one, of 256
+    };
+
+    [[gnu::always_inline]] inline TexelRows texelRows(float texV) const
+    {
+        const float sv = texV - 0.5f;
+        const int v0 = floorToInt(sv);
+        int upper = v0 & maskV;
+        int lower = (v0 + 1) & maskV;
+        upper = upper < lowV ? lowV : (upper > highV ? highV : upper);
+        lower = lower < lowV ? lowV : (lower > highV ? highV : lower);
+        return {rowOf(texture, upper), rowOf(texture, lower), static_cast<uint32_t>((sv - static_cast<float>(v0)) * 256.0f + 0.5f)};
+    }
+
+    [[gnu::always_inline]] inline uint32_t sampleInRows(float texU, const TexelRows &rows) const
+    {
+        const float su = texU - 0.5f;
+        const int u0 = floorToInt(su);
+        int left = u0 & maskU;
+        int right = (u0 + 1) & maskU;
+        left = left < lowU ? lowU : (left > highU ? highU : left);
+        right = right < lowU ? lowU : (right > highU ? highU : right);
+        const uint32_t c00 = read32(vram, unitIn(texture, rows.upper, left));
+        const uint32_t c10 = read32(vram, unitIn(texture, rows.upper, right));
+        const uint32_t c01 = read32(vram, unitIn(texture, rows.lower, left));
+        const uint32_t c11 = read32(vram, unitIn(texture, rows.lower, right));
+        if (c00 == c10 && c00 == c01 && c00 == c11)
+            return c00;
+        const uint32_t wx = static_cast<uint32_t>((su - static_cast<float>(u0)) * 256.0f + 0.5f);
+        return lerpColor(lerpColor(c00, c10, wx), lerpColor(c01, c11, wx), rows.wy);
+    }
+
+    // What write() does without choosing: every pixel blended into a 32-bit
+    // frame in VRAM and tested against a depth it does not store, MODULATE,
+    // with no fog, alpha test, destination alpha test or mask in the way.
+    // The state of a blur of the frame into itself.
+    bool blendsTestedInto32() const
+    {
+        return target == vram && targetMask == kVramMask && frameKind == FrameKind::C32 && !fge && !alphaTest && !date &&
+               fbmsk == 0u && abe && !pabe && ztst >= 2u && zmask && tfx == 0u;
+    }
+
     [[gnu::always_inline]] inline void write(int x, const Row &frameRow, const Row &depthRow, uint32_t z, int r, int g, int b, int a, int fog) const
     {
         if (fge)
@@ -3380,6 +3437,83 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             return p.fst ? static_cast<float>(clampInt(static_cast<int>((coordinate * 16.0f) + 0.5f), 0, 0xFFFF)) * 0.0625f
                          : coordinate;
         };
+        // A sprite that blurs the frame into itself is 229,000 pixels of
+        // this once or twice a frame, one thread's work with the rest of
+        // the pool waiting for it. For that state the loop below is
+        // sample(), combine() and write() with what they ask of the
+        // pipeline for every pixel asked once: the texel rows found a row
+        // at a time (sampleInRows), MODULATE, the frame read, the depth
+        // test, the blend and the store. The pixels are the same and in the
+        // same order, each stored before the next is sampled.
+        if (p.samplesInRows() && p.blendsTestedInto32())
+        {
+            const bool tcc = p.tcc, fba = p.fba, greaterOrEqual = p.ztst == 2u;
+            const DepthKind depthKind = p.depthKind;
+            const int csel = p.csel, fix = p.fix;
+            const int maskAS = p.maskAS, maskAD = p.maskAD, maskBS = p.maskBS, maskBD = p.maskBD, maskDS = p.maskDS, maskDD = p.maskDD;
+            for (int y = yFirst; y <= yLast; ++y)
+            {
+                const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+                const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+                const float texV = quantise(primitive.tv0 + (static_cast<float>(y - primitive.originY) + 0.5f) * stepV);
+                const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
+                const FastPipeline::TexelRows rows = p.texelRows(texV);
+                for (int x = primitive.minX; x <= primitive.maxX; ++x)
+                {
+                    const float texU = quantise(rowU + static_cast<float>(x - primitive.minX) * stepU);
+                    const uint32_t texelColor = p.sampleInRows(texU, rows);
+
+                    // combine(), MODULATE.
+                    const int tr = static_cast<int>(texelColor & 0xFFu);
+                    const int tg = static_cast<int>((texelColor >> 8) & 0xFFu);
+                    const int tb = static_cast<int>((texelColor >> 16) & 0xFFu);
+                    const int ta = static_cast<int>(texelColor >> 24);
+                    int pr = std::min((tr * r) >> 7, 255);
+                    int pg = std::min((tg * g) >> 7, 255);
+                    int pb = std::min((tb * b) >> 7, 255);
+                    int pa = tcc ? std::min((ta * a) >> 7, 255) : a;
+
+                    // write(): the frame's pixel, the depth test, the blend, the store.
+                    const uint32_t frameUnit = FastPipeline::unitIn(p.frame, frameRow, x);
+                    const uint32_t frameRgba = p.tread32(frameUnit);
+                    const uint32_t depthUnit = FastPipeline::unitIn(p.depth, depthRow, x);
+                    uint32_t stored = 0u;
+                    switch (depthKind)
+                    {
+                    case DepthKind::Z32:
+                        stored = p.tread32(depthUnit);
+                        break;
+                    case DepthKind::Z24:
+                        stored = p.tread32(depthUnit) & 0x00FFFFFFu;
+                        break;
+                    case DepthKind::Z16:
+                        stored = p.tread16(depthUnit);
+                        break;
+                    }
+                    if (greaterOrEqual ? z < stored : z <= stored)
+                        continue;
+
+                    const int dr = static_cast<int>(frameRgba & 0xFFu);
+                    const int dg = static_cast<int>((frameRgba >> 8) & 0xFFu);
+                    const int db = static_cast<int>((frameRgba >> 16) & 0xFFu);
+                    const int da = static_cast<int>(frameRgba >> 24);
+                    const int alpha = csel == 0 ? pa : (csel == 1 ? da : fix);
+                    const auto blend = [&](int source, int dest)
+                    {
+                        const int difference = ((source & maskAS) | (dest & maskAD)) - ((source & maskBS) | (dest & maskBD));
+                        return clampU8(((difference * alpha) >> 7) + ((source & maskDS) | (dest & maskDD)));
+                    };
+                    pr = blend(pr, dr);
+                    pg = blend(pg, dg);
+                    pb = blend(pb, db);
+                    if (fba)
+                        pa |= 0x80;
+                    p.twrite32(frameUnit, static_cast<uint32_t>(pr & 0xFF) | (static_cast<uint32_t>(pg & 0xFF) << 8) |
+                                              (static_cast<uint32_t>(pb & 0xFF) << 16) | (static_cast<uint32_t>(pa & 0xFF) << 24));
+                }
+            }
+            return;
+        }
         for (int y = yFirst; y <= yLast; ++y)
         {
             const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);

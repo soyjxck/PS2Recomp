@@ -1304,6 +1304,129 @@ void register_ps2_gs_tests()
             }
         });
 
+        tc.Run("a blur of the frame into itself by its own loop is the picture the general loop draws", [](TestCase &t)
+        {
+            // A sprite that samples the frame it draws, blended and tested
+            // against a depth it does not store, has a loop of its own in
+            // the rasteriser: sample(), combine() and write() with what
+            // they ask of the draw state asked once. The same sprite with
+            // REGION_REPEAT set to wrap as REPEAT does goes through the
+            // general loop, texel by texel and pixel by pixel through all
+            // three: the two have to leave the same VRAM, for each way the
+            // sprite can read itself and each thing the loop decided once
+            // (the depth test and its format, the blend's terms, the
+            // texture's alpha, FBA).
+            constexpr uint32_t kFbp = 150u, kZbp = 170u, kWidth = 64u, kHeight = 96u;
+            constexpr uint64_t kFrame = static_cast<uint64_t>(kFbp) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kScissor = (static_cast<uint64_t>(kWidth - 1u) << 16) | (static_cast<uint64_t>(kHeight - 1u) << 48);
+            constexpr uint64_t kLinear = (1ull << 5) | (1ull << 6);
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 6) | (1ull << 8);
+            constexpr uint64_t kRepeat = 0ull;
+            // REGION_REPEAT keeping all of the size's bits and setting none.
+            constexpr uint64_t kRegionAsRepeat = 3ull | (3ull << 2) | (63ull << 4) | (127ull << 24);
+            constexpr uint32_t kSpriteZ = 0x1000u;
+
+            struct Form
+            {
+                const char *name;
+                uint32_t x0, y0, x1, y1, u0, v0, u1, v1; // 12.4
+            };
+            const Form forms[] = {
+                {"mixed with the pixel to its left", 8u, 0u, 8u + (kWidth - 1u) * 16u, kHeight * 16u, 0u, 0u, (kWidth - 1u) * 16u, kHeight * 16u},
+                {"the row above", 0u, 16u, kWidth * 16u, kHeight * 16u, 8u, 9u, 8u + kWidth * 16u, 9u + (kHeight - 1u) * 16u},
+                {"stretched", 0u, 0u, kWidth * 16u, kHeight * 16u, 37u, 52u, 37u + kWidth * 9u, 52u + kHeight * 15u},
+            };
+            struct State
+            {
+                const char *name;
+                uint64_t alpha;     // ALPHA_1
+                uint32_t depthTest; // ZTST
+                uint32_t depthPsm;  // ZBUF's format field
+                bool textureAlpha;  // TCC
+                bool fba;
+            };
+            const State states[] = {
+                {"(Cs - Cd) * As + Cd, greater, Z24", 0x44ull, 3u, 1u, false, false},
+                {"the same with the texture's alpha", 0x44ull, 3u, 1u, true, false},
+                {"greater or equal", 0x44ull, 2u, 1u, false, false},
+                {"Z32", 0x44ull, 3u, 0u, false, false},
+                {"Z16", 0x44ull, 2u, 2u, true, false},
+                {"(Cs - Cd) * Ad + Cd", 0x54ull, 3u, 1u, false, false},
+                {"(Cs - Cd) * FIX + Cd", 0x64ull | (0x50ull << 32), 3u, 1u, true, false},
+                {"(Cs - 0) * As + Cd", 0x48ull, 3u, 1u, false, false},
+                {"FBA", 0x44ull, 3u, 1u, true, true},
+            };
+
+            const auto draw = [&](const Form &form, const State &state, uint64_t clamp)
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                uint32_t seed = 4321u;
+                for (uint32_t y = 0u; y < 128u; ++y)
+                    for (uint32_t x = 0u; x < kWidth; ++x)
+                    {
+                        seed = seed * 1664525u + 1013904223u;
+                        writeReferenceFramePSMCT32Pixel(vram, kFbp, 1u, x, y, seed);
+                        // Depth above the sprite's here and there, and its own depth elsewhere.
+                        const uint32_t depth = (seed >> 28) == 0u ? 0xFFFFu : ((seed >> 28) == 1u ? kSpriteZ : 0u);
+                        if (state.depthPsm == 0u)
+                            GSMem::WriteZ32(vram.data(), kZbp * 32u, 1u, x, y, depth);
+                        else if (state.depthPsm == 1u)
+                            GSMem::WriteZ24(vram.data(), kZbp * 32u, 1u, x, y, depth);
+                        else
+                            GSMem::WriteZ16(vram.data(), kZbp * 32u, 1u, x, y, depth);
+                    }
+                {
+                    GS gs;
+                    gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                    gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                    gs.writeRegister(GS_REG_ZBUF_1, static_cast<uint64_t>(kZbp) | (static_cast<uint64_t>(state.depthPsm) << 24) | (1ull << 32));
+                    gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+                    gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                    gs.writeRegister(GS_REG_TEST_1, (1ull << 16) | (static_cast<uint64_t>(state.depthTest) << 17));
+                    gs.writeRegister(GS_REG_ALPHA_1, state.alpha);
+                    gs.writeRegister(GS_REG_FBA_1, state.fba ? 1ull : 0ull);
+                    gs.writeRegister(GS_REG_TEX0_1, static_cast<uint64_t>(kFbp * 32u) | (1ull << 14) | (static_cast<uint64_t>(GS_PSM_CT32) << 20) |
+                                                        (6ull << 26) | (7ull << 30) | (state.textureAlpha ? 1ull << 34 : 0ull));
+                    gs.writeRegister(GS_REG_TEX1_1, kLinear);
+                    gs.writeRegister(GS_REG_CLAMP_1, clamp);
+                    gs.writeRegister(GS_REG_PRIM, kPrim);
+                    gs.writeRegister(GS_REG_RGBAQ, 0x40908070ull);
+                    gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(form.u0) | (static_cast<uint64_t>(form.v0) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(form.x0) | (static_cast<uint64_t>(form.y0) << 16) |
+                                                      (static_cast<uint64_t>(kSpriteZ) << 32));
+                    gs.writeRegister(GS_REG_UV, static_cast<uint64_t>(form.u1) | (static_cast<uint64_t>(form.v1) << 16));
+                    gs.writeRegister(GS_REG_XYZ2, static_cast<uint64_t>(form.x1) | (static_cast<uint64_t>(form.y1) << 16) |
+                                                      (static_cast<uint64_t>(kSpriteZ) << 32));
+                }
+                return vram;
+            };
+
+            for (const State &state : states)
+            {
+                for (const Form &form : forms)
+                {
+                    const std::vector<uint8_t> own = draw(form, state, kRepeat);
+                    const std::vector<uint8_t> general = draw(form, state, kRegionAsRepeat);
+                    uint32_t different = 0u, drawn = 0u;
+                    uint32_t seed = 4321u;
+                    for (uint32_t y = 0u; y < 128u; ++y)
+                        for (uint32_t x = 0u; x < kWidth; ++x)
+                        {
+                            seed = seed * 1664525u + 1013904223u;
+                            const uint32_t pixel = readReferenceFramePSMCT32Pixel(own, kFbp, 1u, x, y);
+                            if (y < kHeight && pixel != seed)
+                                ++drawn;
+                            if (pixel != readReferenceFramePSMCT32Pixel(general, kFbp, 1u, x, y))
+                                ++different;
+                        }
+                    const std::string what = std::string(state.name) + ", " + form.name;
+                    t.IsTrue(drawn > kWidth * kHeight / 2u, what + ": the sprite should have drawn most of the frame");
+                    t.Equals(different, 0u, what + ": every pixel as the general loop draws it");
+                    t.IsTrue(own == general, what + ": and nothing else in VRAM differs");
+                }
+            }
+        });
+
         tc.Run("a 16-bit copy of each block's left columns to its right ones puts red and green in blue and alpha", [](TestCase &t)
         {
             // A buffer of 32-bit pixels read as 16-bit ones is twice as
