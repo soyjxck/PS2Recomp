@@ -10,11 +10,13 @@
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_region.h"
 #include "../../ps2xRuntime/src/lib/vu/ps2_vu1_loop_plan.h"
 
+#include <algorithm>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace
@@ -3118,6 +3120,91 @@ void register_ps2_vu1_tests()
                                          replacement,
                                          sizeof(replacement)) == 0,
                          "XGKICK must read each qword in its transfer cycle");
+            }
+        });
+
+        tc.Run("the packet a program leaves behind goes out in the cycle PATH1 would have taken its last qword", [](TestCase &t)
+        {
+            // XGKICK in the pair that ends the program. PATH1 takes the tag
+            // in the cycle after it and a qword every other cycle from then
+            // on, so a packet of n qwords leaves in cycle 2n - 1 of the VU's
+            // clock, whatever its tags are, holding VU memory as it is. With
+            // nothing else pending those cycles are taken in one step, and
+            // neither the clock a GIF callback sees, nor the clock the
+            // program is left with, nor the packet may show it.
+            struct Tag
+            {
+                uint16_t loops;
+                uint8_t format, registers;
+            };
+            struct Shape
+            {
+                const char *name;
+                uint32_t address; // qword
+                std::vector<Tag> tags;
+            };
+            const Shape shapes[] = {
+                {"a tag and nothing else", 16u, {{0u, GIF_FMT_PACKED, 1u}}},
+                {"one packed tag", 16u, {{40u, GIF_FMT_PACKED, 3u}}},
+                {"three tags of three kinds", 32u, {{5u, GIF_FMT_IMAGE, 0u}, {3u, GIF_FMT_REGLIST, 5u}, {200u, GIF_FMT_PACKED, 1u}}},
+                {"around the end of VU memory", 0x3F0u, {{30u, GIF_FMT_PACKED, 2u}}},
+            };
+            for (const Shape &shape : shapes)
+            {
+                PS2Memory mem;
+                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                uint8_t *code = mem.getVU1Code();
+                uint8_t *data = mem.getVU1Data();
+                std::memset(code, 0, PS2_VU1_CODE_SIZE);
+                for (uint32_t byte = 0; byte < PS2_VU1_DATA_SIZE; ++byte)
+                    data[byte] = static_cast<uint8_t>(byte * 13u + (byte >> 7));
+
+                // The tags where the transfer will come to them.
+                constexpr uint32_t kQwords = PS2_VU1_DATA_SIZE / 16u;
+                uint32_t qwords = 0u;
+                for (size_t index = 0; index < shape.tags.size(); ++index)
+                {
+                    const Tag &tag = shape.tags[index];
+                    uint8_t *at = data + ((shape.address + qwords) % kQwords) * 16u;
+                    std::memset(at, 0, 16u);
+                    const uint64_t word = makeGifTag(tag.loops, tag.format, tag.registers, index + 1u == shape.tags.size());
+                    std::memcpy(at, &word, sizeof(word));
+                    const uint32_t registers = tag.registers == 0u ? 16u : tag.registers;
+                    qwords += 1u + (tag.format == GIF_FMT_PACKED ? tag.loops * registers
+                                    : tag.format == GIF_FMT_REGLIST ? (tag.loops * registers + 1u) / 2u
+                                                                    : tag.loops);
+                }
+                std::vector<uint8_t> expected;
+                for (uint32_t qword = 0; qword < qwords; ++qword)
+                {
+                    const uint8_t *from = data + ((shape.address + qword) % kQwords) * 16u;
+                    expected.insert(expected.end(), from, from + 16u);
+                }
+
+                writeVuInstructionPair(code, 0u, makeVuLowerSpecial(0x6Cu, 1u), kVuUpperNop | 0x40000000u); // XGKICK, E bit
+                writeVuInstructionPair(code, 8u, 0x8000033Cu, kVuUpperNop);
+
+                VU1Interpreter vu1;
+                std::vector<std::vector<uint8_t>> packets;
+                uint64_t clockAtPacket = 0u;
+                mem.setGifPacketCallback([&](const uint8_t *packet, uint32_t sizeBytes)
+                {
+                    packets.emplace_back(packet, packet + sizeBytes);
+                    clockAtPacket = vu1.state().cycles;
+                });
+                vu1.state().vi[1] = static_cast<int32_t>(shape.address);
+                vu1.execute(code, PS2_VU1_CODE_SIZE, data, PS2_VU1_DATA_SIZE, gs, &mem, 0u, 0u, 0u, 4096u);
+
+                const uint64_t leaves = 2ull * qwords - 1ull;
+                t.Equals(packets.size(), static_cast<size_t>(1u), std::string(shape.name) + ": one packet");
+                if (!packets.empty())
+                    t.IsTrue(packets[0] == expected, std::string(shape.name) + ": the qwords VU memory holds, in order");
+                t.Equals(clockAtPacket, leaves, std::string(shape.name) + ": the clock a GIF callback sees");
+                t.Equals(static_cast<uint64_t>(vu1.state().cycles), std::max<uint64_t>(leaves, 2u),
+                         std::string(shape.name) + ": the clock the program is left with");
             }
         });
 

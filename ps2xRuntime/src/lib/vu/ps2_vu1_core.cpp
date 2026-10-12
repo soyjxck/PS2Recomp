@@ -248,7 +248,29 @@ bool VU1Interpreter::pipelinesPending() const
 void VU1Interpreter::flushPipelines()
 {
     while (pipelinesPending())
+    {
+        // A program that ends with its last XGKICK leaves PATH1 hundreds of
+        // cycles of packet to take, a qword every other cycle. Once that is
+        // all that is pending, nothing writes VU memory any more and the
+        // cycles until the packet leaves are all alike: the clock is put at
+        // the last of them but one, the qwords they would have taken are
+        // copied together, and the cycle that sends the packet off is taken
+        // as ever, so that a GIF callback sees the clock it would have.
+        const bool onlyKick = m_xgkick.active && m_unit == Unit::VU1 && !m_fdiv.valid && !m_efu[0].valid && !m_efu[1].valid &&
+                              (m_activeFlags | m_activeStores | m_activeVfWrites | m_activeViWrites | m_activeAccWrites) == 0u &&
+                              m_activeVuData != nullptr && m_activeVuDataSize != 0u;
+        if (onlyKick)
+        {
+            const uint32_t calls = ps2_vu_program::Access::xgkickCallsLeft(*this);
+            if (calls > 1u)
+            {
+                ps2_vu_program::Access::progressXgkick(*this, calls - 1u);
+                m_cycle += calls - 1u;
+                m_state.cycles = m_cycle;
+            }
+        }
         advanceOneCycle();
+    }
 }
 
 uint64_t VU1Interpreter::calculatePairReadyCycle(const DecodedInstructionPair &decoded) const

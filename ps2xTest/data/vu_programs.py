@@ -10,7 +10,8 @@ tests with PS2_VU_PROGRAM_FIXTURES=DIRECTORY: ps2_vu1_program_tests.cpp runs
 every entry both compiled and interpreted and compares the two.
 
 A few programs are written out to reach particular paths: blocks split for
-length, an E bit on a branch, a program the compiler hands back part-way. The
+length, an E bit on a branch, a program the compiler hands back part-way,
+stores into a packet while XGKICK is sending it. The
 rest come from a seeded generator that mixes the instructions the compiler
 accepts inside counted loops, forward branches, calls and register jumps.
 They rely on what the test sets up: VI registers start at zero, data memory
@@ -380,6 +381,62 @@ def handed_back(generator):
     return program
 
 
+PACKET_QWORD = 0x200  # a packet the programs below build, clear of what generated code writes
+
+
+def tag_word(program, register, loops):
+    """The first word of a GIF tag that ends a packet into a VI register: its
+    loop count with the EOP bit, which is the register's sign."""
+    if loops == 0:
+        program.add(immediate15(0x09, register, 0, 0x7FFF))
+        program.add(immediate15(0x09, register, register, 1))
+    else:
+        program.add(immediate15(0x09, register, 0, 0x8000 - loops))
+
+
+def kicked_and_stored(generator, entry, rewritten_loops, rewrite_late=False, hand_back=False):
+    """XGKICK hands PATH1 a qword every other cycle while the program goes on.
+    A store into the packet is in what goes out or not by the cycle it lands
+    on, and one that rewrites a tag still to go moves where the packet ends
+    (its second tag here, to `rewritten_loops` loops; too late for that when
+    rewrite_late). With hand_back the program leaves the compiler while the
+    packet is on its way."""
+    x, y, z, w, xyzw = 8, 4, 2, 1, 15
+    value, later = COUNTERS
+    program = generator.start(entry)
+    # Two tags of sixteen registers and one loop each, so sixteen qwords of
+    # whatever is there after each: 34 qwords, 67 cycles.
+    program.add(immediate15(0x08, FIXED, 0, PACKET_QWORD))
+    program.add(memory(0x05, xyzw, 0, FIXED, 0))        # ISW: a tag of zeros
+    program.add(immediate15(0x08, value, 0, 1))
+    program.add(memory(0x05, x, value, FIXED, 0))       # one loop, more to come
+    program.add(memory(0x05, xyzw, 0, FIXED, 17))
+    tag_word(program, value, 1)
+    program.add(memory(0x05, x, value, FIXED, 17))      # one loop, the end
+    tag_word(program, later, rewritten_loops)
+
+    program.add(lower_special(0x6C, FIXED))             # XGKICK
+    program.add(memory(0x05, y, value, FIXED, 1))       # qword 1 goes two cycles on: this is in it
+    program.add()
+    program.add(memory(0x05, z, value, FIXED, 1))       # and this is not
+    program.add(memory(0x05, w, value, FIXED, 2))       # qword 2 goes a cycle on: in
+    program.add(memory(0x01, xyzw, FIXED, 5, 9))        # SQ into qword 9, long before it goes
+    if hand_back:
+        program.add(lower_special(0x42, 1, 0, 0), UPPER_NOP)  # RINIT is not compiled
+        program.add(memory(0x05, y, value, FIXED, 12))
+    if rewrite_late:
+        generator.straight(program, 40)
+    program.add(memory(0x05, x, later, FIXED, 17))      # the second tag, before it goes or after
+    generator.straight(program, 24)
+    program.add(memory(0x05, x, value, FIXED, 25))      # into the second tag's data, in or out by the cycle
+    program.add(lower_special(0x6C, FIXED))             # the packet again, as it is now: waits for the first
+    program.add(memory(0x05, y, later, FIXED, 3))
+    program.add(memory(0x05, y, later, FIXED, 30))
+    generator.straight(program, 12)
+    generator.end(program)
+    return program
+
+
 def image(programs):
     words = [(LOWER_NOP, UPPER_NOP)] * PAIRS
     for program in programs:
@@ -404,7 +461,10 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     images = [[long_straight(Generator(1))],
               [branch_with_e_bit(Generator(2), True), handed_back(Generator(3))],
-              [branch_with_e_bit(Generator(4), False)]]
+              [branch_with_e_bit(Generator(4), False)],
+              [kicked_and_stored(Generator(5), 0, 2), kicked_and_stored(Generator(6), 400, 0)],
+              [kicked_and_stored(Generator(7), 0, 2, rewrite_late=True),
+               kicked_and_stored(Generator(8), 400, 0, hand_back=True)]]
     # Two generated programs per image, at entries the layout leaves free.
     for seed in range(100, 124, 2):
         first = Generator(seed).program(0)

@@ -210,6 +210,93 @@ void Access::pendFlags(VU1Interpreter &vu, uint64_t issue, uint32_t mac, uint32_
     slot->writesClip = (writes & 8u) != 0u;
 }
 
+void Access::progressXgkick(VU1Interpreter &vu, uint32_t calls)
+{
+    auto &kick = vu.m_xgkick;
+    const uint32_t size = vu.m_activeVuDataSize;
+    while (calls != 0u && kick.active)
+    {
+        // Two calls send one qword, whichever of the two it goes with. The
+        // qwords of a tag's data that are due go together, all but the
+        // tag's last: that one, and a tag itself, is the interpreter's step,
+        // which knows what comes after it.
+        const uint32_t left = kick.currentTagEnd > kick.copiedBytes ? (kick.currentTagEnd - kick.copiedBytes) / 16u : 0u;
+        const uint32_t together = std::min(calls / 2u, left != 0u ? left - 1u : 0u);
+        if (together == 0u)
+        {
+            vu.progressXgkick();
+            --calls;
+            continue;
+        }
+        uint32_t source = (kick.sourceAddress + kick.copiedBytes) % size;
+        uint32_t bytes = together * 16u;
+        uint8_t *target = kick.packet.data() + kick.copiedBytes;
+        kick.copiedBytes += bytes;
+        calls -= together * 2u;
+        while (bytes != 0u)
+        {
+            const uint32_t chunk = std::min(bytes, size - source);
+            std::memcpy(target, vu.m_activeVuData + source, chunk);
+            target += chunk;
+            bytes -= chunk;
+            source = 0u;
+        }
+    }
+}
+
+uint32_t Access::xgkickCallsLeft(const VU1Interpreter &vu)
+{
+    // progressXgkick's own walk over the tags, without the copies: a tag is
+    // read where it will be copied from, and its data is skipped.
+    const auto &kick = vu.m_xgkick;
+    const uint32_t size = vu.m_activeVuDataSize;
+    constexpr uint32_t kBuffer = VU1Interpreter::XgkickPipeline::kBufferSize;
+    uint32_t copied = kick.copiedBytes, tagEnd = kick.currentTagEnd;
+    bool eop = kick.currentTagEop;
+    uint32_t steps = 0u; // qwords still to go, the one that ends the transfer included
+    for (;;)
+    {
+        ++steps;
+        if (copied > kBuffer - 16u)
+            break; // refused where it would be copied
+        const uint32_t offset = copied;
+        copied += 16u;
+        if (tagEnd == 0u)
+        {
+            uint64_t tagLo = 0;
+            std::memcpy(&tagLo, vu.m_activeVuData + (kick.sourceAddress + offset) % size, sizeof(tagLo));
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint32_t format = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+            if (nreg == 0u)
+                nreg = 16u;
+            uint64_t tagBytes = 16u;
+            if (format == 0u)
+                tagBytes += static_cast<uint64_t>(nloop) * nreg * 16u;
+            else if (format == 1u)
+                tagBytes += ((static_cast<uint64_t>(nloop) * nreg + 1u) & ~1ull) * 8u;
+            else if (format == 2u)
+                tagBytes += static_cast<uint64_t>(nloop) * 16u;
+            else
+                break; // a reserved format ends it
+            if (tagBytes > kBuffer - offset)
+                break; // so does a tag too long for the buffer
+            tagEnd = offset + static_cast<uint32_t>(tagBytes);
+            eop = ((tagLo >> 15) & 1u) != 0u;
+        }
+        if (copied < tagEnd)
+        {
+            steps += (tagEnd - copied) / 16u;
+            copied = tagEnd;
+        }
+        if (eop)
+            break;
+        tagEnd = 0u;
+    }
+    // A qword goes with every second call; the credit of one may be in hand.
+    return steps * 2u - kick.cycleCredit;
+}
+
 void Access::finish(VU1Interpreter &vu, uint64_t cycle, uint32_t workingClip, uint8_t backupReg,
                     int32_t backupValue, uint64_t pairs)
 {

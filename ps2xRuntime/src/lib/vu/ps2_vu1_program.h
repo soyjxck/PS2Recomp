@@ -103,6 +103,12 @@ struct Access
     static bool xgkickActive(const VU1Interpreter &vu) { return vu.m_xgkick.active; }
     static void startXgkick(VU1Interpreter &vu, uint32_t address) { vu.startXgkick(address); }
     static void progressXgkick(VU1Interpreter &vu) { vu.progressXgkick(); }
+    // As many calls of progressXgkick() in one: the qwords they send are
+    // copied together where the packet's tags allow it.
+    static void progressXgkick(VU1Interpreter &vu, uint32_t calls);
+    // How many more such calls the transfer under way lasts, the one that
+    // ends it included, by the tags VU memory holds now.
+    static uint32_t xgkickCallsLeft(const VU1Interpreter &vu);
     static ScalarEntry &fdiv(VU1Interpreter &vu) { return vu.m_fdiv; }
     static std::array<ScalarEntry, 2> &efu(VU1Interpreter &vu) { return vu.m_efu; }
     static uint64_t efuResourceReady(const VU1Interpreter &vu) { return vu.m_efuResourceReady; }
