@@ -3556,10 +3556,15 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
         const uint32_t z = gsDepthBits(v1.z);
         const int r = v1.r, g = v1.g, b = v1.b, a = v1.a;
         const int fog = v1.fog;
-        // PS2X_GS_PROBE: the sprite's pixel there.
+        // PS2X_GS_PROBE: the sprite's pixel there. The loops that report
+        // are apart from the ones that draw and are entered only when the
+        // probed pixel is among the rows and columns of this call, so a
+        // sprite drawn without a probe, or away from it, costs what it did.
         PixelProbe &probe = pixelProbe();
-        const auto write = [&](int x, int y, const FastPipeline::Row &frameRow, const FastPipeline::Row &depthRow, float texU,
-                               float texV, uint32_t texel, int pr, int pg, int pb, int pa)
+        const bool probedHere = probe.set && probe.x >= primitive.minX && probe.x <= primitive.maxX && probe.y >= yFirst &&
+                                probe.y <= yLast;
+        const auto probedWrite = [&](int x, int y, const FastPipeline::Row &frameRow, const FastPipeline::Row &depthRow, float texU,
+                                     float texV, uint32_t texel, int pr, int pg, int pb, int pa)
         {
             const bool probed = probe.set && x == probe.x && y == probe.y && probe.left.load(std::memory_order_relaxed) > 0 &&
                                 probe.left.fetch_sub(1) > 0;
@@ -3595,12 +3600,23 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
         };
         if (!p.tme)
         {
+            if (probedHere)
+            {
+                for (int y = yFirst; y <= yLast; ++y)
+                {
+                    const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+                    const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+                    for (int x = primitive.minX; x <= primitive.maxX; ++x)
+                        probedWrite(x, y, frameRow, depthRow, 0.0f, 0.0f, 0u, r, g, b, a);
+                }
+                return;
+            }
             for (int y = yFirst; y <= yLast; ++y)
             {
                 const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
                 const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
                 for (int x = primitive.minX; x <= primitive.maxX; ++x)
-                    write(x, y, frameRow, depthRow, 0.0f, 0.0f, 0u, r, g, b, a);
+                    p.write(x, frameRow, depthRow, z, r, g, b, a, fog);
             }
             return;
         }
@@ -3691,6 +3707,25 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             }
             return;
         }
+        if (probedHere)
+        {
+            for (int y = yFirst; y <= yLast; ++y)
+            {
+                const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
+                const FastPipeline::Row depthRow = FastPipeline::rowOf(p.depth, y);
+                const float texV = quantise(primitive.tv0 + (static_cast<float>(y - primitive.originY) + 0.5f) * stepV);
+                const float rowU = primitive.tu0 + (static_cast<float>(primitive.minX - primitive.originX) + 0.5f) * stepU;
+                for (int x = primitive.minX; x <= primitive.maxX; ++x)
+                {
+                    const float texU = quantise(rowU + static_cast<float>(x - primitive.minX) * stepU);
+                    int pr = r, pg = g, pb = b, pa = a;
+                    const uint32_t texel = p.sample(texU, texV);
+                    p.combine(texel, pr, pg, pb, pa);
+                    probedWrite(x, y, frameRow, depthRow, texU, texV, texel, pr, pg, pb, pa);
+                }
+            }
+            return;
+        }
         for (int y = yFirst; y <= yLast; ++y)
         {
             const FastPipeline::Row frameRow = FastPipeline::rowOf(p.frame, y);
@@ -3701,9 +3736,8 @@ void GSCpuBackend::RasteriseRowsScalar(const PreparedPrimitive &primitive, int y
             {
                 const float texU = quantise(rowU + static_cast<float>(x - primitive.minX) * stepU);
                 int pr = r, pg = g, pb = b, pa = a;
-                const uint32_t texel = p.sample(texU, texV);
-                p.combine(texel, pr, pg, pb, pa);
-                write(x, y, frameRow, depthRow, texU, texV, texel, pr, pg, pb, pa);
+                p.combine(p.sample(texU, texV), pr, pg, pb, pa);
+                p.write(x, frameRow, depthRow, z, pr, pg, pb, pa, fog);
             }
         }
         return;
