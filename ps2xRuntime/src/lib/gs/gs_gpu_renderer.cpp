@@ -158,7 +158,9 @@ uniform int uFba;
 uniform int uAlphaSplit;    // 0 all, 1 only pixels whose blending alpha is at most one, 2 only the others
 uniform sampler2D uFrame;   // a copy of what is being drawn into, for uDate and uFrameBlend
 uniform int uDate;          // 0 none, 1 draw where the frame's alpha is below 0x80, 2 where it is not
-uniform int uFrameBlend;    // 0 none, else 1 + A + 3 B + 9 D of (A - B) * the frame's alpha + D: 0 the colour, 1 what is there, 2 nothing
+#ifdef PS2X_FRAME_BLEND
+uniform int uFrameBlend;    // 1 + A + 3 B + 9 D of (A - B) * the frame's alpha + D: 0 the colour, 1 what is there, 2 nothing
+#endif
 
 int wrapTexel(int c, int mode, int size, int low, int high)
 {
@@ -274,11 +276,13 @@ void main()
         if (pass != (uAlphaTest == 1))
             discard;
     }
-    if (uFrameBlend != 0 && !(uPabe != 0 && a < 128.0))
+#ifdef PS2X_FRAME_BLEND
+    if (!(uPabe != 0 && a < 128.0))
     {
         // Blended by the alpha the frame holds: no blend of the card's has
         // that for a factor (0x80 is one), so it is worked out here from
-        // the copy, as the GS does it, and stored as it is.
+        // the copy, as the GS does it, and stored as it is. (A program of
+        // its own, so that every other draw pays nothing for it.)
         vec4 there = texelFetch(uFrame, ivec2(gl_FragCoord.xy), 0);
         vec3 held = floor(there.rgb * 255.0 + 0.5);
         float heldAlpha = floor(there.a * 255.0 + 0.5);
@@ -288,6 +292,7 @@ void main()
         vec3 termD = selD == 0 ? rgb : selD == 1 ? held : vec3(0.0);
         rgb = clamp(floor((termA - termB) * heldAlpha / 128.0) + termD, 0.0, 255.0);
     }
+#endif
     float alpha = (uBlendAlpha == 0 ? a : uFix) / 128.0;
     if (uAlphaSplit != 0 && (alpha > 1.0) != (uAlphaSplit == 2))
         discard;
@@ -472,7 +477,7 @@ void main()
         std::unordered_map<uint32_t, Surface> surfaces;
         std::unordered_map<uint64_t, GLuint> framebuffers;
         bool failed = false;
-        GLuint program = 0, fillProgram = 0;
+        GLuint program = 0, frameBlendProgram = 0, fillProgram = 0;
         GLuint vertexArray = 0, vertexBuffer = 0;
         GLuint nearest = 0, linear = 0;
         GLuint scratchColour = 0, scratchDepth = 0, scratchFramebuffer = 0;
@@ -483,12 +488,14 @@ void main()
             int width = 0, height = 0;
         } shownAs[2], frameCopy;
         int shownNext = 0;
-        struct
+        // The draw program's uniforms, and those of the one that blends by
+        // the frame's alpha (the same shader with PS2X_FRAME_BLEND).
+        struct DrawUniforms
         {
             GLint toClip, texture, textureMode, linear, tfx, tcc, wrap, region, texSize, texOrigin, texExtent, surfaceTexel,
                 texAlphaFixed, ta0, aem, fog, fogColour, alphaTest, atst, aref, output, blendSource, blendDest, blendAlpha, fix,
                 pabe, fba, frame, date, frameBlend, alphaSplit, shuffle;
-        } at{};
+        } drawAt{}, frameBlendAt{};
         struct
         {
             GLint rect, size, source, depth;
@@ -829,43 +836,56 @@ void main()
         if (!glfwGetCurrentContext())
             return false;
         program = Compile(kVertexShader, kFragmentShader, "draw");
+        {
+            // The same source with the blend compiled in, after its #version line.
+            const char *const version = "#version 330 core\n";
+            std::string source = kFragmentShader;
+            if (source.compare(0, std::strlen(version), version) == 0)
+                source.insert(std::strlen(version), "#define PS2X_FRAME_BLEND 1\n");
+            frameBlendProgram = Compile(kVertexShader, source.c_str(), "draw, blended by the frame's alpha");
+        }
         fillProgram = Compile(kFillVertexShader, kFillFragmentShader, "fill");
-        if (!program || !fillProgram)
+        if (!program || !frameBlendProgram || !fillProgram)
             return false;
+        const auto locate = [](DrawUniforms &at, GLuint program)
+        {
 #define PS2X_UNIFORM(field, name) at.field = glGetUniformLocation(program, name)
-        PS2X_UNIFORM(toClip, "uToClip");
-        PS2X_UNIFORM(texture, "uTexture");
-        PS2X_UNIFORM(textureMode, "uTextureMode");
-        PS2X_UNIFORM(linear, "uLinear");
-        PS2X_UNIFORM(tfx, "uTfx");
-        PS2X_UNIFORM(tcc, "uTcc");
-        PS2X_UNIFORM(wrap, "uWrap");
-        PS2X_UNIFORM(region, "uRegion");
-        PS2X_UNIFORM(texSize, "uTexSize");
-        PS2X_UNIFORM(texOrigin, "uTexOrigin");
-        PS2X_UNIFORM(texExtent, "uTexExtent");
-        PS2X_UNIFORM(surfaceTexel, "uSurfaceTexel");
-        PS2X_UNIFORM(texAlphaFixed, "uTexAlphaFixed");
-        PS2X_UNIFORM(ta0, "uTa0");
-        PS2X_UNIFORM(aem, "uAem");
-        PS2X_UNIFORM(fog, "uFog");
-        PS2X_UNIFORM(fogColour, "uFogColour");
-        PS2X_UNIFORM(alphaTest, "uAlphaTest");
-        PS2X_UNIFORM(atst, "uAtst");
-        PS2X_UNIFORM(aref, "uAref");
-        PS2X_UNIFORM(output, "uOutput");
-        PS2X_UNIFORM(blendSource, "uBlendSource");
-        PS2X_UNIFORM(blendDest, "uBlendDest");
-        PS2X_UNIFORM(blendAlpha, "uBlendAlpha");
-        PS2X_UNIFORM(fix, "uFix");
-        PS2X_UNIFORM(pabe, "uPabe");
-        PS2X_UNIFORM(fba, "uFba");
-        PS2X_UNIFORM(frame, "uFrame");
-        PS2X_UNIFORM(date, "uDate");
-        PS2X_UNIFORM(frameBlend, "uFrameBlend");
-        PS2X_UNIFORM(alphaSplit, "uAlphaSplit");
-        PS2X_UNIFORM(shuffle, "uShuffle");
+            PS2X_UNIFORM(toClip, "uToClip");
+            PS2X_UNIFORM(texture, "uTexture");
+            PS2X_UNIFORM(textureMode, "uTextureMode");
+            PS2X_UNIFORM(linear, "uLinear");
+            PS2X_UNIFORM(tfx, "uTfx");
+            PS2X_UNIFORM(tcc, "uTcc");
+            PS2X_UNIFORM(wrap, "uWrap");
+            PS2X_UNIFORM(region, "uRegion");
+            PS2X_UNIFORM(texSize, "uTexSize");
+            PS2X_UNIFORM(texOrigin, "uTexOrigin");
+            PS2X_UNIFORM(texExtent, "uTexExtent");
+            PS2X_UNIFORM(surfaceTexel, "uSurfaceTexel");
+            PS2X_UNIFORM(texAlphaFixed, "uTexAlphaFixed");
+            PS2X_UNIFORM(ta0, "uTa0");
+            PS2X_UNIFORM(aem, "uAem");
+            PS2X_UNIFORM(fog, "uFog");
+            PS2X_UNIFORM(fogColour, "uFogColour");
+            PS2X_UNIFORM(alphaTest, "uAlphaTest");
+            PS2X_UNIFORM(atst, "uAtst");
+            PS2X_UNIFORM(aref, "uAref");
+            PS2X_UNIFORM(output, "uOutput");
+            PS2X_UNIFORM(blendSource, "uBlendSource");
+            PS2X_UNIFORM(blendDest, "uBlendDest");
+            PS2X_UNIFORM(blendAlpha, "uBlendAlpha");
+            PS2X_UNIFORM(fix, "uFix");
+            PS2X_UNIFORM(pabe, "uPabe");
+            PS2X_UNIFORM(fba, "uFba");
+            PS2X_UNIFORM(frame, "uFrame");
+            PS2X_UNIFORM(date, "uDate");
+            PS2X_UNIFORM(frameBlend, "uFrameBlend");
+            PS2X_UNIFORM(alphaSplit, "uAlphaSplit");
+            PS2X_UNIFORM(shuffle, "uShuffle");
 #undef PS2X_UNIFORM
+        };
+        locate(drawAt, program);
+        locate(frameBlendAt, frameBlendProgram);
         fillAt.rect = glGetUniformLocation(fillProgram, "uRect");
         fillAt.size = glGetUniformLocation(fillProgram, "uSize");
         fillAt.source = glGetUniformLocation(fillProgram, "uSource");
@@ -1210,7 +1230,8 @@ void main()
         glEnable(GL_SCISSOR_TEST);
         glScissor(p.scissor[0] * colour->scaleX, p.scissor[1] * colour->scaleY, (p.scissor[2] - p.scissor[0] + 1) * colour->scaleX,
                   (p.scissor[3] - p.scissor[1] + 1) * colour->scaleY);
-        glUseProgram(program);
+        const DrawUniforms &at = blend == Blend::FrameAlpha ? frameBlendAt : drawAt;
+        glUseProgram(blend == Blend::FrameAlpha ? frameBlendProgram : program);
         glUniform4f(at.toClip, 2.0f / static_cast<float>(colour->width), 2.0f / static_cast<float>(colour->height), -1.0f, -1.0f);
 
         // Part of the surface being drawn into, copied where the shader can
@@ -1305,12 +1326,12 @@ void main()
             glActiveTexture(GL_TEXTURE0);
             glUniform1i(at.frame, 1);
             glUniform1i(at.date, tested ? (p.datm ? 2 : 1) : 0);
-            glUniform1i(at.frameBlend, blend == Blend::FrameAlpha ? 1 + p.asel + 3 * p.bsel + 9 * p.dsel : 0);
+            if (blend == Blend::FrameAlpha)
+                glUniform1i(at.frameBlend, 1 + p.asel + 3 * p.bsel + 9 * p.dsel);
         }
         else
         {
             glUniform1i(at.date, 0);
-            glUniform1i(at.frameBlend, 0);
         }
 
         if (depthUsed)
