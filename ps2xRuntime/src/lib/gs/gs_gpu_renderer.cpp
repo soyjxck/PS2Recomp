@@ -98,9 +98,18 @@ namespace GSGpu
         std::atomic<GLFWwindow *> g_context{nullptr};
 
         // What LatestShown gives: the renderer's thread writes one of two
-        // textures while the window may still be drawing the other.
+        // textures while the window may still be drawing the other. The
+        // picture is drawn in the renderer's context and used in the
+        // window's, and commands flushed are not commands finished: each
+        // comes with a fence set after its last command, for the window to
+        // wait on before it takes the texture. The fence of the latest
+        // picture belongs to whoever takes it out of g_shownFence: the
+        // window, which waits on it and deletes it, or the renderer's
+        // thread putting the next one in, which deletes the one nobody
+        // waited for. A later fence stands for the earlier pictures too.
         std::mutex g_shownMutex;
         Shown g_shown;
+        std::atomic<GLsync> g_shownFence{nullptr};
 
         const char *const kVertexShader = R"(#version 330 core
 layout(location = 0) in vec3 aPosition;
@@ -446,8 +455,18 @@ void main()
 
     bool LatestShown(Shown &shown)
     {
-        std::lock_guard<std::mutex> lock(g_shownMutex);
-        shown = g_shown;
+        {
+            std::lock_guard<std::mutex> lock(g_shownMutex);
+            shown = g_shown;
+        }
+        // The card is given time to finish the picture: a window that drew
+        // at once had the texture as it was two pictures before, whenever
+        // it got there first. The renderer's thread is not held up.
+        if (const GLsync fence = g_shownFence.exchange(nullptr, std::memory_order_acq_rel))
+        {
+            glWaitSync(fence, 0, GL_TIMEOUT_IGNORED);
+            glDeleteSync(fence);
+        }
         return shown.texture != 0u;
     }
 
@@ -1586,7 +1605,12 @@ void main()
                 glClear(GL_COLOR_BUFFER_BIT);
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             }
+            // The fence, then the flush that sends it and the picture on
+            // their way (a wait in another context needs it sent).
+            const GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             glFlush();
+            if (const GLsync unused = g_shownFence.exchange(fence, std::memory_order_acq_rel))
+                glDeleteSync(unused);
             {
                 std::lock_guard<std::mutex> lock(g_shownMutex);
                 g_shown.texture = target.texture;
