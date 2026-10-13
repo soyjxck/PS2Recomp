@@ -44,6 +44,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -697,10 +698,13 @@ void main()
                 const float q = vertices[i].q != 0.0f ? vertices[i].q : 1.0f;
                 const float u = vertices[i].s / q + static_cast<float>(pipeline.texOrigin[0]);
                 const float v = vertices[i].t / q + static_cast<float>(pipeline.texOrigin[1]);
-                drawn.sampled[0] = std::min(drawn.sampled[0], u);
-                drawn.sampled[1] = std::min(drawn.sampled[1], v);
-                drawn.sampled[2] = std::max(drawn.sampled[2], u);
-                drawn.sampled[3] = std::max(drawn.sampled[3], v);
+                // A coordinate that is no number bounds nothing by itself
+                // (min and max pass it over): it may be anywhere.
+                const float infinity = std::numeric_limits<float>::infinity();
+                drawn.sampled[0] = u == u ? std::min(drawn.sampled[0], u) : -infinity;
+                drawn.sampled[1] = v == v ? std::min(drawn.sampled[1], v) : -infinity;
+                drawn.sampled[2] = u == u ? std::max(drawn.sampled[2], u) : infinity;
+                drawn.sampled[3] = v == v ? std::max(drawn.sampled[3], v) : infinity;
             }
         }
         batch.vertices.insert(batch.vertices.end(), vertices, vertices + count);
@@ -1295,8 +1299,44 @@ void main()
         const Surface *texture = p.textureMode != TextureNone ? Find(p.texture) : nullptr;
         const bool ownTexture = texture && p.textureMode == TextureSurface && p.texture == p.colour;
         if (ownTexture)
-            copyFrame(static_cast<int>(std::floor(command.sampled[0])) - 2, static_cast<int>(std::floor(command.sampled[1])) - 2,
-                      static_cast<int>(std::ceil(command.sampled[2])) + 2, static_cast<int>(std::ceil(command.sampled[3])) + 2);
+        {
+            // What of the frame the primitive can read: its coordinates as
+            // the wrap mode takes them (surfaceCoordinate in the shader),
+            // however far the coordinates themselves go. Clamped, they stay
+            // within the texture or the region; repeated, they are anywhere
+            // in the texture once they leave it. (A triangle with a vertex
+            // whose S/Q is infinite had a rectangle that could not be made
+            // a whole number: nothing was copied, and the shader read what
+            // the copy held from some primitive before.)
+            const auto reach = [](float from, float to, int origin, int mode, int size, int low, int high, int limit, int &first, int &last)
+            {
+                double least = 0.0, most = static_cast<double>(size);
+                if (mode == 2)
+                {
+                    least = static_cast<double>(low);
+                    most = static_cast<double>(high) + 1.0;
+                }
+                if (limit > 0)
+                    most = std::min(most, static_cast<double>(limit));
+                double a = static_cast<double>(from) - origin, b = static_cast<double>(to) - origin;
+                if (mode == 1 || mode == 2)
+                {
+                    a = std::min(std::max(a, least), most);
+                    b = std::min(std::max(b, least), most);
+                }
+                else if (!(a >= least && b <= most))
+                {
+                    a = least;
+                    b = most;
+                }
+                first = static_cast<int>(std::floor(a)) + origin - 2;
+                last = static_cast<int>(std::ceil(b)) + origin + 2;
+            };
+            int left, top, right, bottom;
+            reach(command.sampled[0], command.sampled[2], p.texOrigin[0], p.wrapU, p.texSize[0], p.region[0], p.region[1], p.texExtent[0], left, right);
+            reach(command.sampled[1], command.sampled[3], p.texOrigin[1], p.wrapV, p.texSize[1], p.region[2], p.region[3], p.texExtent[1], top, bottom);
+            copyFrame(left, top, right, bottom);
+        }
         if (texture)
         {
             glActiveTexture(GL_TEXTURE0);
