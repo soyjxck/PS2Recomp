@@ -156,8 +156,9 @@ uniform float uFix;
 uniform int uPabe;
 uniform int uFba;
 uniform int uAlphaSplit;    // 0 all, 1 only pixels whose blending alpha is at most one, 2 only the others
-uniform sampler2D uFrame;   // a copy of what is being drawn into, for uDate
+uniform sampler2D uFrame;   // a copy of what is being drawn into, for uDate and uFrameBlend
 uniform int uDate;          // 0 none, 1 draw where the frame's alpha is below 0x80, 2 where it is not
+uniform int uFrameBlend;    // 0 none, else 1 + A + 3 B + 9 D of (A - B) * the frame's alpha + D: 0 the colour, 1 what is there, 2 nothing
 
 int wrapTexel(int c, int mode, int size, int low, int high)
 {
@@ -272,6 +273,20 @@ void main()
                   : uAtst == 5 ? a >= uAref : uAtst == 6 ? a > uAref : a != uAref;
         if (pass != (uAlphaTest == 1))
             discard;
+    }
+    if (uFrameBlend != 0 && !(uPabe != 0 && a < 128.0))
+    {
+        // Blended by the alpha the frame holds: no blend of the card's has
+        // that for a factor (0x80 is one), so it is worked out here from
+        // the copy, as the GS does it, and stored as it is.
+        vec4 there = texelFetch(uFrame, ivec2(gl_FragCoord.xy), 0);
+        vec3 held = floor(there.rgb * 255.0 + 0.5);
+        float heldAlpha = floor(there.a * 255.0 + 0.5);
+        int selA = (uFrameBlend - 1) % 3, selB = ((uFrameBlend - 1) / 3) % 3, selD = (uFrameBlend - 1) / 9;
+        vec3 termA = selA == 0 ? rgb : selA == 1 ? held : vec3(0.0);
+        vec3 termB = selB == 0 ? rgb : selB == 1 ? held : vec3(0.0);
+        vec3 termD = selD == 0 ? rgb : selD == 1 ? held : vec3(0.0);
+        rgb = clamp(floor((termA - termB) * heldAlpha / 128.0) + termD, 0.0, 255.0);
     }
     float alpha = (uBlendAlpha == 0 ? a : uFix) / 128.0;
     if (uAlphaSplit != 0 && (alpha > 1.0) != (uAlphaSplit == 2))
@@ -472,7 +487,7 @@ void main()
         {
             GLint toClip, texture, textureMode, linear, tfx, tcc, wrap, region, texSize, texOrigin, texExtent, surfaceTexel,
                 texAlphaFixed, ta0, aem, fog, fogColour, alphaTest, atst, aref, output, blendSource, blendDest, blendAlpha, fix,
-                pabe, fba, frame, date, alphaSplit, shuffle;
+                pabe, fba, frame, date, frameBlend, alphaSplit, shuffle;
         } at{};
         struct
         {
@@ -594,6 +609,16 @@ void main()
         m_impl->pending.blob.insert(m_impl->pending.blob.end(), bytes, bytes + command.count);
     }
 
+    // Whether the primitive is blended by the alpha the frame holds in a
+    // way only the shader can work out (DoDraw's Blend::FrameAlpha): all of
+    // them but colour * that alpha + what is there, and none on a 24-bit
+    // frame, whose alpha is one.
+    static bool blendsByFrameAlpha(const Pipeline &pipeline)
+    {
+        return pipeline.abe && pipeline.csel == 1u && !pipeline.frameAlphaOne &&
+               !(pipeline.asel == 0u && pipeline.bsel == 2u && pipeline.dsel == 1u);
+    }
+
     void Renderer::Draw(const Pipeline &pipeline, const Vertex *vertices, size_t count)
     {
         Impl &impl = *m_impl;
@@ -605,8 +630,14 @@ void main()
         // So does a destination alpha test, which sees the frame as it
         // was before the primitive, and a texture that is the surface
         // drawn into, which is the surface as the primitive before left it.
+        // And blending by the frame's alpha, worked out from a copy of the
+        // frame: the next primitive has to find what this one stored (text
+        // drawn that way puts its shadow where its letters left the alpha
+        // alone).
         const bool ownTexture = pipeline.textureMode == TextureSurface && pipeline.texture == pipeline.colour;
-        const bool alone = (pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u) || pipeline.date || ownTexture;
+        const bool frameBlend = blendsByFrameAlpha(pipeline);
+        const bool alone = (pipeline.abe && pipeline.dsel == 1u && pipeline.asel == 1u && pipeline.bsel != 1u) || pipeline.date || ownTexture ||
+                           frameBlend;
         if (!impl.drawing || alone || std::memcmp(&batch.pipelines.back(), &pipeline, sizeof(Pipeline)) != 0)
         {
             Command &command = impl.Add(Command::Draw);
@@ -614,7 +645,7 @@ void main()
             command.pipeline = static_cast<uint32_t>(batch.pipelines.size());
             batch.pipelines.push_back(pipeline);
             impl.drawing = true;
-            if (pipeline.date)
+            if (pipeline.date || frameBlend)
             {
                 // The pixels it can touch, for the copy of the frame.
                 float x0 = vertices[0].x, y0 = vertices[0].y, x1 = x0, y1 = y0;
@@ -831,6 +862,7 @@ void main()
         PS2X_UNIFORM(fba, "uFba");
         PS2X_UNIFORM(frame, "uFrame");
         PS2X_UNIFORM(date, "uDate");
+        PS2X_UNIFORM(frameBlend, "uFrameBlend");
         PS2X_UNIFORM(alphaSplit, "uAlphaSplit");
         PS2X_UNIFORM(shuffle, "uShuffle");
 #undef PS2X_UNIFORM
@@ -1108,6 +1140,7 @@ void main()
             None,
             General,
             FrameAlphaAdd, // colour * the frame's alpha + what is there
+            FrameAlpha,    // anything else by the frame's alpha: worked out by the shader from a copy of the frame
             OnePlusAlpha,  // what is there * (1 + alpha), less colour * alpha perhaps
         };
         Blend blend = Blend::None;
@@ -1127,17 +1160,13 @@ void main()
                 {
                     blend = Blend::FrameAlphaAdd;
                 }
+                else if (!p.frameAlphaOne)
+                {
+                    blend = Blend::FrameAlpha;
+                }
                 else
                 {
                     // A 24-bit frame's alpha is 0x80 whatever is in it.
-                    // Anything else this cannot do is drawn as if it were.
-                    static bool told = false;
-                    if (!p.frameAlphaOne && !told)
-                    {
-                        told = true;
-                        std::fprintf(stderr, "[gs-gpu] blending %u%u%u%u with the frame's alpha is drawn with alpha 0x80\n",
-                                     p.asel, p.bsel, p.csel, p.dsel);
-                    }
                     alphaFrom = 2;
                     fix = 128.0f;
                 }
@@ -1264,9 +1293,10 @@ void main()
         glUniform1f(at.aref, static_cast<float>(p.aref));
         glUniform1i(at.blendAlpha, alphaFrom);
         glUniform1f(at.fix, fix);
-        glUniform1i(at.pabe, p.abe && p.pabe && blend == Blend::General && equation == GL_FUNC_ADD ? 1 : 0);
+        glUniform1i(at.pabe, p.abe && p.pabe && ((blend == Blend::General && equation == GL_FUNC_ADD) || blend == Blend::FrameAlpha) ? 1 : 0);
         glUniform1i(at.fba, p.fba && !p.frameAlphaOne ? 1 : 0);
-        if (p.date && !p.frameAlphaOne && command.width > 0 && command.height > 0)
+        const bool tested = p.date && !p.frameAlphaOne;
+        if ((tested || blend == Blend::FrameAlpha) && command.width > 0 && command.height > 0)
         {
             copyFrame(command.x, command.y, command.x + command.width, command.y + command.height);
             glActiveTexture(GL_TEXTURE1);
@@ -1274,11 +1304,13 @@ void main()
             glBindSampler(1, nearest);
             glActiveTexture(GL_TEXTURE0);
             glUniform1i(at.frame, 1);
-            glUniform1i(at.date, p.datm ? 2 : 1);
+            glUniform1i(at.date, tested ? (p.datm ? 2 : 1) : 0);
+            glUniform1i(at.frameBlend, blend == Blend::FrameAlpha ? 1 + p.asel + 3 * p.bsel + 9 * p.dsel : 0);
         }
         else
         {
             glUniform1i(at.date, 0);
+            glUniform1i(at.frameBlend, 0);
         }
 
         if (depthUsed)
@@ -1313,6 +1345,7 @@ void main()
             switch (blend)
             {
             case Blend::None:
+            case Blend::FrameAlpha: // the shader has blended it
                 glDisable(GL_BLEND);
                 glUniform1i(at.output, 0);
                 glUniform2f(at.blendSource, 1.0f, 0.0f);
