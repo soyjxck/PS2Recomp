@@ -3908,7 +3908,7 @@ int GSCpuBackend::ScaleSetting()
     static const int scale = []
     {
         const char *asked = ps2x::setting("PS2X_GS_SCALE", "display.resolution");
-        return clampInt(asked ? std::atoi(asked) : 1, 1, 4);
+        return clampInt(asked ? std::atoi(asked) : 1, 1, 8);
     }();
     return scale;
 }
