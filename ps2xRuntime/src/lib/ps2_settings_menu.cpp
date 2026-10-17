@@ -187,7 +187,8 @@ namespace
             row.environment = "PS2X_GS_SCALE";
             row.label = "Resolution";
             row.description = "How many times the game's own resolution the picture is drawn at. 3x suits a "
-                              "1080p screen, 4x 1440p and 6x 4K.";
+                              "1080p screen, 4x 1440p and 6x 4K. The higher ones need a strong graphics card: "
+                              "lower it if the game slows down.";
             row.choices = {{"1", "1x (PlayStation 2)"}, {"2", "2x"}, {"3", "3x"}, {"4", "4x"},
                            {"5", "5x"}, {"6", "6x"}, {"7", "7x"}, {"8", "8x"}};
             rows.push_back(std::move(row));
